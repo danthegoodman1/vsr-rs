@@ -363,10 +363,10 @@ impl Journal {
     /// Opens the journal in `dir` and replays it. Returns the replica's
     /// state if the node has run before, without the client table, which
     /// the store keeps.
-    fn open(dir: &Path) -> Result<(Journal, Option<KvState>), String> {
+    fn open(dir: &Path, max_file_size: u64) -> Result<(Journal, Option<KvState>), String> {
         let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
             log_dir: dir.to_path_buf(),
-            max_file_size: WAL_FILE_SIZE,
+            max_file_size,
             ..Default::default()
         });
         wal.start()
@@ -1086,8 +1086,19 @@ impl Node {
     /// replica: a restart from what they hold if the node has run before,
     /// a new replica otherwise, or a recovering one if asked to.
     fn open(id: ReplicaID, config: Config, data_dir: &Path, recover: bool) -> Result<Node, String> {
+        Node::open_with(id, config, data_dir, recover, WAL_FILE_SIZE)
+    }
+
+    /// `open`, with journal files of `wal_file_size` bytes.
+    fn open_with(
+        id: ReplicaID,
+        config: Config,
+        data_dir: &Path,
+        recover: bool,
+        wal_file_size: u64,
+    ) -> Result<Node, String> {
         let store = Store::open(&data_dir.join("store"))?;
-        let (journal, state) = Journal::open(&data_dir.join("journal"))?;
+        let (journal, state) = Journal::open(&data_dir.join("journal"), wal_file_size)?;
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos() as u64)
@@ -1652,5 +1663,206 @@ mod tests {
                 Frame::Reply(_) => panic!("{line}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn temp_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vsr-kvstore-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn config() -> Config {
+        let mut config = Config::new();
+        for _ in 0..3 {
+            config.add_replica();
+        }
+        config
+    }
+
+    /// Feeds a backup node the primary's `Prepare` for `op_number`, then
+    /// persists the journal, as the event loop does after every batch.
+    fn prepare(node: &mut Node, op_number: OpNumber) {
+        node.replica.on_message(Message::Prepare {
+            view_number: 0,
+            op_number,
+            client_id: 7,
+            request_number: op_number - 1,
+            op: Op::Put(format!("k{op_number}"), format!("v{op_number}")),
+            commit_number: op_number - 1,
+        });
+        node.journal.persist(&mut node.replica).unwrap();
+        node.replica.drain_messages().for_each(drop);
+    }
+
+    /// Tells a backup node that the primary committed up to `commit_number`.
+    fn commit(node: &mut Node, commit_number: usize) {
+        node.replica.on_message(Message::Commit {
+            view_number: 0,
+            commit_number,
+        });
+        node.journal.persist(&mut node.replica).unwrap();
+        node.replica.drain_messages().for_each(drop);
+    }
+
+    /// Journal files small enough to rotate every few entries.
+    const SMALL_WAL_FILE: u64 = 14 * 1024;
+
+    fn journal_files(dir: &Path) -> Vec<u64> {
+        let mut ids: Vec<u64> = std::fs::read_dir(dir.join("journal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                name.strip_suffix(".log")?.parse().ok()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// With journal files a few entries long, compaction after every store
+    /// persist deletes the files that hold nothing a replay needs, and a
+    /// restart replays what is left.
+    #[test]
+    fn journal_rotates_and_trims() {
+        let dir = temp_dir("rotate");
+        let mut node = Node::open_with(1, config(), &dir, false, SMALL_WAL_FILE).unwrap();
+        node.log_retention = 3;
+        for op_number in 1..=120 {
+            prepare(&mut node, op_number);
+            if op_number % 20 == 0 {
+                node.flush_store().unwrap();
+                node.journal.persist(&mut node.replica).unwrap();
+            }
+        }
+        // Files rotated every few entries, and every file behind the
+        // retained entries has been deleted.
+        let files = journal_files(&dir);
+        assert!(files[0] > 0, "the first file was never deleted: {files:?}");
+        assert!(files.len() <= 2, "files {files:?}");
+        assert_eq!(120, node.replica.op_number());
+        assert_eq!(119, node.replica.commit_number());
+        assert_eq!(116, node.replica.log_start());
+        let before = node.replica.persistent_state();
+        drop(node);
+
+        let mut node = Node::open_with(1, config(), &dir, false, SMALL_WAL_FILE).unwrap();
+        assert_eq!(before, node.replica.persistent_state());
+        assert_eq!(
+            Some("v119".to_string()),
+            node.replica.state_machine().get("k119")
+        );
+        assert_eq!(None, node.replica.state_machine().get("k120"));
+        commit(&mut node, 120);
+        assert_eq!(
+            Some("v120".to_string()),
+            node.replica.state_machine().get("k120")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const CHILD_DIR: &str = "KVSTORE_TORN_TAIL_CHILD";
+    const CHILD_OPS: usize = 60;
+    const CHILD_PERSIST_AT: usize = 25;
+
+    /// The child of `store_behind_journal_after_crash`: a backup node that
+    /// persists its store once, applies more ops with the store buffered
+    /// only, and dies without flushing anything.
+    #[test]
+    fn torn_tail_child() {
+        let Ok(dir) = std::env::var(CHILD_DIR) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let mut node = Node::open(1, config(), &dir, false).unwrap();
+        node.log_retention = 0;
+        for op_number in 1..=CHILD_OPS {
+            prepare(&mut node, op_number);
+            if op_number == CHILD_PERSIST_AT {
+                node.flush_store().unwrap();
+            }
+        }
+        commit(&mut node, CHILD_OPS);
+        assert_eq!(CHILD_OPS, node.replica.state_machine().applied);
+        assert_eq!(CHILD_PERSIST_AT - 1, node.replica.log_start());
+        std::process::exit(0);
+    }
+
+    /// A node dies without flushing, the way a power loss takes it, and
+    /// the store's journal loses its tail on top. The store comes back at
+    /// some prefix of what it applied, behind the replica's journal, and
+    /// the restart applies the rest again.
+    #[test]
+    fn store_behind_journal_after_crash() {
+        let dir = temp_dir("torn");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "disk_tests::torn_tail_child", "--nocapture"])
+            .env(CHILD_DIR, &dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "child failed: {status}");
+
+        // Tear the store's journal: drop the last byte of its newest file.
+        let store_dir = dir.join("store");
+        let mut journals: Vec<PathBuf> = std::fs::read_dir(&store_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jnl"))
+            .collect();
+        journals.sort();
+        let newest = journals.last().expect("a store journal");
+        let len = std::fs::metadata(newest).unwrap().len();
+        if len > 0 {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(newest)
+                .unwrap()
+                .set_len(len - 1)
+                .unwrap();
+        }
+
+        // The store persisted while op CHILD_PERSIST_AT was appended but
+        // not yet committed, so it comes back at or after the op before.
+        let store = Store::open(&store_dir).unwrap();
+        let applied = store.applied;
+        assert!(
+            (CHILD_PERSIST_AT - 1..CHILD_OPS).contains(&applied),
+            "store applied {applied} ops"
+        );
+        for op_number in 1..=applied {
+            assert_eq!(
+                Some(format!("v{op_number}")),
+                store.get(&format!("k{op_number}"))
+            );
+        }
+        drop(store);
+
+        let node = Node::open(1, config(), &dir, false).unwrap();
+        assert_eq!(CHILD_OPS, node.replica.commit_number());
+        assert_eq!(CHILD_OPS, node.replica.state_machine().applied);
+        assert_eq!(CHILD_PERSIST_AT - 1, node.replica.log_start());
+        for op_number in 1..=CHILD_OPS {
+            assert_eq!(
+                Some(format!("v{op_number}")),
+                node.replica.state_machine().get(&format!("k{op_number}"))
+            );
+        }
+        assert_eq!(
+            vec![ClientRecord {
+                client_id: 7,
+                request_number: CHILD_OPS - 1,
+                reply: None,
+            }],
+            node.replica.client_table()
+        );
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

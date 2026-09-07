@@ -1,0 +1,19 @@
+[package]
+name = "vsr-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmark of the durable log against the original in-memory library"
+publish = false
+
+[[bin]]
+name = "vsr-bench"
+path = "src/main.rs"
+
+[dependencies]
+fjall = "3.1.10"
+futures = "0.3"
+log = "0.4.17"
+rand = "0.8.5"
+rand_chacha = "0.3.1"
+vsr-rs = { path = ".." }
+writeahead = "0.3.0"

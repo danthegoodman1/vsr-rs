@@ -375,8 +375,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                     }
                     _ if !app.interactive => {}
                     KeyCode::Char('c') => app.inject(Fault::Crash(app.selected)),
+                    KeyCode::Char('C') => app.inject(Fault::PowerLoss(app.selected)),
+                    KeyCode::Char('B') => app.inject(Fault::Blackout),
                     KeyCode::Char('r') => app.inject(Fault::Restart(app.selected)),
                     KeyCode::Char('R') => app.inject(Fault::Reboot(app.selected)),
+                    KeyCode::Char('f') => app.inject(Fault::Flush(app.selected)),
                     KeyCode::Char('p') => {
                         let fault = if app.sim.is_partitioned(app.selected) {
                             Fault::Heal(app.selected)
@@ -428,7 +431,7 @@ fn draw(frame: &mut Frame, app: &App) {
     draw_messages(frame, messages, snapshot);
     draw_events(frame, events, app);
     let keys_line = if app.interactive {
-        "q quit  space pause  . step  +/- speed  0-9 or arrows/tab select a replica  c crash  r restart  R reboot  p partition/heal  h heal all  l loss"
+        "q quit  space pause  . step  +/- speed  0-9 or arrows/tab select a replica  c crash  C power loss  B blackout  r restart  R reboot  f flush  p partition/heal  h heal all  l loss"
     } else {
         "q quit  space pause  . step  +/- speed  0-9 or arrows/tab select a replica     (replaying a seed: nothing can be injected)"
     };
@@ -612,13 +615,15 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, snapshot: &Snapshot) {
     ]);
     let net = &snapshot.network;
     let line2 = Line::from(format!(
-        "requests {}/{} replied of {}   crashes {} restarts {} reboots {}   messages sent {} lost {} replayed {} delayed {}   loss {} replay {} latency {} ticks, mean {}",
+        "requests {}/{} replied of {}   crashes {} power losses {} restarts {} reboots {} flushes {}   messages sent {} lost {} replayed {} delayed {}   loss {} replay {} latency {} ticks, mean {}",
         snapshot.requests_replied,
         snapshot.requests_sent,
         snapshot.requests_max,
         snapshot.crashes,
+        snapshot.power_losses,
         snapshot.restarts,
         snapshot.reboots,
+        snapshot.flushes,
         net.sent,
         net.lost,
         net.replayed,

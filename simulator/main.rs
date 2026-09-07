@@ -41,6 +41,21 @@ struct Args {
     /// Override the probability that a restart loses the replica's memory.
     #[arg(long)]
     replica_reboot_probability: Option<f64>,
+    /// Override the probability that a crash is a power loss, after which
+    /// the replica restarts from its disk.
+    #[arg(long)]
+    replica_power_loss_probability: Option<f64>,
+    /// Override the per-tick probability that every replica loses power.
+    #[arg(long)]
+    blackout_probability: Option<f64>,
+    /// Override the per-tick probability that a replica's state machine
+    /// flushes to disk, after which the replica compacts its log.
+    #[arg(long)]
+    replica_flush_probability: Option<f64>,
+    /// Override the log entries kept behind what the state machine has
+    /// flushed.
+    #[arg(long)]
+    log_retention: Option<usize>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -88,6 +103,18 @@ fn main() -> anyhow::Result<()> {
     if let Some(p) = args.replica_reboot_probability {
         options.replica_reboot_probability = p;
     }
+    if let Some(p) = args.replica_power_loss_probability {
+        options.replica_power_loss_probability = p;
+    }
+    if let Some(p) = args.blackout_probability {
+        options.blackout_probability = p;
+    }
+    if let Some(p) = args.replica_flush_probability {
+        options.replica_flush_probability = p;
+    }
+    if let Some(n) = args.log_retention {
+        options.log_retention = n;
+    }
     let limits = Limits {
         ticks_max_requests: args.ticks_max_requests,
         ticks_max_convergence: args.ticks_max_convergence,
@@ -120,10 +147,12 @@ fn main() -> anyhow::Result<()> {
         simulator.requests_sent, simulator.requests_replied
     );
     println!(
-        "          replicas: crashes={} restarts={} reboots={} core={:?} up={:?}",
+        "          replicas: crashes={} power_losses={} restarts={} reboots={} flushes={} core={:?} up={:?}",
         simulator.crashes,
+        simulator.power_losses,
         simulator.restarts,
         simulator.reboots,
+        simulator.flushes,
         simulator.core(),
         (0..simulator.options.replica_count)
             .filter(|&id| simulator.is_up(id))

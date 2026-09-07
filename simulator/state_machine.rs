@@ -2,9 +2,9 @@
 //!
 //! The simulator uses a simple accumulator that also records every operation
 //! it has applied. Properties use the recorded history to check that the
-//! state machine state matches the committed prefix of the replica log.
+//! state machine state matches the committed log.
 
-use vsr_rs::StateMachine;
+use vsr_rs::{Checkpoint, LogEntry, MessageFor, OpNumber, StateMachine};
 
 /// The kind of an operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub struct Op {
 }
 
 /// An accumulator state machine that records its history.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Accumulator {
     /// The current value of the accumulator.
     pub value: i64,
@@ -45,10 +45,26 @@ pub struct Accumulator {
 impl StateMachine for Accumulator {
     type Input = Op;
     type Output = i64;
+    /// The whole state, history included, so that a replica that installs
+    /// a checkpoint can still be checked against the committed log.
+    type Snapshot = Accumulator;
 
-    fn apply(&mut self, op: Op) -> i64 {
-        self.value = op.kind.apply(self.value);
-        self.applied.push(op);
+    fn apply(&mut self, op_number: OpNumber, entry: &LogEntry<Op>) -> i64 {
+        assert_eq!(op_number, self.applied.len() + 1);
+        self.value = entry.op.kind.apply(self.value);
+        self.applied.push(entry.op.clone());
         self.value
     }
+
+    fn snapshot(&self) -> Accumulator {
+        self.clone()
+    }
+
+    fn restore(&mut self, checkpoint: Checkpoint<i64, Accumulator>) {
+        assert_eq!(checkpoint.op_number, checkpoint.state.applied.len());
+        *self = checkpoint.state;
+    }
 }
+
+/// A protocol message in the simulator.
+pub type Msg = MessageFor<Accumulator>;

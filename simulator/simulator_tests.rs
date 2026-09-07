@@ -76,6 +76,7 @@ fn fault_script() {
     let mut options = Options::lite(&mut prng);
     options.network = NetworkOptions::perfect();
     options.replica_crash_probability = 0.0;
+    options.blackout_probability = 0.0;
     options.full_core = true;
     options.requests_max = 20_000;
     let script = parse_script(
@@ -112,4 +113,129 @@ fn fault_script() {
         .iter()
         .any(|replica| replica.view_number > 0));
     assert_eq!(1, snapshot.reboots);
+}
+
+/// Runs `script` on a quiet cluster: perfect network, no random crashes,
+/// restarts, blackouts, or flushes, every replica in the liveness core, so
+/// that the script alone decides what happens.
+fn run_script(seed: u64, requests_max: usize, script: &str) -> Simulator {
+    let _ = env_logger::try_init();
+    let mut prng = ChaCha8Rng::seed_from_u64(seed);
+    let mut options = Options::lite(&mut prng);
+    options.network = NetworkOptions::perfect();
+    options.replica_crash_probability = 0.0;
+    options.replica_restart_probability = 0.0;
+    options.replica_reboot_probability = 0.0;
+    options.blackout_probability = 0.0;
+    options.replica_flush_probability = 0.0;
+    options.log_retention = 0;
+    options.full_core = true;
+    options.requests_max = requests_max;
+    let script = parse_script(script).unwrap();
+    let last_tick = script.last().map(|(tick, _)| *tick).unwrap_or(0);
+    let mut simulator = Simulator::init(seed, options).expect("options are valid");
+    if let Err(err) = simulator.run_script(&script, Limits::default()) {
+        panic!("script failed at tick {}: {err:#}", simulator.ticks);
+    }
+    assert!(
+        simulator.ticks > last_tick,
+        "the run ended at tick {} before the script did",
+        simulator.ticks
+    );
+    simulator
+}
+
+/// Replicas lose power one after another and restart from their disks,
+/// with and without a flush of the state machine before the loss. The
+/// primary is among them, so a view change happens while it is down and
+/// it comes back to a view it has to catch up with.
+#[test]
+fn power_loss_script() {
+    let simulator = run_script(
+        8,
+        20_000,
+        "100 flush 0\n\
+         300 power-loss 0\n\
+         800 restart 0\n\
+         1500 power-loss 1\n\
+         1600 flush 2\n\
+         2000 restart 1\n\
+         2500 flush 0\n\
+         2501 power-loss 2\n\
+         3000 restart 2\n",
+    );
+    let snapshot = simulator.snapshot();
+    assert_eq!(3, snapshot.power_losses);
+    assert_eq!(3, snapshot.flushes);
+    assert_eq!(0, snapshot.reboots);
+}
+
+/// Every replica loses power at once, twice. The cluster must come back
+/// with everything it had committed, and finish the run.
+#[test]
+fn blackout_script() {
+    let simulator = run_script(
+        9,
+        20_000,
+        "500 flush 1\n\
+         1000 blackout\n\
+         1200 restart 0\n\
+         1300 restart 1\n\
+         1400 restart 2\n\
+         3000 blackout\n\
+         3100 restart 2\n\
+         3200 restart 1\n\
+         3300 restart 0\n",
+    );
+    let snapshot = simulator.snapshot();
+    assert_eq!(6, snapshot.power_losses);
+}
+
+/// Flushes compact the log on every replica, with no retention, while a
+/// replica is cut off and while one has lost power: both come back to
+/// logs whose entries they need have been compacted, so they catch up
+/// from checkpoints.
+#[test]
+fn compaction_script() {
+    let simulator = run_script(
+        10,
+        20_000,
+        "300 partition 2\n\
+         600 flush 0\n\
+         601 flush 1\n\
+         1000 heal 2\n\
+         1500 power-loss 0\n\
+         1800 flush 1\n\
+         1801 flush 2\n\
+         2300 restart 0\n\
+         3000 flush 0\n\
+         3001 flush 1\n\
+         3002 flush 2\n",
+    );
+    let snapshot = simulator.snapshot();
+    assert_eq!(7, snapshot.flushes);
+    assert!(
+        simulator
+            .replicas()
+            .iter()
+            .all(|replica| replica.log_start() > 0),
+        "no replica compacted"
+    );
+}
+
+/// Random power losses, blackouts, and flushes with no retention, on top
+/// of a lossy network, for a few seeds.
+#[test]
+fn power_losses_and_compaction() {
+    for seed in [11, 12, 13, 14] {
+        run(seed, |options| {
+            options.replica_crash_probability = 0.0005;
+            options.replica_restart_probability = 0.01;
+            options.replica_power_loss_probability = 1.0;
+            options.replica_reboot_probability = 0.1;
+            options.blackout_probability = 0.0001;
+            options.replica_flush_probability = 0.05;
+            options.log_retention = 0;
+        });
+    }
 }

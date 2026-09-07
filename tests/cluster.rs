@@ -807,10 +807,11 @@ fn test_restart_applies_only_what_the_state_machine_lacks() {
 }
 
 /// The primary restarts with an op in its log that the backups never
-/// acknowledged. It resumes as the primary, re-sends the op on its next
-/// idle period, and commits it once the backups acknowledge.
+/// acknowledged. It does not resume as the primary: it starts the next
+/// view. The view starts from the backups' logs, which lack the op, so
+/// the client's re-send is what gets it executed.
 #[test]
-fn test_restart_primary_resumes_view() {
+fn test_restart_primary_starts_next_view() {
     let mut cluster = Cluster::new(3);
     cluster.request(Op::Add(10));
     cluster.tick();
@@ -821,21 +822,112 @@ fn test_restart_primary_resumes_view() {
     assert_eq!(1, cluster.replicas[0].commit_number());
 
     cluster.restart(0);
-    assert!(cluster.replicas[0].is_primary());
-    assert_eq!(Status::Normal, cluster.replicas[0].status());
+    assert_eq!(Status::ViewChange, cluster.replicas[0].status());
+    assert_eq!(1, cluster.replicas[0].view_number());
     assert_eq!(2, cluster.replicas[0].op_number());
-    assert_eq!(1, cluster.replicas[0].commit_number());
     assert_eq!(10, cluster.value(0));
 
-    cluster.idle();
+    for _ in 0..10 {
+        cluster.idle();
+        cluster.tick();
+    }
+    assert!(cluster.settled());
+    assert!(cluster.replicas[1].is_primary());
+    for id in 0..3 {
+        assert_eq!(1, cluster.replicas[id].commit_number());
+        assert_eq!(1, cluster.replicas[id].op_number());
+    }
+    cluster.client.on_idle();
     cluster.tick();
-    assert_eq!(2, cluster.replicas[0].commit_number());
-    assert_eq!(30, cluster.value(0));
     cluster.idle();
     cluster.tick();
     for id in 0..3 {
+        assert_eq!(2, cluster.replicas[id].commit_number());
         assert_eq!(30, cluster.value(id));
     }
+}
+
+/// The primary sends the `Prepare` for an op before its own entry is
+/// durable, and loses power before it is. The backups hold the op under
+/// op number 2; the primary's disk does not. On restart the primary must
+/// not resume and assign op number 2 again: it starts the next view, and
+/// the op the backups hold commits there.
+#[test]
+fn test_prepare_sent_before_persist_survives_primary_crash() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    // The request reaches the primary, whose `Prepare` goes out before
+    // its disk has op 2.
+    let request_number = cluster.request(Op::Add(20));
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    let early: Vec<_> = cluster.replicas[0]
+        .drain_messages_before_persist()
+        .collect();
+    assert_eq!(2, early.len());
+    for (replica_id, message) in early {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    assert_eq!(1, cluster.disks[0].log.len());
+    // The primary restarts from that disk. The backups' acknowledgements
+    // reach nobody.
+    cluster.replicas[0].drain_messages().for_each(drop);
+    cluster.restart(0);
+    assert_eq!(1, cluster.replicas[0].op_number());
+    assert_eq!(Status::ViewChange, cluster.replicas[0].status());
+    cluster.replicas[1].drain_messages().for_each(drop);
+    cluster.replicas[2].drain_messages().for_each(drop);
+    assert_eq!(2, cluster.replicas[1].op_number());
+
+    for _ in 0..10 {
+        cluster.idle();
+        cluster.tick();
+    }
+    assert!(cluster.settled());
+    let replies = cluster.take_replies();
+    assert!(replies
+        .iter()
+        .any(|reply| reply.request_number == request_number));
+    for id in 0..3 {
+        assert_eq!(2, cluster.replicas[id].commit_number());
+        assert_eq!(30, cluster.value(id));
+    }
+}
+
+/// A backup that is down leaves the primary with itself and one backup,
+/// which is a quorum of three only if the primary counts its own
+/// acknowledgement, which it does once the step is persisted.
+#[test]
+fn test_primary_counts_own_acknowledgement_after_persist() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    // Before the persist, the primary has appended but acknowledged
+    // nothing; a backup's acknowledgement alone is no quorum.
+    let prepares: Vec<_> = cluster.replicas[0]
+        .drain_messages_before_persist()
+        .collect();
+    for (replica_id, message) in prepares {
+        if replica_id == 1 {
+            cluster.replicas[replica_id].on_message(message);
+        }
+    }
+    let acks: Vec<_> = cluster.replicas[1].drain_messages().collect();
+    for (_, message) in acks {
+        cluster.replicas[0].on_message(message);
+    }
+    assert_eq!(0, cluster.replicas[0].commit_number());
+    // The persist, marked by draining, adds the primary's own.
+    cluster.replicas[0].drain_messages().for_each(drop);
+    assert_eq!(1, cluster.replicas[0].commit_number());
 }
 
 /// A replica restarts in the middle of a view change. Its last normal

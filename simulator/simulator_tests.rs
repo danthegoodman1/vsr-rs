@@ -78,6 +78,7 @@ fn fault_script() {
     options.replica_crash_probability = 0.0;
     options.blackout_probability = 0.0;
     options.checkpoint_power_loss_probability = 0.0;
+    options.step_power_loss_probability = 0.0;
     options.full_core = true;
     options.requests_max = 20_000;
     let script = parse_script(
@@ -130,6 +131,7 @@ fn run_script(seed: u64, requests_max: usize, script: &str) -> Simulator {
     options.blackout_probability = 0.0;
     options.replica_flush_probability = 0.0;
     options.checkpoint_power_loss_probability = 0.0;
+    options.step_power_loss_probability = 0.0;
     options.log_retention = 0;
     options.full_core = true;
     options.requests_max = requests_max;
@@ -297,5 +299,25 @@ fn restart_from_a_disk_that_lost_the_last_step() {
         if let Err(err) = simulator.run(Limits::default()) {
             panic!("seed {seed} failed at tick {}: {err:#}", simulator.ticks);
         }
+    }
+}
+
+/// Replicas lose power after sending what need not wait and before
+/// persisting the step, often, for a few seeds. A primary that sent a
+/// `Prepare` for an entry it never made durable must not resume as the
+/// primary; a step whose commit number was never written comes back from
+/// the state machine.
+#[test]
+fn power_loss_between_send_and_persist() {
+    for seed in [18, 19, 20] {
+        let simulator = run(seed, |options| {
+            options.replica_crash_probability = 0.0;
+            options.replica_restart_probability = 0.02;
+            options.replica_reboot_probability = 0.0;
+            options.replica_flush_probability = 0.05;
+            options.step_power_loss_probability = 0.002;
+            options.log_retention = 0;
+        });
+        assert!(simulator.power_losses > 0, "seed {seed}");
     }
 }

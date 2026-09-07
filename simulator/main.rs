@@ -60,6 +60,10 @@ struct Args {
     /// restoring a checkpoint, before the step is persisted.
     #[arg(long)]
     checkpoint_power_loss_probability: Option<f64>,
+    /// Override the per-step probability that a replica loses power after
+    /// sending what need not wait, before persisting the step.
+    #[arg(long)]
+    step_power_loss_probability: Option<f64>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -121,6 +125,9 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(p) = args.checkpoint_power_loss_probability {
         options.checkpoint_power_loss_probability = p;
+    }
+    if let Some(p) = args.step_power_loss_probability {
+        options.step_power_loss_probability = p;
     }
     let limits = Limits {
         ticks_max_requests: args.ticks_max_requests,

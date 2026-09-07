@@ -41,12 +41,13 @@ Each node keeps its data in `kvstore-node-N`, or the directory given with
 
 - `journal/` holds the replica's log and counters, in a write-ahead log
   from the `writeahead` crate, see [`journal.rs`](journal.rs). After every
-  batch of events, before anything the batch produced is sent, the node
-  appends what changed and fsyncs once: the log entries from the change
-  marker on, a truncation or compaction if there was one, and the
-  counters, which close the batch. A replay applies a batch only once it
-  has seen the counters, since a torn write can leave the first records of
-  a batch on disk.
+  batch of events, the node sends the messages that need not wait for the
+  write, then appends what changed and fsyncs once, then sends the rest:
+  the log entries from the change marker on, a truncation or compaction if
+  there was one, and the counters, which close the batch. A batch that
+  changed only the commit number is not written. A replay applies a batch
+  only once it has seen the counters, since a torn write can leave the
+  first records of a batch on disk.
 - `store/` is a `fjall` database with the keys and values, the client
   table, and the number of operations applied, all written in the same
   batch as each operation. The replica executes operations only after the

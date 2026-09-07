@@ -77,7 +77,11 @@ You provide the rest:
   after the entry it covers is on disk, and the replica executes committed
   operations only when its replies are drained, after the step is
   persisted, so a state machine that persists what it executes never gets
-  ahead of the log.
+  ahead of the log. Two things cost nothing in that argument, and the
+  library exposes both: messages that promise nothing about the sender's
+  durable state, a `Prepare` above all, can leave before the write, which
+  overlaps the primary's write with the backups', and a step that changed
+  only the commit number needs no write before delivery.
 - **Compaction.** Once the state machine has made its state durable, call
   `compact` with the op number it reached. A replica that needs entries
   another one has compacted gets a checkpoint of its state instead.
@@ -207,10 +211,9 @@ TigerBeetle's VOPR. It runs a cluster and its clients in one thread, passes
 every message through a network that loses, replays, and delays them,
 crashes and restarts replicas, sometimes from what they persisted after a
 power loss, sometimes with their disk wiped, cuts the power of every
-replica at once, or of a replica that has just restored a checkpoint and
-not yet persisted the step, makes state machines flush and replicas
-compact their logs, and checks a set of safety properties after every
-tick:
+replica at once, or of a replica between sending what need not wait and
+persisting the step, makes state machines flush and replicas compact
+their logs, and checks a set of safety properties after every tick:
 
 - committed prefixes agree on every replica,
 - committed operations survive on enough replicas,

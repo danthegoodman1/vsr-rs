@@ -236,6 +236,11 @@ pub struct Options {
     /// the step is persisted: it comes back with the state machine ahead
     /// of its log.
     pub checkpoint_power_loss_probability: f64,
+    /// Probability per step that a replica loses power after sending the
+    /// messages that need not wait for the step to be persisted, and
+    /// before persisting it: what it sent is out, and its disk holds the
+    /// state before the step.
+    pub step_power_loss_probability: f64,
     /// Log entries a replica keeps behind what its state machine has
     /// flushed, so that replicas a little behind catch up from the log
     /// rather than from a checkpoint.
@@ -285,6 +290,7 @@ impl Options {
             blackout_probability: f64::from(prng.gen_range(0..=5)) / 100_000.0,
             replica_flush_probability: f64::from(prng.gen_range(0..=100)) / 1_000.0,
             checkpoint_power_loss_probability: f64::from(prng.gen_range(0..=50)) / 100.0,
+            step_power_loss_probability: f64::from(prng.gen_range(0..=20)) / 100_000.0,
             log_retention: prng.gen_range(0..=50),
             full_core: false,
             primary_timeout,
@@ -339,6 +345,10 @@ impl Options {
             (
                 "checkpoint_power_loss_probability",
                 self.checkpoint_power_loss_probability,
+            ),
+            (
+                "step_power_loss_probability",
+                self.step_power_loss_probability,
             ),
         ] {
             ensure!(
@@ -457,6 +467,11 @@ impl fmt::Display for Options {
             f,
             "          checkpoint_power_loss_probability={}",
             self.checkpoint_power_loss_probability
+        )?;
+        writeln!(
+            f,
+            "          step_power_loss_probability={}",
+            self.step_power_loss_probability
         )?;
         writeln!(f, "          log_retention={} entries", self.log_retention)?;
         writeln!(f, "          full_core={}", self.full_core)?;
@@ -818,11 +833,20 @@ impl Simulator {
     fn restart_replica_from_disk(&mut self, id: usize) {
         debug!("tick {}: replica {id} restarts from its disk", self.ticks);
         let disk = &self.disks[id];
-        let lost_last_step = disk.applied > disk.state.commit_number;
+        let before = self.replicas[id].persistent_state();
+        // The disk holds what the replica persisted, with the commit
+        // number possibly behind, unless the last step was lost.
+        let lost_last_step = disk.state.view_number != before.view_number
+            || disk.state.log != before.log
+            || disk.state.log_start != before.log_start;
         if !lost_last_step {
             assert_eq!(
-                disk.state,
-                self.replicas[id].persistent_state(),
+                PersistentState {
+                    commit_number: before.commit_number,
+                    client_table: before.client_table.clone(),
+                    ..disk.state.clone()
+                },
+                before,
                 "tick {}: disk of replica {id} differs from its state",
                 self.ticks
             );
@@ -842,7 +866,9 @@ impl Simulator {
             state,
             nonce,
         );
-        if lost_last_step {
+        // What the properties tracked about the replica in memory may be
+        // ahead of what it came back with.
+        if self.replicas[id].commit_number() < before.commit_number {
             for property in &mut self.properties {
                 property.on_restart(id);
             }
@@ -1194,17 +1220,25 @@ impl Simulator {
             ..
         } = self;
         for (id, replica) in replicas.iter_mut().enumerate() {
-            // Persist before anything the step produced goes out. A
-            // replica that restored a checkpoint may lose power in between,
-            // once the checkpoint is durable and before the rest is: what
-            // the step produced is then lost with it.
-            let power_loss_probability = if *liveness_mode {
-                0.0
+            // The messages that promise nothing about the replica's durable
+            // state go out first, then the step is persisted, then the
+            // rest. A replica may lose power in between: after a
+            // checkpoint it restored is durable, or in any step at all.
+            // What the step produced besides the early messages is then
+            // lost with it.
+            for (dst, msg) in replica.drain_messages_before_persist() {
+                network.send(*ticks, Origin::Replica(id), dst, msg, prng);
+            }
+            let (checkpoint_power_loss, step_power_loss) = if *liveness_mode {
+                (0.0, 0.0)
             } else {
-                options.checkpoint_power_loss_probability
+                (
+                    options.checkpoint_power_loss_probability,
+                    options.step_power_loss_probability,
+                )
             };
-            if disks[id].persist(replica, prng, power_loss_probability) {
-                debug!("tick {ticks}: replica {id} loses power after restoring a checkpoint");
+            if disks[id].persist(replica, prng, checkpoint_power_loss, step_power_loss) {
+                debug!("tick {ticks}: replica {id} loses power before persisting the step");
                 replica_up[id] = false;
                 crash_kind[id] = CrashKind::PowerLoss;
                 replica_stable_until[id] = *ticks + options.replica_crash_stability;
@@ -1308,23 +1342,33 @@ impl Disk {
     /// and before delivering what the step produced. A checkpoint the
     /// replica installed moved its log start past what the state machine
     /// had flushed: the state machine makes a restored checkpoint durable
-    /// at once, as the library requires. With `power_loss_probability`,
-    /// the replica then loses power before the rest of the step is
-    /// written, and the disk keeps the state before the step; returns
-    /// whether that happened.
+    /// at once, as the library requires. The replica may then lose power
+    /// before the rest of the step is written, with
+    /// `checkpoint_power_loss` after a checkpoint and `step_power_loss`
+    /// otherwise, and the disk keeps the state before the step; returns
+    /// whether that happened. A step that changed nothing but the commit
+    /// number is not written, as the library allows: the disk's commit
+    /// number lags until the next step that is.
     fn persist(
         &mut self,
         replica: &mut Replica<Accumulator>,
         prng: &mut ChaCha8Rng,
-        power_loss_probability: f64,
+        checkpoint_power_loss: f64,
+        step_power_loss: f64,
     ) -> bool {
-        if replica.log_start() > self.applied {
+        let power_loss = if replica.log_start() > self.applied {
             self.flush(replica);
-            if power_loss_probability > 0.0 && prng.gen_bool(power_loss_probability) {
-                return true;
-            }
+            checkpoint_power_loss
+        } else {
+            step_power_loss
+        };
+        if power_loss > 0.0 && prng.gen_bool(power_loss) {
+            return true;
         }
-        self.state.update_from(replica);
+        let commit_number = self.state.commit_number;
+        if !self.state.update_from(replica) {
+            self.state.commit_number = commit_number;
+        }
         false
     }
 

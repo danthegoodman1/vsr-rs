@@ -8,7 +8,10 @@
 //! record, and a replay applies a batch only once it has seen that record:
 //! a crash in the middle of a write can leave the first records of a
 //! batch on disk, and those describe a state the replica never
-//! acknowledged. Files that hold nothing a replay needs are deleted.
+//! acknowledged. A step that changed nothing but the commit number is not
+//! written at all: the next batch's counters carry it, and a restart
+//! takes the commit number from the state machine when the log is behind
+//! it. Files that hold nothing a replay needs are deleted.
 
 use futures::executor::block_on;
 use futures::StreamExt;
@@ -211,7 +214,14 @@ impl<Op: Clone> Journal<Op> {
             op_number: replica.op_number(),
             recovering: replica.is_recovering(),
         };
-        if records.is_empty() && header == self.header {
+        let commit_only = Header {
+            commit_number: self.header.commit_number,
+            ..header
+        } == self.header;
+        if records.is_empty() && commit_only {
+            // Only the commit number moved, which needs no write before
+            // anything the step produced is delivered.
+            self.header.commit_number = header.commit_number;
             return Ok(false);
         }
         records.push(

@@ -840,9 +840,17 @@ fn deliver_reply(connections: &mut HashMap<u64, Connection>, reply: KvReply) {
     }
 }
 
-/// Sends out everything the replica and the clients produced: protocol
-/// messages to the sender thread, and replies to the node that owns the
-/// client connection, which may be this one.
+/// Sends out the messages that need not wait for the journal, so that
+/// the other nodes' writes overlap this one's.
+fn flush_early(replica: &mut Replica<Store>, frames: &Sender<(ReplicaID, Frame)>) {
+    for (dst, message) in replica.drain_messages_before_persist() {
+        let _ = frames.send((dst, Frame::Message(message)));
+    }
+}
+
+/// Sends out everything else the replica and the clients produced:
+/// protocol messages to the sender thread, and replies to the node that
+/// owns the client connection, which may be this one.
 fn flush(
     node_id: ReplicaID,
     replica: &mut Replica<Store>,
@@ -1020,14 +1028,16 @@ impl Node {
     }
 
     /// Runs the event loop: every batch of events already queued is
-    /// stepped, the journal is written once, and only then is anything the
-    /// batch produced sent.
+    /// stepped, the messages that need not wait go out, the journal is
+    /// written once, and only then is the rest of what the batch produced
+    /// sent.
     fn run(&mut self, events: Receiver<Event>, frames: Sender<(ReplicaID, Frame)>) {
         while let Ok(event) = events.recv() {
             let mut flush_store = self.handle(event);
             while let Ok(event) = events.try_recv() {
                 flush_store |= self.handle(event);
             }
+            flush_early(&mut self.replica, &frames);
             self.journal
                 .persist(&mut self.replica)
                 .unwrap_or_else(|err| fatal(&err));
@@ -1210,6 +1220,9 @@ mod tests {
         loop {
             let mut frames: Vec<(ReplicaID, String)> = Vec::new();
             for node in nodes.iter_mut() {
+                for (dst, message) in node.replica.drain_messages_before_persist() {
+                    frames.push((dst, encode(&Frame::Message(message))));
+                }
                 node.journal.persist(&mut node.replica).unwrap();
                 for (dst, message) in node.replica.drain_messages() {
                     frames.push((dst, encode(&Frame::Message(message))));
@@ -1306,7 +1319,14 @@ mod tests {
         drop(node);
         let restarted = Node::open(1, config(3), &dirs[1], false).unwrap();
         nodes.insert(1, restarted);
-        assert_eq!(before, nodes[1].replica.persistent_state());
+        // The last step only moved the commit number, so the journal was
+        // behind the store, and the restart takes the store's count as a
+        // checkpoint: the log now starts there.
+        let after = nodes[1].replica.persistent_state();
+        assert_eq!(before.commit_number, after.commit_number);
+        assert_eq!(before.commit_number, after.log_start);
+        assert_eq!(before.log.len(), after.log_start + after.log.len());
+        assert_eq!(before.client_table, after.client_table);
         assert_eq!(
             Some("1".to_string()),
             nodes[1].replica.state_machine().get("a")
@@ -1612,6 +1632,38 @@ mod disk_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A step that only moved the commit number is not written. After a
+    /// restart the journal's commit number is behind the store's applied
+    /// count, and the replica takes the store's.
+    #[test]
+    fn journal_skips_commit_only_steps() {
+        let dir = temp_dir("commit-only");
+        let mut node = Node::open(1, config(), &dir, false).unwrap();
+        for op_number in 1..=3 {
+            prepare(&mut node, op_number);
+        }
+        node.replica.on_message(Message::Commit {
+            view_number: 0,
+            commit_number: 3,
+        });
+        assert!(!node.journal.persist(&mut node.replica).unwrap());
+        node.replica.drain_messages().for_each(drop);
+        node.replica.drain_replies().for_each(drop);
+        assert_eq!(3, node.replica.applied());
+        drop(node);
+
+        let node = Node::open(1, config(), &dir, false).unwrap();
+        assert_eq!(3, node.replica.commit_number());
+        assert_eq!(3, node.replica.log_start());
+        assert_eq!(3, node.replica.state_machine().applied);
+        assert_eq!(
+            Some("v3".to_string()),
+            node.replica.state_machine().get("k3")
+        );
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A crash in the middle of a journal write can leave the first records
     /// of a batch on disk without the counters that close it. A replay must
     /// ignore them: they describe a state the replica never acknowledged.
@@ -1723,10 +1775,16 @@ mod disk_tests {
         }
         drop(store);
 
-        let node = Node::open(1, config(), &dir, false).unwrap();
-        assert_eq!(CHILD_OPS, node.replica.commit_number());
-        assert_eq!(CHILD_OPS, node.replica.state_machine().applied);
+        // The journal's last write was the Prepare of the last op, which
+        // committed the one before; the final commit-only step was never
+        // written, and the primary's next Commit brings it back.
+        let mut node = Node::open(1, config(), &dir, false).unwrap();
+        assert_eq!(CHILD_OPS - 1, node.replica.commit_number());
+        assert_eq!(CHILD_OPS, node.replica.op_number());
+        assert_eq!(CHILD_OPS - 1, node.replica.state_machine().applied);
         assert_eq!(CHILD_PERSIST_AT - 1, node.replica.log_start());
+        commit(&mut node, CHILD_OPS);
+        assert_eq!(CHILD_OPS, node.replica.state_machine().applied);
         for op_number in 1..=CHILD_OPS {
             assert_eq!(
                 Some(format!("v{op_number}")),

@@ -260,6 +260,11 @@ trait Version: Sized + 'static {
     fn persist(replica: &mut Self::Replica);
     fn flush_store(replica: &mut Self::Replica);
     fn drain(replica: &mut Self::Replica) -> (Vec<(ReplicaID, Self::Msg)>, Vec<ReplyEvent>);
+    /// Messages that may go out before the persist. The original library
+    /// has none.
+    fn drain_early(_replica: &mut Self::Replica) -> Vec<(ReplicaID, Self::Msg)> {
+        Vec::new()
+    }
 }
 
 fn config<C>(new: fn() -> C, add: fn(&mut C)) -> C {
@@ -417,6 +422,9 @@ impl Version for Current {
             .replica
             .compact(applied.saturating_sub(LOG_RETENTION));
     }
+    fn drain_early(replica: &mut Self::Replica) -> Vec<(ReplicaID, Self::Msg)> {
+        replica.replica.drain_messages_before_persist().collect()
+    }
     fn drain(replica: &mut Self::Replica) -> (Vec<(ReplicaID, Self::Msg)>, Vec<ReplyEvent>) {
         let messages = replica.replica.drain_messages().collect();
         let replies = replica
@@ -432,8 +440,9 @@ impl Version for Current {
     }
 }
 
-/// A replica's event loop: every message already queued, then persist,
-/// then send. Idle logic every tick, a store persist every `FLUSH_TICKS`.
+/// A replica's event loop: every message already queued, then the
+/// messages that need not wait, then persist, then the rest. Idle logic
+/// every tick, a store persist every `FLUSH_TICKS`.
 fn run_replica<V: Version>(
     mut replica: V::Replica,
     inbox: Receiver<V::Msg>,
@@ -459,6 +468,9 @@ fn run_replica<V: Version>(
         }
         while let Ok(message) = inbox.try_recv() {
             V::on_message(&mut replica, message);
+        }
+        for (dst, message) in V::drain_early(&mut replica) {
+            let _ = peers[dst].send(message);
         }
         V::persist(&mut replica);
         let (messages, reply_events) = V::drain(&mut replica);

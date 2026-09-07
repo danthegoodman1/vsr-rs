@@ -40,21 +40,29 @@ Each node keeps its data in `kvstore-node-N`, or the directory given with
 `--data`:
 
 - `journal/` holds the replica's log and counters, in a write-ahead log
-  from the `writeahead` crate. After every batch of events, before anything
-  the batch produced is sent, the node appends what changed and fsyncs
-  once: the log entries from the change marker on, a truncation or
-  compaction if there was one, and the counters.
+  from the `writeahead` crate, see [`journal.rs`](journal.rs). After every
+  batch of events, before anything the batch produced is sent, the node
+  appends what changed and fsyncs once: the log entries from the change
+  marker on, a truncation or compaction if there was one, and the
+  counters, which close the batch. A replay applies a batch only once it
+  has seen the counters, since a torn write can leave the first records of
+  a batch on disk.
 - `store/` is a `fjall` database with the keys and values, the client
   table, and the number of operations applied, all written in the same
-  batch as each operation. It never fsyncs on its own. A timer persists it
-  once a second, and the replica then compacts its log up to what the store
-  has made durable, less a thousand entries kept for replicas a little
-  behind. Journal files with nothing left in them are deleted.
+  batch as each operation. The replica executes operations only after the
+  journal is written, so the store is never ahead of the journal, except
+  for a checkpoint it restored, which is persisted at once. The store never
+  fsyncs on its own otherwise. A timer persists it once a second, and the
+  replica then compacts its log up to what the store has made durable,
+  less a thousand entries kept for replicas a little behind. Journal files
+  with nothing left in them are deleted.
 
 On restart the node replays the journal, opens the store, and applies the
 committed entries the store had not persisted. A node whose data is gone
-starts empty; with `--recover` it recovers from the others instead, as a
-replacement machine should.
+starts empty; with `--recover`, which needs an empty data directory, it
+recovers from the others instead, as a replacement machine should. A
+store behind the journal's compaction point, as after restoring the wrong
+backup, is refused.
 
 ## Notes
 

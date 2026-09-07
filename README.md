@@ -71,10 +71,13 @@ You provide the rest:
 - **Persistence.** After each step, before delivering what the step
   produced, write what `PersistentState` describes: a few counters, the
   client table, and the log entries from the change marker on. Pass it to
-  `Replica::restart` when the replica restarts. The state machine may lag
-  behind the log; the replica applies what it lacks again. That ordering is
-  the whole durability argument: an acknowledgement leaves only after the
-  entry it covers is on disk.
+  `Replica::restart` when the replica restarts, with the number of ops the
+  state machine had made durable; the replica applies the rest again. That
+  ordering is the whole durability argument: an acknowledgement leaves only
+  after the entry it covers is on disk, and the replica executes committed
+  operations only when its replies are drained, after the step is
+  persisted, so a state machine that persists what it executes never gets
+  ahead of the log.
 - **Compaction.** Once the state machine has made its state durable, call
   `compact` with the op number it reached. A replica that needs entries
   another one has compacted gets a checkpoint of its state instead.
@@ -204,8 +207,10 @@ TigerBeetle's VOPR. It runs a cluster and its clients in one thread, passes
 every message through a network that loses, replays, and delays them,
 crashes and restarts replicas, sometimes from what they persisted after a
 power loss, sometimes with their disk wiped, cuts the power of every
-replica at once, makes state machines flush and replicas compact their
-logs, and checks a set of safety properties after every tick:
+replica at once, or of a replica that has just restored a checkpoint and
+not yet persisted the step, makes state machines flush and replicas
+compact their logs, and checks a set of safety properties after every
+tick:
 
 - committed prefixes agree on every replica,
 - committed operations survive on enough replicas,
@@ -240,6 +245,21 @@ to reproduce whatever failed:
 scripts/simulate --budget 1h
 scripts/simulate --report          # the runs of the current commit
 scripts/simulate --report --all    # every commit ever run
+```
+
+### Benchmark
+
+[`bench/`](bench) measures what the durable log costs. Three replicas run
+on their own threads with the event loop of the kvstore example and a
+fjall store, and a set of closed-loop clients drives them over channels.
+It compares the library as it was before the durable log, embedded from
+the commit that preceded it, with the current library with the journal
+off and on, so the cost of the new bookkeeping and the cost of the fsync
+per batch can be read apart.
+
+```console
+cargo run --release -p vsr-bench
+CLIENTS=1,16,256 cargo run --release -p vsr-bench
 ```
 
 ### Coverage

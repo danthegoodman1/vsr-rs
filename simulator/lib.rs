@@ -151,6 +151,8 @@ pub struct ReplicaSnapshot {
     pub view_number: ViewNumber,
     pub op_number: usize,
     pub commit_number: usize,
+    pub applied: usize,
+    pub log_start: usize,
     pub value: i64,
 }
 
@@ -758,6 +760,8 @@ impl Simulator {
                     view_number: replica.view_number(),
                     op_number: replica.op_number(),
                     commit_number: replica.commit_number(),
+                    applied: replica.applied(),
+                    log_start: replica.log_start(),
                     value: replica.state_machine().value,
                 })
                 .collect(),
@@ -923,15 +927,21 @@ impl Simulator {
         // itself, and it needs a quorum of answers for that. The protocol
         // tolerates f failures and a recovering replica is one, so the core
         // must hold a quorum of replicas that are not recovering: draw
-        // those first, then fill up at random.
+        // those first, then fill up at random. A replica that lost power
+        // is what its disk says it is, which is what it restarts as.
         let mut candidates: Vec<usize> = (0..replica_count).collect();
         for i in (1..replica_count).rev() {
             let j = self.prng.gen_range(0..=i);
             candidates.swap(i, j);
         }
-        let (mut core, recovering): (Vec<usize>, Vec<usize>) = candidates
-            .into_iter()
-            .partition(|&id| !self.replicas[id].is_recovering());
+        let (mut core, recovering): (Vec<usize>, Vec<usize>) =
+            candidates.into_iter().partition(|&id| {
+                if !self.replica_up[id] && self.crash_kind[id] == CrashKind::PowerLoss {
+                    !self.disks[id].state.recovering
+                } else {
+                    !self.replicas[id].is_recovering()
+                }
+            });
         assert!(core.len() >= quorum);
         // The first quorum of healthy replicas is in. The remaining slots
         // are filled from the other healthy ones and the recovering ones

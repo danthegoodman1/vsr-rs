@@ -263,3 +263,21 @@ fn power_loss_after_every_checkpoint() {
         );
     }
 }
+
+/// The liveness core must judge a replica that lost power by what its
+/// disk says, since that is what it restarts as. Seed 17238020951159820783
+/// at commit cf5628a put a replica that had restored a checkpoint, then
+/// lost power before persisting the step, into the core on the strength of
+/// its in-memory status; it restarted recovering, with the primary of its
+/// persisted view crashed for good, and the core never converged.
+#[test]
+fn liveness_core_judges_power_lost_replicas_by_disk() {
+    let _ = env_logger::try_init();
+    let seed = 17238020951159820783;
+    let mut prng = ChaCha8Rng::seed_from_u64(seed);
+    let options = Options::swarm(&mut prng);
+    let mut simulator = Simulator::init(seed, options).expect("options are valid");
+    if let Err(err) = simulator.run(Limits::default()) {
+        panic!("seed {seed} failed at tick {}: {err:#}", simulator.ticks);
+    }
+}

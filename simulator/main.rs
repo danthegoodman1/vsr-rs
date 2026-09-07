@@ -174,6 +174,21 @@ fn main() -> anyhow::Result<()> {
         Some(message) => {
             println!();
             println!("          FAILED at tick {}: {message}", simulator.ticks);
+            for replica in simulator.snapshot().replicas {
+                println!(
+                    "          replica {}: {}{} {:?} view={} op={} commit={} applied={} log_start={} value={}",
+                    replica.id,
+                    if replica.up { "up" } else { "down" },
+                    if replica.in_core { ", core" } else { "" },
+                    replica.status,
+                    replica.view_number,
+                    replica.op_number,
+                    replica.commit_number,
+                    replica.applied,
+                    replica.log_start,
+                    replica.value
+                );
+            }
             println!("          you can reproduce this failure with seed={seed}");
             std::process::exit(1);
         }

@@ -255,6 +255,7 @@ trait Version: Sized + 'static {
     fn request(client: &mut Self::Client, op: Op) -> usize;
     fn client_messages(client: &mut Self::Client) -> Vec<(ReplicaID, Self::Msg)>;
     fn reply(client: &mut Self::Client, request_number: usize, view_number: usize) -> bool;
+    fn client_idle(client: &mut Self::Client);
     fn on_message(replica: &mut Self::Replica, message: Self::Msg);
     fn on_idle(replica: &mut Self::Replica);
     fn persist(replica: &mut Self::Replica);
@@ -313,6 +314,9 @@ impl Version for Original {
     }
     fn reply(client: &mut Self::Client, request_number: usize, view_number: usize) -> bool {
         client.on_reply(request_number, view_number)
+    }
+    fn client_idle(client: &mut Self::Client) {
+        client.on_idle();
     }
     fn on_message(replica: &mut Self::Replica, message: Self::Msg) {
         replica.on_message(message);
@@ -394,6 +398,9 @@ impl Version for Current {
     fn reply(client: &mut Self::Client, request_number: usize, view_number: usize) -> bool {
         client.on_reply(request_number, view_number)
     }
+    fn client_idle(client: &mut Self::Client) {
+        client.on_idle();
+    }
     fn on_message(replica: &mut Self::Replica, message: Self::Msg) {
         replica.replica.on_message(message);
     }
@@ -457,9 +464,12 @@ fn run_replica<V: Version>(
         match inbox.recv_timeout(timeout) {
             Ok(message) => V::on_message(&mut replica, message),
             Err(RecvTimeoutError::Timeout) => {
+                // A tick that fell due while messages kept the loop busy
+                // is not made up for: an idle period means the inbox was
+                // empty for a while, as with the kvstore's timer thread.
                 V::on_idle(&mut replica);
                 ticks += 1;
-                next_tick += TICK;
+                next_tick = Instant::now() + TICK;
                 if ticks.is_multiple_of(FLUSH_TICKS) {
                     V::flush_store(&mut replica);
                 }
@@ -543,9 +553,16 @@ fn run_clients<V: Version>(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                // Nothing is lost on a channel, so this only matters while
-                // a view change is under way.
-                resend_at += TICK * 5;
+                // A request that reached a replica during a view change
+                // was dropped; re-send it, to every replica, as the kvstore
+                // does every few ticks.
+                for client in states.iter_mut() {
+                    V::client_idle(client);
+                    for (dst, message) in V::client_messages(client) {
+                        let _ = peers[dst].send(message);
+                    }
+                }
+                resend_at = Instant::now() + TICK * 5;
             }
             Err(RecvTimeoutError::Disconnected) => return sample,
         }
@@ -610,6 +627,7 @@ fn run<V: Version>(name: &str, journaled: bool, clients: usize, data: &Path) {
 }
 
 fn main() {
+    let _ = env_logger::try_init();
     let data = PathBuf::from(
         std::env::args()
             .nth(1)
@@ -634,9 +652,19 @@ fn main() {
         "{:<18} {:>7} {:>10} {:>9} {:>9} {:>9} {:>10} {:>9}",
         "configuration", "clients", "ops/s", "p50 ms", "p99 ms", "max ms", "fsync/s", "ops/fsync"
     );
+    let only = std::env::var("CONFIG").ok();
     for &clients in &client_counts {
-        run::<Original>("original", false, clients, &data);
-        run::<Current>("durable-nojournal", false, clients, &data);
-        run::<Current>("durable", true, clients, &data);
+        if only.as_deref().is_none_or(|name| name == "original") {
+            run::<Original>("original", false, clients, &data);
+        }
+        if only
+            .as_deref()
+            .is_none_or(|name| name == "durable-nojournal")
+        {
+            run::<Current>("durable-nojournal", false, clients, &data);
+        }
+        if only.as_deref().is_none_or(|name| name == "durable") {
+            run::<Current>("durable", true, clients, &data);
+        }
     }
 }

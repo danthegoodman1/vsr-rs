@@ -776,8 +776,13 @@ impl Simulator {
         let nonce = self.prng.gen::<u64>();
         let view_number = self.disks[id].state.view_number;
         self.disks[id] = Disk::new();
-        self.replicas[id] =
-            Replica::recover(id, self.config.clone(), Accumulator::default(), view_number, nonce);
+        self.replicas[id] = Replica::recover(
+            id,
+            self.config.clone(),
+            Accumulator::default(),
+            view_number,
+            nonce,
+        );
         for property in &mut self.properties {
             property.on_reboot(id);
         }
@@ -1028,7 +1033,10 @@ impl Simulator {
             }
             if self.replica_up[id] {
                 if self.prng.gen_bool(self.options.replica_crash_probability) {
-                    let kind = if self.prng.gen_bool(self.options.replica_power_loss_probability) {
+                    let kind = if self
+                        .prng
+                        .gen_bool(self.options.replica_power_loss_probability)
+                    {
                         CrashKind::PowerLoss
                     } else {
                         CrashKind::Pause

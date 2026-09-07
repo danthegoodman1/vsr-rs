@@ -14,3 +14,8 @@ log = "0.4.17"
 
 [dev-dependencies]
 env_logger = "0.9.1"
+# The kvstore example persists the replica's log with writeahead and its
+# state with fjall.
+fjall = "3.1.10"
+futures = "0.3"
+writeahead = "0.3.0"

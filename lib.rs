@@ -677,6 +677,10 @@ impl<SM: StateMachine> Replica<SM> {
     /// owner persisted for it, and a state machine that has applied the
     /// first `applied` operations; the replica applies the committed ones
     /// after that once more, so `applied` must be at least `log_start`.
+    /// A state machine ahead of the log holds a checkpoint it made durable
+    /// before the log was persisted after it, as [`StateMachine::restore`]
+    /// requires: the checkpoint stands, and the log, which predates it, is
+    /// dropped.
     ///
     /// A replica that was normal in its view resumes there: its log is the
     /// one it acknowledged, and if it was the primary the backups will
@@ -694,18 +698,21 @@ impl<SM: StateMachine> Replica<SM> {
         if state.recovering {
             return Replica::recover(self_id, config, state_machine, state.view_number, nonce);
         }
+        let (commit_number, log_start, log) = if applied > state.commit_number {
+            (applied, applied, Vec::new())
+        } else {
+            (state.commit_number, state.log_start, state.log)
+        };
         assert!(
-            state.log_start <= applied && applied <= state.commit_number,
-            "state machine applied {applied} ops, log starts after {} and {} are committed",
-            state.log_start,
-            state.commit_number
+            log_start <= applied,
+            "state machine applied {applied} ops but the log starts after {log_start}"
         );
-        assert!(state.commit_number <= state.log_start + state.log.len());
+        assert!(commit_number <= log_start + log.len());
         let mut replica = Replica::new(self_id, config, state_machine);
         replica.view_number = state.view_number;
         replica.last_normal_view = state.last_normal_view;
-        replica.log_start = state.log_start;
-        replica.log = state.log;
+        replica.log_start = log_start;
+        replica.log = log;
         replica.commit_number = applied;
         for record in state.client_table {
             replica.client_table.insert(
@@ -716,20 +723,16 @@ impl<SM: StateMachine> Replica<SM> {
                 },
             );
         }
-        replica.commit_up_to(state.commit_number, false);
+        replica.commit_up_to(commit_number, false);
         trace!(
-            "Replica {self_id} restarts in view {} with {} ops, {} committed, {} applied",
+            "Replica {self_id} restarts in view {} with {} ops, {commit_number} committed, {applied} applied",
             state.view_number,
-            replica.op_number(),
-            state.commit_number,
-            applied
+            replica.op_number()
         );
         if state.last_normal_view == state.view_number {
             if replica.is_primary() {
                 for op_number in replica.commit_number + 1..=replica.op_number() {
-                    replica
-                        .acks
-                        .insert(op_number, BTreeSet::from([self_id]));
+                    replica.acks.insert(op_number, BTreeSet::from([self_id]));
                 }
             }
         } else {
@@ -1900,7 +1903,9 @@ impl<SM: StateMachine> Replica<SM> {
     /// The log entries from `op_number` on, or from the first one held if
     /// `op_number` has been compacted.
     pub fn log_from(&self, op_number: OpNumber) -> &[LogEntry<SM::Input>] {
-        let skip = op_number.saturating_sub(self.log_start + 1).min(self.log.len());
+        let skip = op_number
+            .saturating_sub(self.log_start + 1)
+            .min(self.log.len());
         &self.log[skip..]
     }
 

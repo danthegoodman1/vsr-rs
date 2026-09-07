@@ -201,7 +201,13 @@ impl Property for StateMatchesCommittedLog {
                 ctx.tick,
                 state.applied.len()
             );
-            for (i, entry) in ctx.committed.iter().enumerate().take(commit).skip(*verified) {
+            for (i, entry) in ctx
+                .committed
+                .iter()
+                .enumerate()
+                .take(commit)
+                .skip(*verified)
+            {
                 ensure!(
                     state.applied[i] == entry.op,
                     "tick {}: replica {id} applied {:?} as op {} but the committed op is {:?}",

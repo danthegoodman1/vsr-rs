@@ -145,14 +145,7 @@ impl Network {
     }
 
     /// Accepts a message sent at tick `now`, applying faults.
-    pub fn send(
-        &mut self,
-        now: u64,
-        from: Origin,
-        dst: ReplicaId,
-        msg: Msg,
-        rng: &mut ChaCha8Rng,
-    ) {
+    pub fn send(&mut self, now: u64, from: Origin, dst: ReplicaId, msg: Msg, rng: &mut ChaCha8Rng) {
         self.summary.sent += 1;
         if matches!(msg, Message::Request { .. }) && !self.options.fault_client_messages {
             self.enqueue_at(now, now, from, dst, msg);
@@ -183,14 +176,7 @@ impl Network {
         due.into_values().collect()
     }
 
-    fn enqueue(
-        &mut self,
-        now: u64,
-        from: Origin,
-        dst: ReplicaId,
-        msg: Msg,
-        rng: &mut ChaCha8Rng,
-    ) {
+    fn enqueue(&mut self, now: u64, from: Origin, dst: ReplicaId, msg: Msg, rng: &mut ChaCha8Rng) {
         let delay = self.sample_delay(rng);
         if delay > self.options.one_way_delay_min {
             trace!("tick {now}: delaying {msg:?} to {dst} by {delay}");

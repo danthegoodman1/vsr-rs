@@ -9,8 +9,8 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use vsr_rs::{
-    Checkpoint, Client, Config, LogEntry, Message, MessageFor, OpNumber, PersistentState,
-    Replica, ReplicaID, Reply, RequestNumber, StateMachine, Status,
+    Checkpoint, Client, Config, LogEntry, Message, MessageFor, OpNumber, PersistentState, Replica,
+    ReplicaID, Reply, RequestNumber, StateMachine, Status,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,7 +69,12 @@ fn persist(disk: &mut Disk, replica: &mut Replica<Accumulator>) {
     disk.commit_number = replica.commit_number();
     disk.client_table = replica.client_table();
     disk.recovering = replica.is_recovering();
-    assert_eq!(*disk, replica.persistent_state(), "disk of replica {}", replica.id());
+    assert_eq!(
+        *disk,
+        replica.persistent_state(),
+        "disk of replica {}",
+        replica.id()
+    );
 }
 
 fn empty_disk() -> Disk {
@@ -195,9 +200,9 @@ impl Cluster {
     /// Whether every replica is in normal status in the same view.
     fn settled(&self) -> bool {
         let view = self.replicas[0].view_number();
-        self.replicas.iter().all(|replica| {
-            replica.status() == Status::Normal && replica.view_number() == view
-        })
+        self.replicas
+            .iter()
+            .all(|replica| replica.status() == Status::Normal && replica.view_number() == view)
     }
 
     fn take_replies(&mut self) -> Vec<Reply<()>> {
@@ -219,11 +224,25 @@ impl Cluster {
     /// Like `restart`, with a state machine that had made the first
     /// `applied` ops durable.
     fn restart_with_applied(&mut self, replica_id: ReplicaID, applied: OpNumber, sm: Accumulator) {
+        let disk = self.disks[replica_id].clone();
+        self.restart_with_state(replica_id, applied, sm, disk);
+    }
+
+    /// Like `restart`, from the given persisted state.
+    fn restart_with_state(
+        &mut self,
+        replica_id: ReplicaID,
+        applied: OpNumber,
+        sm: Accumulator,
+        state: Disk,
+    ) {
         self.replicas[replica_id].drain_messages().for_each(drop);
         self.replicas[replica_id].drain_replies().for_each(drop);
-        let disk = self.disks[replica_id].clone();
         self.replicas[replica_id] =
-            Replica::restart(replica_id, self.config.clone(), sm, applied, disk, 7);
+            Replica::restart(replica_id, self.config.clone(), sm, applied, state, 7);
+        // The disk is what the restarted replica now persists.
+        self.disks[replica_id] = self.replicas[replica_id].persistent_state();
+        self.replicas[replica_id].take_log_changes();
     }
 }
 
@@ -1102,4 +1121,38 @@ fn test_prepare_ok_coalesced() {
         })
         .collect();
     assert_eq!(vec![3], acks);
+}
+
+/// A replica restored a checkpoint, which its state machine made durable
+/// at once, and lost power before the log was persisted after it. The
+/// state machine is ahead of the log: the checkpoint stands and the older
+/// log is dropped, then the replica catches up from the primary.
+#[test]
+fn test_restart_with_state_machine_ahead_of_log() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.request(Op::Add(30));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    // What replica 1 had persisted before the checkpoint: op 1 committed,
+    // op 2 still uncommitted.
+    let mut stale = cluster.disks[1].clone();
+    stale.commit_number = 1;
+    stale.log.truncate(2);
+    stale.client_table = cluster.disks[1].client_table.clone();
+    cluster.restart_with_state(1, 3, Accumulator { value: 60 }, stale);
+    assert_eq!(3, cluster.replicas[1].commit_number());
+    assert_eq!(3, cluster.replicas[1].log_start());
+    assert_eq!(0, cluster.replicas[1].log().len());
+    assert_eq!(60, cluster.value(1));
+
+    cluster.request(Op::Add(40));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    for id in 0..3 {
+        assert_eq!(100, cluster.value(id));
+    }
 }

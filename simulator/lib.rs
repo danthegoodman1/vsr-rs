@@ -226,6 +226,11 @@ pub struct Options {
     /// Probability per tick that a running replica's state machine flushes
     /// its state to disk, after which the replica compacts its log.
     pub replica_flush_probability: f64,
+    /// Probability that a replica loses power right after its state
+    /// machine restored a checkpoint, which is durable at once, and before
+    /// the step is persisted: it comes back with the state machine ahead
+    /// of its log.
+    pub checkpoint_power_loss_probability: f64,
     /// Log entries a replica keeps behind what its state machine has
     /// flushed, so that replicas a little behind catch up from the log
     /// rather than from a checkpoint.
@@ -274,6 +279,7 @@ impl Options {
             replica_power_loss_probability: f64::from(prng.gen_range(0..=100)) / 100.0,
             blackout_probability: f64::from(prng.gen_range(0..=5)) / 100_000.0,
             replica_flush_probability: f64::from(prng.gen_range(0..=100)) / 1_000.0,
+            checkpoint_power_loss_probability: f64::from(prng.gen_range(0..=50)) / 100.0,
             log_retention: prng.gen_range(0..=50),
             full_core: false,
             primary_timeout,
@@ -325,6 +331,10 @@ impl Options {
             ),
             ("blackout_probability", self.blackout_probability),
             ("replica_flush_probability", self.replica_flush_probability),
+            (
+                "checkpoint_power_loss_probability",
+                self.checkpoint_power_loss_probability,
+            ),
         ] {
             ensure!(
                 (0.0..=1.0).contains(&p),
@@ -437,6 +447,11 @@ impl fmt::Display for Options {
             f,
             "          replica_flush_probability={}",
             self.replica_flush_probability
+        )?;
+        writeln!(
+            f,
+            "          checkpoint_power_loss_probability={}",
+            self.checkpoint_power_loss_probability
         )?;
         writeln!(f, "          log_retention={} entries", self.log_retention)?;
         writeln!(f, "          full_core={}", self.full_core)?;
@@ -790,17 +805,20 @@ impl Simulator {
     }
 
     /// Replaces a replica with one rebuilt from its disk, as after a power
-    /// loss. The disk must hold exactly what the replica would have
-    /// persisted, which checks the change marker the disk was kept from.
+    /// loss. The disk holds exactly what the replica would have persisted,
+    /// which checks the change marker the disk was kept from, unless the
+    /// power went out after a checkpoint and before the step was written.
     fn restart_replica_from_disk(&mut self, id: usize) {
         debug!("tick {}: replica {id} restarts from its disk", self.ticks);
         let disk = &self.disks[id];
-        assert_eq!(
-            disk.state,
-            self.replicas[id].persistent_state(),
-            "tick {}: disk of replica {id} differs from its state",
-            self.ticks
-        );
+        if disk.applied <= disk.state.commit_number {
+            assert_eq!(
+                disk.state,
+                self.replicas[id].persistent_state(),
+                "tick {}: disk of replica {id} differs from its state",
+                self.ticks
+            );
+        }
         let nonce = self.prng.gen::<u64>();
         self.replicas[id] = Replica::restart(
             id,
@@ -1141,11 +1159,36 @@ impl Simulator {
             prng,
             ticks,
             disks,
+            replica_up,
+            crash_kind,
+            replica_stable_until,
+            crashes,
+            power_losses,
+            options,
+            liveness_mode,
             ..
         } = self;
         for (id, replica) in replicas.iter_mut().enumerate() {
-            // Persist before anything the step produced goes out.
-            disks[id].persist(replica);
+            // Persist before anything the step produced goes out. A
+            // replica that restored a checkpoint may lose power in between,
+            // once the checkpoint is durable and before the rest is: what
+            // the step produced is then lost with it.
+            let power_loss_probability = if *liveness_mode {
+                0.0
+            } else {
+                options.checkpoint_power_loss_probability
+            };
+            if disks[id].persist(replica, prng, power_loss_probability) {
+                debug!("tick {ticks}: replica {id} loses power after restoring a checkpoint");
+                replica_up[id] = false;
+                crash_kind[id] = CrashKind::PowerLoss;
+                replica_stable_until[id] = *ticks + options.replica_crash_stability;
+                *crashes += 1;
+                *power_losses += 1;
+                replica.drain_messages().for_each(drop);
+                replica.drain_replies().for_each(drop);
+                continue;
+            }
             for (dst, msg) in replica.drain_messages() {
                 network.send(*ticks, Origin::Replica(id), dst, msg, prng);
             }
@@ -1237,12 +1280,24 @@ impl Disk {
     /// and before delivering what the step produced. A checkpoint the
     /// replica installed moved its log start past what the state machine
     /// had flushed: the state machine makes a restored checkpoint durable
-    /// at once, as the library requires.
-    fn persist(&mut self, replica: &mut Replica<Accumulator>) {
+    /// at once, as the library requires. With `power_loss_probability`,
+    /// the replica then loses power before the rest of the step is
+    /// written, and the disk keeps the state before the step; returns
+    /// whether that happened.
+    fn persist(
+        &mut self,
+        replica: &mut Replica<Accumulator>,
+        prng: &mut ChaCha8Rng,
+        power_loss_probability: f64,
+    ) -> bool {
         if replica.log_start() > self.applied {
             self.flush(replica);
+            if power_loss_probability > 0.0 && prng.gen_bool(power_loss_probability) {
+                return true;
+            }
         }
         self.state.update_from(replica);
+        false
     }
 
     /// The state machine writes its state to disk.

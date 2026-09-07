@@ -77,6 +77,7 @@ fn fault_script() {
     options.network = NetworkOptions::perfect();
     options.replica_crash_probability = 0.0;
     options.blackout_probability = 0.0;
+    options.checkpoint_power_loss_probability = 0.0;
     options.full_core = true;
     options.requests_max = 20_000;
     let script = parse_script(
@@ -128,6 +129,7 @@ fn run_script(seed: u64, requests_max: usize, script: &str) -> Simulator {
     options.replica_reboot_probability = 0.0;
     options.blackout_probability = 0.0;
     options.replica_flush_probability = 0.0;
+    options.checkpoint_power_loss_probability = 0.0;
     options.log_retention = 0;
     options.full_core = true;
     options.requests_max = requests_max;
@@ -237,5 +239,27 @@ fn power_losses_and_compaction() {
             options.replica_flush_probability = 0.05;
             options.log_retention = 0;
         });
+    }
+}
+
+/// Every checkpoint a replica restores is followed by a power loss before
+/// the step is persisted, so the replica comes back with its state
+/// machine ahead of its log, for a few seeds.
+#[test]
+fn power_loss_after_every_checkpoint() {
+    for seed in [15, 16, 17] {
+        let simulator = run(seed, |options| {
+            options.replica_crash_probability = 0.0005;
+            options.replica_restart_probability = 0.02;
+            options.replica_power_loss_probability = 1.0;
+            options.replica_reboot_probability = 0.0;
+            options.replica_flush_probability = 0.05;
+            options.checkpoint_power_loss_probability = 1.0;
+            options.log_retention = 0;
+        });
+        assert!(
+            simulator.power_losses > simulator.crashes / 2,
+            "seed {seed}"
+        );
     }
 }

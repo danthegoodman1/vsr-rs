@@ -56,6 +56,10 @@ struct Args {
     /// flushed.
     #[arg(long)]
     log_retention: Option<usize>,
+    /// Override the probability that a replica loses power right after
+    /// restoring a checkpoint, before the step is persisted.
+    #[arg(long)]
+    checkpoint_power_loss_probability: Option<f64>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -114,6 +118,9 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(n) = args.log_retention {
         options.log_retention = n;
+    }
+    if let Some(p) = args.checkpoint_power_loss_probability {
+        options.checkpoint_power_loss_probability = p;
     }
     let limits = Limits {
         ticks_max_requests: args.ticks_max_requests,

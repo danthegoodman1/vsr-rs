@@ -34,10 +34,11 @@ pub trait Property {
         Ok(())
     }
 
-    /// Called when a replica comes back from a crash with no memory: an
-    /// empty log, view 0, a fresh state machine. Whatever the property
-    /// tracked about that replica starts over.
-    fn on_reboot(&mut self, _replica_id: usize) {}
+    /// Called when a replica comes back from a crash as something other
+    /// than what it was in memory: with no memory at all, or from a disk
+    /// that lost the last step. Whatever the property tracked about that
+    /// replica starts over.
+    fn on_restart(&mut self, _replica_id: usize) {}
 }
 
 /// The default property set.
@@ -81,7 +82,7 @@ impl Property for Durability {
         "durability"
     }
 
-    fn on_reboot(&mut self, replica_id: usize) {
+    fn on_restart(&mut self, replica_id: usize) {
         if let Some(verified) = self.verified.get_mut(replica_id) {
             *verified = 0;
         }
@@ -130,7 +131,7 @@ impl Property for CommitNumberMonotonic {
         "commit-number-monotonic"
     }
 
-    fn on_reboot(&mut self, replica_id: usize) {
+    fn on_restart(&mut self, replica_id: usize) {
         if let Some(last) = self.last_commit.get_mut(replica_id) {
             *last = 0;
         }
@@ -183,7 +184,7 @@ impl Property for StateMatchesCommittedLog {
         "state-matches-committed-log"
     }
 
-    fn on_reboot(&mut self, replica_id: usize) {
+    fn on_restart(&mut self, replica_id: usize) {
         if let Some(verified) = self.verified.get_mut(replica_id) {
             *verified = (0, 0);
         }
@@ -244,7 +245,7 @@ impl Property for CommittedPrefixAgreement {
         "committed-prefix-agreement"
     }
 
-    fn on_reboot(&mut self, replica_id: usize) {
+    fn on_restart(&mut self, replica_id: usize) {
         if let Some(verified) = self.verified.get_mut(replica_id) {
             *verified = 0;
         }

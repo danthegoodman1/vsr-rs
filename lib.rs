@@ -256,7 +256,10 @@ pub struct PersistentState<Op, Output> {
     /// entries after it.
     pub log_start: OpNumber,
     pub log: Vec<LogEntry<Op>>,
-    /// The latest executed request of each client, with its result.
+    /// The latest executed request of each client, with its result. On a
+    /// restart it must be as of what the state machine has applied, or
+    /// later: a state machine that persists its state keeps the table with
+    /// it, as [`StateMachine::apply`] gives it what it needs for that.
     pub client_table: Vec<ClientRecord<Output>>,
     /// Whether the replica was still recovering from a disk loss. Such a
     /// replica holds nothing it may act on, and must recover again.

@@ -281,3 +281,21 @@ fn liveness_core_judges_power_lost_replicas_by_disk() {
         panic!("seed {seed} failed at tick {}: {err:#}", simulator.ticks);
     }
 }
+
+/// A replica that lost power right after restoring a checkpoint restarts
+/// from a disk that lost its last step, so its commit number in memory
+/// steps back to what was persisted, and its client table is the one the
+/// state machine flushed. Seeds 18270094277230390851 and 4992333150870101077
+/// at commit 534b85c tripped the monotonic commit property on that.
+#[test]
+fn restart_from_a_disk_that_lost_the_last_step() {
+    let _ = env_logger::try_init();
+    for seed in [18270094277230390851, 4992333150870101077] {
+        let mut prng = ChaCha8Rng::seed_from_u64(seed);
+        let options = Options::swarm(&mut prng);
+        let mut simulator = Simulator::init(seed, options).expect("options are valid");
+        if let Err(err) = simulator.run(Limits::default()) {
+            panic!("seed {seed} failed at tick {}: {err:#}", simulator.ticks);
+        }
+    }
+}

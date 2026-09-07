@@ -28,7 +28,10 @@ use log::{debug, info, trace};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::fmt;
-use vsr_rs::{Client, Config, LogEntry, OpNumber, PersistentState, Replica, Reply, RequestNumber};
+use vsr_rs::{
+    Client, ClientRecord, Config, LogEntry, OpNumber, PersistentState, Replica, Reply,
+    RequestNumber,
+};
 
 use network::Network;
 pub use network::{message_kind, Envelope, MessageSummary, NetworkOptions, Origin};
@@ -803,7 +806,7 @@ impl Simulator {
             nonce,
         );
         for property in &mut self.properties {
-            property.on_reboot(id);
+            property.on_restart(id);
         }
         self.reboots += 1;
     }
@@ -815,7 +818,8 @@ impl Simulator {
     fn restart_replica_from_disk(&mut self, id: usize) {
         debug!("tick {}: replica {id} restarts from its disk", self.ticks);
         let disk = &self.disks[id];
-        if disk.applied <= disk.state.commit_number {
+        let lost_last_step = disk.applied > disk.state.commit_number;
+        if !lost_last_step {
             assert_eq!(
                 disk.state,
                 self.replicas[id].persistent_state(),
@@ -824,14 +828,25 @@ impl Simulator {
             );
         }
         let nonce = self.prng.gen::<u64>();
+        // The client table comes back from the state machine's flush, as
+        // of what it had applied then; the replica fills in the rest.
+        let state = PersistentState {
+            client_table: disk.client_table.clone(),
+            ..disk.state.clone()
+        };
         self.replicas[id] = Replica::restart(
             id,
             self.config.clone(),
             disk.state_machine.clone(),
             disk.applied,
-            disk.state.clone(),
+            state,
             nonce,
         );
+        if lost_last_step {
+            for property in &mut self.properties {
+                property.on_restart(id);
+            }
+        }
     }
 
     /// Takes a running replica down.
@@ -1271,10 +1286,12 @@ enum CrashKind {
 #[derive(Clone, Debug)]
 struct Disk {
     state: PersistentState<Op, i64>,
-    /// The state machine as of its last flush, and the number of ops it
-    /// had applied then.
+    /// The state machine as of its last flush, the number of ops it had
+    /// applied then, and the client table as of then, which a durable
+    /// state machine keeps alongside what it applies.
     state_machine: Accumulator,
     applied: OpNumber,
+    client_table: Vec<ClientRecord<i64>>,
 }
 
 impl Disk {
@@ -1283,6 +1300,7 @@ impl Disk {
             state: PersistentState::empty(),
             state_machine: Accumulator::default(),
             applied: 0,
+            client_table: Vec::new(),
         }
     }
 
@@ -1314,5 +1332,6 @@ impl Disk {
     fn flush(&mut self, replica: &Replica<Accumulator>) {
         self.applied = replica.applied();
         self.state_machine = replica.state_machine().clone();
+        self.client_table = replica.client_table();
     }
 }

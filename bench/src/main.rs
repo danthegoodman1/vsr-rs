@@ -27,10 +27,9 @@
 mod original;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
-use futures::executor::block_on;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
@@ -38,7 +37,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use vsr_rs::{Checkpoint, ClientRecord, LogEntry, OpNumber, Replica, ReplicaID, StateMachine};
-use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions, WriteHandle};
 
 /// How often each replica runs its idle logic.
 const TICK: Duration = Duration::from_millis(100);
@@ -192,103 +190,43 @@ impl StateMachine for DurableStore {
 }
 
 // ---------------------------------------------------------------------------
-// The journal, as in the kvstore example: one batch per step, one fsync
+// The journal, shared with the kvstore example
 
-struct Journal {
-    writer: WriteHandle,
-    log_start: OpNumber,
-    op_number: OpNumber,
-    header: (usize, usize, usize),
-    files: BTreeMap<OpNumber, u64>,
-    trimmed_before: u64,
-    /// Batches written, which is fsyncs.
-    batches: Arc<AtomicU64>,
-    _wal: WriteAhead<SimpleFile>,
+#[path = "../../examples/kvstore/journal.rs"]
+mod journal;
+
+use journal::{EntryCodec, Journal};
+
+fn encode_entry(entry: &LogEntry<Op>) -> String {
+    format!(
+        "{} {} {} {}",
+        entry.client_id, entry.request_number, entry.op.key, entry.op.value
+    )
 }
 
-impl Journal {
-    fn open(dir: &Path, batches: Arc<AtomicU64>) -> Journal {
-        let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
-            log_dir: dir.to_path_buf(),
-            max_file_size: WAL_FILE_SIZE,
-            ..Default::default()
-        });
-        wal.start().expect("open journal");
-        let writer = wal.writer().expect("journal writer");
-        Journal {
-            writer,
-            log_start: 0,
-            op_number: 0,
-            header: (0, 0, 0),
-            files: BTreeMap::new(),
-            trimmed_before: 0,
-            batches,
-            _wal: wal,
-        }
-    }
-
-    fn persist(&mut self, replica: &mut Replica<DurableStore>) {
-        let mut records: Vec<Vec<u8>> = Vec::new();
-        let mut written = Vec::new();
-        let log_start = replica.log_start();
-        if log_start > self.log_start {
-            records.push(format!("C {log_start}").into_bytes());
-        }
-        if let Some(from) = replica.take_log_changes() {
-            if from <= self.op_number {
-                records.push(format!("T {from}").into_bytes());
-            }
-            let first = from.max(log_start + 1);
-            for (i, entry) in replica.log_from(first).iter().enumerate() {
-                let op_number = first + i;
-                records.push(
-                    format!(
-                        "E {op_number} {} {} {} {}",
-                        entry.client_id, entry.request_number, entry.op.key, entry.op.value
-                    )
-                    .into_bytes(),
-                );
-                written.push(op_number);
-            }
-        }
-        let header = (
-            replica.view_number(),
-            replica.last_normal_view(),
-            replica.commit_number(),
-        );
-        let op_number = replica.op_number();
-        if records.is_empty()
-            && header == self.header
-            && log_start == self.log_start
-            && op_number == self.op_number
-        {
-            return;
-        }
-        records.push(
-            format!(
-                "H {} {} {} {log_start} {op_number} 0",
-                header.0, header.1, header.2
-            )
-            .into_bytes(),
-        );
-        let ids = block_on(self.writer.write_batch(records)).expect("write journal");
-        self.batches.fetch_add(1, Ordering::Relaxed);
-        let file = ids.last().map(|id| id.file_id).unwrap_or(0);
-        for op_number in written {
-            self.files.insert(op_number, file);
-        }
-        self.files = self.files.split_off(&(log_start + 1));
-        self.files.split_off(&(op_number + 1));
-        self.header = header;
-        self.log_start = log_start;
-        self.op_number = op_number;
-        let oldest = self.files.values().min().copied().unwrap_or(file).min(file);
-        if oldest > self.trimmed_before {
-            block_on(self.writer.trim_before(oldest)).expect("trim journal");
-            self.trimmed_before = oldest;
-        }
-    }
+fn decode_entry(text: &str) -> Result<LogEntry<Op>, String> {
+    let mut words = text.split_whitespace();
+    let mut number = || -> Result<u64, String> {
+        words
+            .next()
+            .ok_or("truncated entry")?
+            .parse()
+            .map_err(|_| "bad number".to_string())
+    };
+    Ok(LogEntry {
+        client_id: number()? as usize,
+        request_number: number()? as usize,
+        op: Op {
+            key: number()?,
+            value: number()?,
+        },
+    })
 }
+
+const ENTRY_CODEC: EntryCodec<Op> = EntryCodec {
+    encode: encode_entry,
+    decode: decode_entry,
+};
 
 // ---------------------------------------------------------------------------
 // One harness for both libraries
@@ -398,7 +336,8 @@ impl Version for Original {
 /// The current library, with or without the journal.
 struct Durable {
     replica: Replica<DurableStore>,
-    journal: Option<Journal>,
+    journal: Option<Journal<Op>>,
+    batches: Arc<AtomicU64>,
 }
 
 struct Current;
@@ -422,8 +361,16 @@ impl Version for Current {
             }),
             store,
         );
-        let journal = journaled.then(|| Journal::open(&dir.join("journal"), batches));
-        Durable { replica, journal }
+        let journal = journaled.then(|| {
+            Journal::open::<()>(&dir.join("journal"), WAL_FILE_SIZE, ENTRY_CODEC)
+                .expect("open journal")
+                .0
+        });
+        Durable {
+            replica,
+            journal,
+            batches,
+        }
     }
     fn client(id: usize) -> Self::Client {
         vsr_rs::Client::new(
@@ -450,14 +397,21 @@ impl Version for Current {
     }
     fn persist(replica: &mut Self::Replica) {
         match &mut replica.journal {
-            Some(journal) => journal.persist(&mut replica.replica),
+            Some(journal) => {
+                if journal
+                    .persist(&mut replica.replica)
+                    .expect("write journal")
+                {
+                    replica.batches.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             None => {
                 replica.replica.take_log_changes();
             }
         }
     }
     fn flush_store(replica: &mut Self::Replica) {
-        let applied = replica.replica.state_machine().0.applied;
+        let applied = replica.replica.applied();
         replica.replica.state_machine().0.persist();
         replica
             .replica

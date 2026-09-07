@@ -78,15 +78,7 @@ fn persist(disk: &mut Disk, replica: &mut Replica<Accumulator>) {
 }
 
 fn empty_disk() -> Disk {
-    PersistentState {
-        view_number: 0,
-        last_normal_view: 0,
-        commit_number: 0,
-        log_start: 0,
-        log: Vec::new(),
-        client_table: Vec::new(),
-        recovering: false,
-    }
+    PersistentState::empty()
 }
 
 /// Replicas and one client, with the messages between them held in a queue
@@ -1155,4 +1147,121 @@ fn test_restart_with_state_machine_ahead_of_log() {
     for id in 0..3 {
         assert_eq!(100, cluster.value(id));
     }
+}
+
+/// Five replicas, so a quorum is three. One backup gets three ops at once
+/// and acknowledges only the last, another gets only the first op. An
+/// acknowledgement covers every earlier op, so the first op has a quorum
+/// and must commit at once.
+#[test]
+fn test_prepare_ok_covers_earlier_ops() {
+    let mut cluster = Cluster::new(5);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.request(Op::Add(30));
+    cluster.tick_with(&|replica_id, message| match message {
+        Message::Prepare { op_number, .. } => {
+            replica_id == 1 || (replica_id == 2 && *op_number == 1)
+        }
+        _ => true,
+    });
+    assert_eq!(1, cluster.replicas[0].commit_number());
+    assert_eq!(10, cluster.value(0));
+    cluster.idle();
+    cluster.tick();
+    assert_eq!(3, cluster.replicas[0].commit_number());
+}
+
+/// A backup restored a checkpoint, which its state machine made durable at
+/// once, and lost power before the log was persisted after it. The log it
+/// had persisted holds an op beyond the checkpoint that it had
+/// acknowledged, and that op must survive the restart: the primary is
+/// gone, and the op commits in the next view from this replica's log.
+#[test]
+fn test_restart_keeps_acknowledged_entries_beyond_checkpoint() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.request(Op::Add(30));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    // Op 4 reaches the backups; the primary never sees their
+    // acknowledgements.
+    cluster.request(Op::Add(40));
+    cluster.tick_with(&|_, message| !matches!(message, Message::PrepareOk { op_number: 4, .. }));
+    assert_eq!(4, cluster.replicas[1].op_number());
+    assert_eq!(3, cluster.replicas[1].commit_number());
+    // Replica 1's disk is behind its state machine: it says op 1 is the
+    // last committed, while the state machine holds a checkpoint at op 3.
+    let mut stale = cluster.disks[1].clone();
+    stale.commit_number = 1;
+    cluster.restart_with_state(1, 3, Accumulator { value: 60 }, stale);
+    assert_eq!(3, cluster.replicas[1].log_start());
+    assert_eq!(3, cluster.replicas[1].commit_number());
+    assert_eq!(4, cluster.replicas[1].op_number());
+    assert_eq!(60, cluster.value(1));
+
+    for _ in 0..10 {
+        cluster.idle_without(0);
+        cluster.tick_without(0);
+    }
+    assert!(cluster.replicas[1].is_primary());
+    assert_eq!(4, cluster.replicas[1].commit_number());
+    assert_eq!(100, cluster.value(1));
+    assert_eq!(100, cluster.value(2));
+}
+
+/// A recovering replica restored the primary's checkpoint and lost power
+/// before it was persisted as recovered. It recovers again with its state
+/// machine at the checkpoint, and applies only what comes after it.
+#[test]
+fn test_restart_recovering_with_checkpoint() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.request(Op::Add(30));
+    cluster.tick();
+    cluster.replicas[1] =
+        Replica::recover(1, cluster.config.clone(), Accumulator::default(), 0, 42);
+    cluster.disks[1] = empty_disk();
+    cluster.collect();
+    assert!(cluster.disks[1].recovering);
+    cluster.restart_with_applied(1, 2, Accumulator { value: 30 });
+    assert!(cluster.replicas[1].is_recovering());
+    assert_eq!(2, cluster.replicas[1].log_start());
+    cluster.tick();
+    assert!(!cluster.replicas[1].is_recovering());
+    assert_eq!(3, cluster.replicas[1].commit_number());
+    assert_eq!(60, cluster.value(1));
+}
+
+/// Committed ops are executed when the replies are drained, after the
+/// owner has persisted the step, so a state machine that persists what it
+/// executes never gets ahead of the log.
+#[test]
+fn test_state_machine_applies_on_drain() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    // The primary has a quorum of acknowledgements and has committed op
+    // 1, but has not executed it.
+    assert_eq!(1, cluster.replicas[0].commit_number());
+    assert_eq!(0, cluster.replicas[0].applied());
+    assert_eq!(0, cluster.value(0));
+    let replies: Vec<_> = cluster.replicas[0].drain_replies().collect();
+    assert_eq!(1, replies.len());
+    assert_eq!(1, cluster.replicas[0].applied());
+    assert_eq!(10, cluster.value(0));
 }

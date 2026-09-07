@@ -28,10 +28,9 @@
 //! README.md next to this file.
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
-use futures::executor::block_on;
-use futures::StreamExt;
+use journal::{EntryCodec, Journal};
 use log::{debug, info, warn};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -39,11 +38,11 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use vsr_rs::{
-    Checkpoint, Client, ClientID, ClientRecord, Config, LogEntry, LogSegment, Message, MessageFor,
-    OpNumber, PersistentState, RecoveryState, Replica, ReplicaID, Reply, RequestNumber,
-    StateMachine,
+    Checkpoint, Client, ClientID, ClientRecord, Config, LogBase, LogEntry, LogSegment, Message,
+    MessageFor, OpNumber, RecoveryState, Replica, ReplicaID, Reply, RequestNumber, StateMachine,
 };
-use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions, WriteHandle};
+
+mod journal;
 
 /// How often the replica and the clients run their idle logic.
 const TICK: Duration = Duration::from_millis(100);
@@ -85,6 +84,18 @@ fn encode_entry(entry: &LogEntry<Op>) -> String {
         encode_op(&entry.op)
     )
 }
+
+fn decode_entry(text: &str) -> Result<LogEntry<Op>, String> {
+    let mut t = Tokens::new(text);
+    let entry = t.entry()?;
+    t.done()?;
+    Ok(entry)
+}
+
+const ENTRY_CODEC: EntryCodec<Op> = EntryCodec {
+    encode: encode_entry,
+    decode: decode_entry,
+};
 
 fn encode_entries(log: &[LogEntry<Op>]) -> String {
     let mut out = log.len().to_string();
@@ -329,193 +340,6 @@ impl StateMachine for Store {
     }
 }
 
-type KvState = PersistentState<Op, Option<String>>;
-
-// ---------------------------------------------------------------------------
-// The journal: the replica's persistent state in a write-ahead log
-
-/// The replica's counters, as last written to the journal.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Header {
-    view_number: usize,
-    last_normal_view: usize,
-    commit_number: usize,
-    log_start: OpNumber,
-    op_number: OpNumber,
-    recovering: bool,
-}
-
-/// The replica's persistent state, kept in an append-only log of records:
-/// an entry (`E`), a truncation of the entries from an op number on (`T`),
-/// a compaction of the entries up to an op number (`C`), and the counters
-/// (`H`), which close every batch. Replaying the records in order rebuilds
-/// the state. Files that hold nothing a replay needs are deleted.
-struct Journal {
-    dir: PathBuf,
-    writer: WriteHandle,
-    header: Header,
-    /// The file holding the latest copy of each retained entry.
-    files: BTreeMap<OpNumber, u64>,
-    trimmed_before: u64,
-}
-
-impl Journal {
-    /// Opens the journal in `dir` and replays it. Returns the replica's
-    /// state if the node has run before, without the client table, which
-    /// the store keeps.
-    fn open(dir: &Path, max_file_size: u64) -> Result<(Journal, Option<KvState>), String> {
-        let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
-            log_dir: dir.to_path_buf(),
-            max_file_size,
-            ..Default::default()
-        });
-        wal.start()
-            .map_err(|err| format!("cannot open journal at {}: {err}", dir.display()))?;
-        let writer = wal
-            .writer()
-            .map_err(|err| format!("cannot write journal: {err}"))?;
-        let mut entries: BTreeMap<OpNumber, (LogEntry<Op>, u64)> = BTreeMap::new();
-        let mut header: Option<Header> = None;
-        let mut stream = wal
-            .create_stream()
-            .map_err(|err| format!("cannot read journal: {err}"))?;
-        block_on(async {
-            while let Some(item) = stream.next().await {
-                let (id, bytes) = item.map_err(|err| format!("cannot read journal: {err}"))?;
-                let line = utf8(&bytes);
-                let mut t = Tokens::new(&line);
-                match t.word()? {
-                    "E" => {
-                        let op_number = t.num()?;
-                        entries.insert(op_number, (t.entry()?, id.file_id));
-                    }
-                    "T" => {
-                        entries.split_off(&t.num()?);
-                    }
-                    "C" => {
-                        entries = entries.split_off(&(t.num()? + 1));
-                    }
-                    "H" => {
-                        header = Some(Header {
-                            view_number: t.num()?,
-                            last_normal_view: t.num()?,
-                            commit_number: t.num()?,
-                            log_start: t.num()?,
-                            op_number: t.num()?,
-                            recovering: t.num()? != 0,
-                        });
-                    }
-                    kind => return Err(format!("bad journal record {kind:?}")),
-                }
-                t.done()?;
-            }
-            Ok::<(), String>(())
-        })?;
-        drop(stream);
-        let mut journal = Journal {
-            dir: dir.to_path_buf(),
-            writer,
-            header: Header::default(),
-            files: BTreeMap::new(),
-            trimmed_before: 0,
-        };
-        let Some(header) = header else {
-            return Ok((journal, None));
-        };
-        let mut log = Vec::with_capacity(header.op_number - header.log_start);
-        for op_number in header.log_start + 1..=header.op_number {
-            let (entry, file) = entries
-                .remove(&op_number)
-                .ok_or_else(|| format!("journal lacks op {op_number}"))?;
-            log.push(entry);
-            journal.files.insert(op_number, file);
-        }
-        journal.header = header;
-        let state = KvState {
-            view_number: header.view_number,
-            last_normal_view: header.last_normal_view,
-            commit_number: header.commit_number,
-            log_start: header.log_start,
-            log,
-            client_table: Vec::new(),
-            recovering: header.recovering,
-        };
-        Ok((journal, Some(state)))
-    }
-
-    /// Writes what the last steps changed, in one batch with one fsync,
-    /// then deletes the files that hold nothing a replay needs any more.
-    fn persist(&mut self, replica: &mut Replica<Store>) -> Result<(), String> {
-        let mut records: Vec<Vec<u8>> = Vec::new();
-        let mut written: Vec<OpNumber> = Vec::new();
-        let log_start = replica.log_start();
-        if log_start > self.header.log_start {
-            records.push(format!("C {log_start}").into_bytes());
-        }
-        if let Some(from) = replica.take_log_changes() {
-            if from <= self.header.op_number {
-                records.push(format!("T {from}").into_bytes());
-            }
-            let first = from.max(log_start + 1);
-            for (i, entry) in replica.log_from(first).iter().enumerate() {
-                let op_number = first + i;
-                records.push(format!("E {op_number} {}", encode_entry(entry)).into_bytes());
-                written.push(op_number);
-            }
-        }
-        let header = Header {
-            view_number: replica.view_number(),
-            last_normal_view: replica.last_normal_view(),
-            commit_number: replica.commit_number(),
-            log_start,
-            op_number: replica.op_number(),
-            recovering: replica.is_recovering(),
-        };
-        if records.is_empty() && header == self.header {
-            return Ok(());
-        }
-        records.push(
-            format!(
-                "H {} {} {} {} {} {}",
-                header.view_number,
-                header.last_normal_view,
-                header.commit_number,
-                header.log_start,
-                header.op_number,
-                u8::from(header.recovering)
-            )
-            .into_bytes(),
-        );
-        let ids = block_on(self.writer.write_batch(records))
-            .map_err(|err| format!("cannot write journal: {err}"))?;
-        let file = ids.last().map(|id| id.file_id).unwrap_or(0);
-        for op_number in written {
-            self.files.insert(op_number, file);
-        }
-        // Entries compacted or truncated away no longer pin their files.
-        self.files = self.files.split_off(&(log_start + 1));
-        self.files.split_off(&(header.op_number + 1));
-        self.header = header;
-        // A replay needs the files from the oldest retained entry's on, and
-        // the one just written, which holds the counters.
-        let oldest = self.files.values().min().copied().unwrap_or(file).min(file);
-        if oldest > self.trimmed_before {
-            let stats = block_on(self.writer.trim_before(oldest))
-                .map_err(|err| format!("cannot trim journal: {err}"))?;
-            if stats.files_deleted > 0 {
-                debug!(
-                    "journal {}: deleted {} files, {} bytes",
-                    self.dir.display(),
-                    stats.files_deleted,
-                    stats.bytes_reclaimed
-                );
-            }
-            self.trimmed_before = oldest;
-        }
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Wire encoding between nodes: one message per line, whitespace separated.
 
@@ -549,15 +373,11 @@ fn encode_checkpoint(checkpoint: &KvCheckpoint) -> String {
 }
 
 fn encode_segment(segment: &KvSegment) -> String {
-    let checkpoint = match &segment.checkpoint {
-        Some(checkpoint) => format!("+ {}", encode_checkpoint(checkpoint)),
-        None => "-".to_string(),
+    let base = match &segment.base {
+        LogBase::Op(op_number) => format!("- {op_number}"),
+        LogBase::Checkpoint(checkpoint) => format!("+ {}", encode_checkpoint(checkpoint)),
     };
-    format!(
-        "{} {} {checkpoint}",
-        segment.start,
-        encode_entries(&segment.entries)
-    )
+    format!("{base} {}", encode_entries(&segment.entries))
 }
 
 fn encode(frame: &Frame) -> String {
@@ -609,23 +429,19 @@ fn encode(frame: &Frame) -> String {
                 view_number,
                 replica_id,
                 last_normal_view,
-                log_start,
-                log,
-                op_number,
+                segment,
                 commit_number,
             } => format!(
-                "DOVIEWCHANGE {view_number} {replica_id} {last_normal_view} {log_start} {op_number} {commit_number} {}",
-                encode_entries(log)
+                "DOVIEWCHANGE {view_number} {replica_id} {last_normal_view} {commit_number} {}",
+                encode_segment(segment)
             ),
             Message::StartView {
                 view_number,
-                log_start,
-                log,
-                op_number,
+                segment,
                 commit_number,
             } => format!(
-                "STARTVIEW {view_number} {log_start} {op_number} {commit_number} {}",
-                encode_entries(log)
+                "STARTVIEW {view_number} {commit_number} {}",
+                encode_segment(segment)
             ),
             Message::Recovery {
                 replica_id,
@@ -681,18 +497,13 @@ impl<'a> Tokens<'a> {
     }
 
     fn segment(&mut self) -> Result<KvSegment, String> {
-        let start = self.num()?;
-        let entries = self.entries()?;
-        let checkpoint = match self.word()? {
-            "+" => Some(self.checkpoint()?),
-            "-" => None,
-            word => return Err(format!("bad checkpoint marker {word:?}")),
+        let base = match self.word()? {
+            "-" => LogBase::Op(self.num()?),
+            "+" => LogBase::Checkpoint(self.checkpoint()?),
+            word => return Err(format!("bad segment base {word:?}")),
         };
-        Ok(LogSegment {
-            checkpoint,
-            start,
-            entries,
-        })
+        let entries = self.entries()?;
+        Ok(LogSegment { base, entries })
     }
 }
 
@@ -739,17 +550,13 @@ fn decode(line: &str) -> Result<Frame, String> {
             view_number: t.num()?,
             replica_id: t.num()?,
             last_normal_view: t.num()?,
-            log_start: t.num()?,
-            op_number: t.num()?,
             commit_number: t.num()?,
-            log: t.entries()?,
+            segment: t.segment()?,
         },
         "STARTVIEW" => Message::StartView {
             view_number: t.num()?,
-            log_start: t.num()?,
-            op_number: t.num()?,
             commit_number: t.num()?,
-            log: t.entries()?,
+            segment: t.segment()?,
         },
         "RECOVERY" => Message::Recovery {
             replica_id: t.num()?,
@@ -1073,7 +880,7 @@ struct Node {
     id: ReplicaID,
     config: Config,
     replica: Replica<Store>,
-    journal: Journal,
+    journal: Journal<Op>,
     connections: HashMap<u64, Connection>,
     ticks: u64,
     view: usize,
@@ -1084,7 +891,8 @@ struct Node {
 impl Node {
     /// Opens the store and the journal in `data_dir`, and builds the
     /// replica: a restart from what they hold if the node has run before,
-    /// a new replica otherwise, or a recovering one if asked to.
+    /// a new replica otherwise, or a recovering one if asked to, which
+    /// needs an empty directory.
     fn open(id: ReplicaID, config: Config, data_dir: &Path, recover: bool) -> Result<Node, String> {
         Node::open_with(id, config, data_dir, recover, WAL_FILE_SIZE)
     }
@@ -1098,15 +906,34 @@ impl Node {
         wal_file_size: u64,
     ) -> Result<Node, String> {
         let store = Store::open(&data_dir.join("store"))?;
-        let (journal, state) = Journal::open(&data_dir.join("journal"), wal_file_size)?;
+        let (journal, state) =
+            Journal::open(&data_dir.join("journal"), wal_file_size, ENTRY_CODEC)?;
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos() as u64)
             .unwrap_or(0);
+        let inconsistent = |what: &str| {
+            format!(
+                "{what} in {}; restore the store and the journal from the same backup, or remove both and start with --recover",
+                data_dir.display()
+            )
+        };
         let replica = match state {
+            Some(_) if recover => {
+                return Err(format!(
+                    "--recover needs an empty data directory, and {} has a journal",
+                    data_dir.display()
+                ));
+            }
             Some(mut state) => {
                 state.client_table = store.client_table()?;
                 let applied = store.applied;
+                if applied < state.log_start {
+                    return Err(inconsistent(&format!(
+                        "the store has applied {applied} ops but the journal has compacted up to {}",
+                        state.log_start
+                    )));
+                }
                 println!(
                     "restarting from view {} with {} ops, {} committed, {applied} applied by the store",
                     state.view_number,
@@ -1116,11 +943,10 @@ impl Node {
                 Replica::restart(id, config.clone(), store, applied, state, nonce)
             }
             None if store.applied > 0 => {
-                return Err(format!(
-                    "the store in {} has applied {} ops but the journal is empty",
-                    data_dir.display(),
+                return Err(inconsistent(&format!(
+                    "the store has applied {} ops but the journal is empty",
                     store.applied
-                ));
+                )));
             }
             None if recover => {
                 println!("recovering with an empty disk");
@@ -1186,7 +1012,7 @@ impl Node {
     /// and compacts the log up to there, less the retention window. The
     /// compaction reaches the journal with the next batch.
     fn flush_store(&mut self) -> Result<(), String> {
-        let applied = self.replica.state_machine().applied;
+        let applied = self.replica.applied();
         self.replica.state_machine().persist()?;
         self.replica
             .compact(applied.saturating_sub(self.log_retention));
@@ -1536,8 +1362,9 @@ mod tests {
         assert_eq!(5, nodes[0].replica.log_start());
         assert_eq!(0, nodes[2].replica.op_number());
 
-        // Node 2 hears about op 6, finds the gap, and gets a checkpoint,
-        // taken once the primary has committed op 6.
+        // Node 2 hears about op 6, finds the gap, and gets a checkpoint:
+        // the primary's state as executed, which trails its commit number
+        // within a batch, and the entries after it.
         run(
             &mut nodes,
             &mut client,
@@ -1546,7 +1373,7 @@ mod tests {
         );
         idle(&mut nodes, &[]);
         deliver(&mut nodes, &mut client, &[]);
-        assert_eq!(6, nodes[2].replica.log_start());
+        assert_eq!(5, nodes[2].replica.log_start());
         assert_eq!(6, nodes[2].replica.commit_number());
         assert_eq!(6, nodes[2].replica.state_machine().applied);
         for i in 0..6 {
@@ -1611,8 +1438,7 @@ mod tests {
             Message::NewState {
                 view_number: 2,
                 segment: LogSegment {
-                    checkpoint: Some(checkpoint.clone()),
-                    start: 7,
+                    base: LogBase::Checkpoint(checkpoint.clone()),
                     entries: entries.clone(),
                 },
                 commit_number: 7,
@@ -1620,8 +1446,7 @@ mod tests {
             Message::NewState {
                 view_number: 2,
                 segment: LogSegment {
-                    checkpoint: None,
-                    start: 3,
+                    base: LogBase::Op(3),
                     entries: entries.clone(),
                 },
                 commit_number: 3,
@@ -1632,8 +1457,7 @@ mod tests {
                 replica_id: 1,
                 state: Some(RecoveryState {
                     segment: LogSegment {
-                        checkpoint: Some(checkpoint),
-                        start: 7,
+                        base: LogBase::Checkpoint(checkpoint),
                         entries: entries.clone(),
                     },
                     commit_number: 7,
@@ -1643,16 +1467,18 @@ mod tests {
                 view_number: 3,
                 replica_id: 2,
                 last_normal_view: 2,
-                log_start: 6,
-                log: entries.clone(),
-                op_number: 7,
+                segment: LogSegment {
+                    base: LogBase::Op(6),
+                    entries: entries.clone(),
+                },
                 commit_number: 6,
             },
             Message::StartView {
                 view_number: 3,
-                log_start: 6,
-                log: entries,
-                op_number: 7,
+                segment: LogSegment {
+                    base: LogBase::Op(6),
+                    entries,
+                },
                 commit_number: 7,
             },
         ];
@@ -1686,7 +1512,8 @@ mod disk_tests {
     }
 
     /// Feeds a backup node the primary's `Prepare` for `op_number`, then
-    /// persists the journal, as the event loop does after every batch.
+    /// persists the journal and drains the replica, as the event loop does
+    /// after every batch.
     fn prepare(node: &mut Node, op_number: OpNumber) {
         node.replica.on_message(Message::Prepare {
             view_number: 0,
@@ -1696,8 +1523,7 @@ mod disk_tests {
             op: Op::Put(format!("k{op_number}"), format!("v{op_number}")),
             commit_number: op_number - 1,
         });
-        node.journal.persist(&mut node.replica).unwrap();
-        node.replica.drain_messages().for_each(drop);
+        step(node);
     }
 
     /// Tells a backup node that the primary committed up to `commit_number`.
@@ -1706,8 +1532,13 @@ mod disk_tests {
             view_number: 0,
             commit_number,
         });
+        step(node);
+    }
+
+    fn step(node: &mut Node) {
         node.journal.persist(&mut node.replica).unwrap();
         node.replica.drain_messages().for_each(drop);
+        node.replica.drain_replies().for_each(drop);
     }
 
     /// Journal files small enough to rotate every few entries.
@@ -1764,6 +1595,54 @@ mod disk_tests {
             Some("v120".to_string()),
             node.replica.state_machine().get("k120")
         );
+        drop(node);
+
+        // A used directory refuses --recover, and a store that fell behind
+        // the journal's compaction point, as after restoring the wrong
+        // backup, is refused rather than replayed from a gap.
+        let err = Node::open_with(1, config(), &dir, true, SMALL_WAL_FILE)
+            .err()
+            .expect("--recover refused");
+        assert!(err.contains("--recover"), "{err}");
+        std::fs::remove_dir_all(dir.join("store")).unwrap();
+        let err = Node::open_with(1, config(), &dir, false, SMALL_WAL_FILE)
+            .err()
+            .expect("store behind the journal refused");
+        assert!(err.contains("compacted"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash in the middle of a journal write can leave the first records
+    /// of a batch on disk without the counters that close it. A replay must
+    /// ignore them: they describe a state the replica never acknowledged.
+    #[test]
+    fn journal_ignores_a_torn_batch() {
+        let dir = temp_dir("torn-batch");
+        let mut node = Node::open(1, config(), &dir, false).unwrap();
+        for op_number in 1..=5 {
+            prepare(&mut node, op_number);
+        }
+        let before = node.replica.persistent_state();
+        drop(node);
+
+        // The first records of a batch that truncates the log and appends
+        // a different op 4, without its header.
+        let mut wal = writeahead::WriteAhead::<writeahead::SimpleFile>::with_options(
+            writeahead::WriteAheadOptions {
+                log_dir: dir.join("journal"),
+                ..Default::default()
+            },
+        );
+        wal.start().unwrap();
+        futures::executor::block_on(
+            wal.write_batch(vec![b"T 4".to_vec(), b"E 4 7 99 PUT other value".to_vec()]),
+        )
+        .unwrap();
+        drop(wal);
+
+        let node = Node::open(1, config(), &dir, false).unwrap();
+        assert_eq!(before, node.replica.persistent_state());
+        drop(node);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

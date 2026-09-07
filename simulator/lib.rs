@@ -1227,54 +1227,27 @@ struct Disk {
 impl Disk {
     fn new() -> Disk {
         Disk {
-            state: PersistentState {
-                view_number: 0,
-                last_normal_view: 0,
-                commit_number: 0,
-                log_start: 0,
-                log: Vec::new(),
-                client_table: Vec::new(),
-                recovering: false,
-            },
+            state: PersistentState::empty(),
             state_machine: Accumulator::default(),
             applied: 0,
         }
     }
 
     /// Writes what a step changed, the way an owner does after every step
-    /// and before delivering what the step produced: the compacted prefix
-    /// goes first, then the entries from the change marker on, then the
-    /// counters and the client table.
+    /// and before delivering what the step produced. A checkpoint the
+    /// replica installed moved its log start past what the state machine
+    /// had flushed: the state machine makes a restored checkpoint durable
+    /// at once, as the library requires.
     fn persist(&mut self, replica: &mut Replica<Accumulator>) {
-        // A checkpoint the replica installed moved its log start past what
-        // the state machine had flushed. The state machine makes a restored
-        // checkpoint durable at once, as the library requires.
         if replica.log_start() > self.applied {
             self.flush(replica);
         }
-        let disk = &mut self.state;
-        let log_start = replica.log_start();
-        if log_start > disk.log_start {
-            let dropped = (log_start - disk.log_start).min(disk.log.len());
-            disk.log.drain(..dropped);
-            disk.log_start = log_start;
-        }
-        if let Some(from) = replica.take_log_changes() {
-            let keep = from.saturating_sub(disk.log_start + 1).min(disk.log.len());
-            disk.log.truncate(keep);
-            disk.log.extend_from_slice(replica.log_from(from));
-        }
-        disk.view_number = replica.view_number();
-        disk.last_normal_view = replica.last_normal_view();
-        disk.commit_number = replica.commit_number();
-        disk.recovering = replica.is_recovering();
-        // The client table is small, so it is written whole.
-        disk.client_table = replica.client_table();
+        self.state.update_from(replica);
     }
 
     /// The state machine writes its state to disk.
     fn flush(&mut self, replica: &Replica<Accumulator>) {
-        self.applied = replica.commit_number();
+        self.applied = replica.applied();
         self.state_machine = replica.state_machine().clone();
     }
 }

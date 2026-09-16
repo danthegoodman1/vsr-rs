@@ -41,6 +41,29 @@ struct Args {
     /// Override the probability that a restart loses the replica's memory.
     #[arg(long)]
     replica_reboot_probability: Option<f64>,
+    /// Override the probability that a crash is a power loss, after which
+    /// the replica restarts from its disk.
+    #[arg(long)]
+    replica_power_loss_probability: Option<f64>,
+    /// Override the per-tick probability that every replica loses power.
+    #[arg(long)]
+    blackout_probability: Option<f64>,
+    /// Override the per-tick probability that a replica's state machine
+    /// flushes to disk, after which the replica compacts its log.
+    #[arg(long)]
+    replica_flush_probability: Option<f64>,
+    /// Override the log entries kept behind what the state machine has
+    /// flushed.
+    #[arg(long)]
+    log_retention: Option<usize>,
+    /// Override the probability that a replica loses power right after
+    /// restoring a checkpoint, before the step is persisted.
+    #[arg(long)]
+    checkpoint_power_loss_probability: Option<f64>,
+    /// Override the per-step probability that a replica loses power after
+    /// sending what need not wait, before persisting the step.
+    #[arg(long)]
+    step_power_loss_probability: Option<f64>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -88,6 +111,24 @@ fn main() -> anyhow::Result<()> {
     if let Some(p) = args.replica_reboot_probability {
         options.replica_reboot_probability = p;
     }
+    if let Some(p) = args.replica_power_loss_probability {
+        options.replica_power_loss_probability = p;
+    }
+    if let Some(p) = args.blackout_probability {
+        options.blackout_probability = p;
+    }
+    if let Some(p) = args.replica_flush_probability {
+        options.replica_flush_probability = p;
+    }
+    if let Some(n) = args.log_retention {
+        options.log_retention = n;
+    }
+    if let Some(p) = args.checkpoint_power_loss_probability {
+        options.checkpoint_power_loss_probability = p;
+    }
+    if let Some(p) = args.step_power_loss_probability {
+        options.step_power_loss_probability = p;
+    }
     let limits = Limits {
         ticks_max_requests: args.ticks_max_requests,
         ticks_max_convergence: args.ticks_max_convergence,
@@ -120,10 +161,12 @@ fn main() -> anyhow::Result<()> {
         simulator.requests_sent, simulator.requests_replied
     );
     println!(
-        "          replicas: crashes={} restarts={} reboots={} core={:?} up={:?}",
+        "          replicas: crashes={} power_losses={} restarts={} reboots={} flushes={} core={:?} up={:?}",
         simulator.crashes,
+        simulator.power_losses,
         simulator.restarts,
         simulator.reboots,
+        simulator.flushes,
         simulator.core(),
         (0..simulator.options.replica_count)
             .filter(|&id| simulator.is_up(id))
@@ -138,6 +181,21 @@ fn main() -> anyhow::Result<()> {
         Some(message) => {
             println!();
             println!("          FAILED at tick {}: {message}", simulator.ticks);
+            for replica in simulator.snapshot().replicas {
+                println!(
+                    "          replica {}: {}{} {:?} view={} op={} commit={} applied={} log_start={} value={}",
+                    replica.id,
+                    if replica.up { "up" } else { "down" },
+                    if replica.in_core { ", core" } else { "" },
+                    replica.status,
+                    replica.view_number,
+                    replica.op_number,
+                    replica.commit_number,
+                    replica.applied,
+                    replica.log_start,
+                    replica.value
+                );
+            }
             println!("          you can reproduce this failure with seed={seed}");
             std::process::exit(1);
         }

@@ -11,14 +11,44 @@
 //! how those get delivered, whether over sockets, through a simulated
 //! network, or straight into another replica in a test.
 //!
-//! The protocol keeps its state in memory, and a replica that crashes comes
-//! back through [`Replica::recover`], which fetches the state from the
-//! others. One thing must survive the crash: the view number. The owner
-//! persists [`Replica::view_number`] after every step, before it delivers
-//! what the step produced, and passes it back to `recover`. Without it a
-//! replica can forget that it asked for a view change and let two views run
-//! at once, as shown by Michael et al. in "Recovering Shared Objects Without
-//! Stable Storage".
+//! # Persistence
+//!
+//! The protocol keeps its state in memory, and the owner persists the part
+//! of it that must survive a crash: after every step, before it delivers
+//! what the step produced. That ordering is what makes the persistence
+//! sound: an acknowledgement leaves only after the entry it covers is on
+//! disk, and a view change is on disk before anything sent in the new view.
+//! What to persist is described by [`PersistentState`], and
+//! [`Replica::take_log_changes`] says which log entries a step touched so
+//! that the owner writes only those. A replica comes back from a crash with
+//! that state through [`Replica::restart`].
+//!
+//! The state machine runs behind the same ordering: a replica executes
+//! committed operations when its replies are drained, after the owner has
+//! persisted the step that committed them, so a state machine that
+//! persists what it executes never gets ahead of the log.
+//!
+//! Two things soften the ordering without weakening it. Messages that
+//! promise nothing about the sender's durable state can leave before the
+//! step is persisted, so that the primary's write overlaps the backups':
+//! [`Replica::drain_messages_before_persist`] yields them. And a step
+//! that changed nothing but the commit number need not be written before
+//! delivery at all, since a restart takes the commit number from what the
+//! state machine has applied when the log is behind it.
+//!
+//! A replica that lost its disk comes back through [`Replica::recover`]
+//! instead, which fetches the state from the others. One thing must survive
+//! even that: the view number. Without it a replica can forget that it asked
+//! for a view change and let two views run at once, as shown by Michael et
+//! al. in "Recovering Shared Objects Without Stable Storage".
+//!
+//! # Compaction
+//!
+//! The log grows without bound until the owner compacts it with
+//! [`Replica::compact`], which drops entries the state machine has made
+//! durable. A replica that needs entries another one has compacted gets a
+//! [`Checkpoint`] of that replica's state instead, through
+//! [`StateMachine::snapshot`] and [`StateMachine::restore`].
 
 use log::trace;
 use std::{
@@ -32,11 +62,11 @@ use std::{
 pub type ClientID = usize;
 
 /// The number of log entries a replica has executed. The entries at
-/// indexes below it are committed and never change.
+/// op numbers up to it are committed and never change.
 pub type CommitID = usize;
 
 /// The position of an entry in the log, counted from 1. A replica's op
-/// number is that of its last entry, so also the length of its log.
+/// number is that of its last entry.
 pub type OpNumber = usize;
 
 /// Identifies a replica: its index in the configuration's list of replicas.
@@ -51,13 +81,37 @@ pub type RequestNumber = usize;
 pub type ViewNumber = usize;
 
 /// State machine.
+///
+/// The replica executes committed operations through it, in op number
+/// order, when [`Replica::drain_messages`] or [`Replica::drain_replies`]
+/// is called: after the owner has persisted the step. A state machine
+/// that persists its state writes the op number it got with each
+/// operation alongside, and gives that number back to
+/// [`Replica::restart`], which executes what the state machine had not yet
+/// made durable once more.
 pub trait StateMachine {
     type Input: Clone + Debug;
     /// The result of applying an input. Replicas keep the latest result per
     /// client to answer a re-sent request without running it again.
     type Output: Clone + Debug;
+    /// A copy of the whole state, for a replica that fell behind a log this
+    /// one has compacted.
+    type Snapshot: Clone + Debug;
 
-    fn apply(&mut self, input: Self::Input) -> Self::Output;
+    /// Executes the request in `entry`, committed as `op_number`, and
+    /// returns its result.
+    fn apply(&mut self, op_number: OpNumber, entry: &LogEntry<Self::Input>) -> Self::Output;
+
+    /// A copy of the state after every operation applied so far.
+    fn snapshot(&self) -> Self::Snapshot;
+
+    /// Replaces the state with the one in `checkpoint`. A state machine
+    /// that persists its state makes the checkpoint durable before it
+    /// returns, together with the checkpoint's client table and op number:
+    /// the replica's log now starts at the checkpoint, so
+    /// [`Replica::restart`] has nothing to apply before it, and takes the
+    /// client table back from the owner.
+    fn restore(&mut self, checkpoint: Checkpoint<Self::Output, Self::Snapshot>);
 }
 
 /// Configuration.
@@ -130,6 +184,146 @@ pub struct Reply<Output> {
     pub result: Output,
 }
 
+/// What a replica remembers about a client: its latest executed request,
+/// and the result, so that a re-sent request is answered without running
+/// it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientRecord<Output> {
+    pub client_id: ClientID,
+    pub request_number: RequestNumber,
+    pub reply: Output,
+}
+
+/// A replica's state after `op_number` operations: the state machine's
+/// snapshot and the client table. Sent to a replica that needs entries the
+/// sender has compacted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkpoint<Output, Snapshot> {
+    /// The number of operations the state reflects.
+    pub op_number: OpNumber,
+    pub state: Snapshot,
+    pub client_table: Vec<ClientRecord<Output>>,
+}
+
+/// What a stretch of log starts from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogBase<Output, Snapshot> {
+    /// The op number the entries start after. The receiver holds the
+    /// entries up to it.
+    Op(OpNumber),
+    /// A checkpoint of the sender's state, which the entries follow. Sent
+    /// when the sender has compacted entries the receiver needs.
+    Checkpoint(Checkpoint<Output, Snapshot>),
+}
+
+impl<Output, Snapshot> LogBase<Output, Snapshot> {
+    /// The op number the entries start after.
+    pub fn start(&self) -> OpNumber {
+        match self {
+            LogBase::Op(op_number) => *op_number,
+            LogBase::Checkpoint(checkpoint) => checkpoint.op_number,
+        }
+    }
+}
+
+/// A stretch of a replica's log: the entries after `base`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogSegment<Op, Output, Snapshot> {
+    pub base: LogBase<Output, Snapshot>,
+    pub entries: Vec<LogEntry<Op>>,
+}
+
+impl<Op, Output, Snapshot> LogSegment<Op, Output, Snapshot> {
+    /// The op number the entries start after.
+    pub fn start(&self) -> OpNumber {
+        self.base.start()
+    }
+
+    /// The op number of the last entry.
+    pub fn end(&self) -> OpNumber {
+        self.start() + self.entries.len()
+    }
+}
+
+/// What the owner persists after every step, before delivering what the
+/// step produced, and hands back to [`Replica::restart`].
+///
+/// The counters and the client table are small and change rarely; the log
+/// is written incrementally: [`Replica::take_log_changes`] says from which
+/// op number the entries changed, and [`Replica::log_start`] how far the
+/// log has been compacted. [`PersistentState::update_from`] is that
+/// procedure for an owner that keeps a copy in memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistentState<Op, Output> {
+    pub view_number: ViewNumber,
+    /// The latest view in which the replica's status was normal, which
+    /// ranks its log in a view change.
+    pub last_normal_view: ViewNumber,
+    pub commit_number: CommitID,
+    /// The op number of the last entry compacted away; `log` holds the
+    /// entries after it.
+    pub log_start: OpNumber,
+    pub log: Vec<LogEntry<Op>>,
+    /// The latest executed request of each client, with its result. On a
+    /// restart it must be as of what the state machine has applied, or
+    /// later: a state machine that persists its state keeps the table with
+    /// it, as [`StateMachine::apply`] gives it what it needs for that.
+    pub client_table: Vec<ClientRecord<Output>>,
+    /// Whether the replica was still recovering from a disk loss. Such a
+    /// replica holds nothing it may act on, and must recover again.
+    pub recovering: bool,
+}
+
+impl<Op: Clone, Output: Clone> PersistentState<Op, Output> {
+    /// The state of a replica that has done nothing yet.
+    pub fn empty() -> PersistentState<Op, Output> {
+        PersistentState {
+            view_number: 0,
+            last_normal_view: 0,
+            commit_number: 0,
+            log_start: 0,
+            log: Vec::new(),
+            client_table: Vec::new(),
+            recovering: false,
+        }
+    }
+
+    /// Brings this copy of `replica`'s persistent state up to date after
+    /// a step, and takes the log change marker: the compacted prefix goes
+    /// first, then the entries from the marker on, then the counters and
+    /// the client table. Returns whether the step must be on disk before
+    /// anything it produced is delivered, which is so unless nothing but
+    /// the commit number changed.
+    pub fn update_from<SM>(&mut self, replica: &mut Replica<SM>) -> bool
+    where
+        SM: StateMachine<Input = Op, Output = Output>,
+    {
+        let mut changed = false;
+        let log_start = replica.log_start();
+        if log_start > self.log_start {
+            let dropped = (log_start - self.log_start).min(self.log.len());
+            self.log.drain(..dropped);
+            self.log_start = log_start;
+            changed = true;
+        }
+        if let Some(from) = replica.take_log_changes() {
+            let keep = from.saturating_sub(self.log_start + 1).min(self.log.len());
+            self.log.truncate(keep);
+            self.log.extend_from_slice(replica.log_from(from));
+            changed = true;
+        }
+        changed |= self.view_number != replica.view_number()
+            || self.last_normal_view != replica.last_normal_view()
+            || self.recovering != replica.is_recovering();
+        self.view_number = replica.view_number();
+        self.last_normal_view = replica.last_normal_view();
+        self.commit_number = replica.commit_number();
+        self.client_table = replica.client_table();
+        self.recovering = replica.is_recovering();
+        changed
+    }
+}
+
 /// A protocol message between replicas, or from a client to a replica.
 ///
 /// Replies from the primary to a client are a [`Reply`], not a message.
@@ -138,8 +332,11 @@ pub struct Reply<Output> {
 /// matches its own: a sender that is behind is ignored, one that is ahead
 /// makes the replica catch up first. The variants follow the sections of
 /// the paper: normal operation, state transfer, view changes, recovery.
-#[derive(Clone, Debug)]
-pub enum Message<Op> {
+///
+/// The type is generic over the state machine's input, output, and
+/// snapshot; [`MessageFor`] names it from the state machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Message<Op, Output, Snapshot> {
     /// A client asks the primary to execute `op`. Backups ignore it. A
     /// request number no larger than the client's latest in the primary's
     /// client table is a re-send: it is answered from the table if it has
@@ -180,28 +377,26 @@ pub enum Message<Op> {
         view_number: ViewNumber,
         commit_number: CommitID,
     },
-    /// A replica that is missing log entries asks the primary for the
-    /// entries after `op_number`. Within a view that is everything after
-    /// its own log; a replica catching up with a newer view asks from its
-    /// commit number, since its uncommitted suffix may not have survived
-    /// the view change.
+    /// A replica that is missing log entries asks for the entries after
+    /// `op_number`. Within a view a backup asks the primary for everything
+    /// after its own log; a replica catching up with a newer view asks its
+    /// primary from its commit number, since its uncommitted suffix may not
+    /// have survived the view change; and the primary of a view being
+    /// started asks the replica whose log it chose for what that replica
+    /// has compacted.
     GetState {
         replica_id: ReplicaID,
         view_number: ViewNumber,
         op_number: OpNumber,
     },
-    /// The primary's answer to `GetState`: the log after the requested op
-    /// number. The paper sends only the op number of the last entry; the
-    /// first is included too, so the receiver can tell a late reply to an
-    /// earlier request from the one it is waiting for.
+    /// The answer to `GetState`: the log after the requested op number, or
+    /// a checkpoint and the log after it when the requested entries have
+    /// been compacted. The paper sends only the op number of the last entry;
+    /// the first is included too, so the receiver can tell a late reply to
+    /// an earlier request from the one it is waiting for.
     NewState {
         view_number: ViewNumber,
-        /// The log entries after `op_number_start`.
-        log: Vec<LogEntry<Op>>,
-        /// The op number the entries start after, as asked in `GetState`.
-        op_number_start: OpNumber,
-        /// The op number of the last entry.
-        op_number_end: OpNumber,
+        segment: LogSegment<Op, Output, Snapshot>,
         /// The sender's commit number.
         commit_number: CommitID,
     },
@@ -221,19 +416,18 @@ pub enum Message<Op> {
         replica_id: ReplicaID,
         /// The latest view in which the sender's status was normal.
         last_normal_view: ViewNumber,
-        log: Vec<LogEntry<Op>>,
-        /// The length of `log`.
-        op_number: OpNumber,
+        /// The sender's log, after what it has compacted.
+        segment: LogSegment<Op, Output, Snapshot>,
         commit_number: CommitID,
     },
     /// The new primary starts `view_number` with the log it chose. Backups
     /// replace their log with it, commit up to `commit_number`, and
-    /// acknowledge the rest.
+    /// acknowledge the rest. A backup that has committed less than the
+    /// segment starts after fetches the primary's checkpoint first.
     StartView {
         view_number: ViewNumber,
-        log: Vec<LogEntry<Op>>,
-        /// The length of `log`.
-        op_number: OpNumber,
+        /// The primary's log, after what it has compacted.
+        segment: LogSegment<Op, Output, Snapshot>,
         commit_number: CommitID,
     },
     /// A replica back from a crash with no memory asks the others for the
@@ -248,24 +442,32 @@ pub enum Message<Op> {
         view_number: ViewNumber,
     },
     /// A replica in normal status answers `Recovery` with its view; the
-    /// primary of that view also sends its log and commit number. The
-    /// recovering replica needs a quorum of these, including one from the
-    /// primary of the latest view among them, and that view must be at
-    /// least the one it persisted.
+    /// primary of that view also sends its state. The recovering replica
+    /// needs a quorum of these, including one from the primary of the
+    /// latest view among them, and that view must be at least the one it
+    /// persisted.
     RecoveryResponse {
         view_number: ViewNumber,
         /// The nonce from the `Recovery` this answers.
         nonce: u64,
         replica_id: ReplicaID,
-        /// The sender's log and commit number, if it is the primary.
-        state: Option<RecoveryState<Op>>,
+        /// The sender's state, if it is the primary.
+        state: Option<RecoveryState<Op, Output, Snapshot>>,
     },
 }
 
-/// The primary's state in a `RecoveryResponse`.
-#[derive(Clone, Debug)]
-pub struct RecoveryState<Op> {
-    pub log: Vec<LogEntry<Op>>,
+/// [`Message`] for a given state machine.
+pub type MessageFor<SM> = Message<
+    <SM as StateMachine>::Input,
+    <SM as StateMachine>::Output,
+    <SM as StateMachine>::Snapshot,
+>;
+
+/// The primary's state in a `RecoveryResponse`: its whole log, with a
+/// checkpoint standing in for what it has compacted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryState<Op, Output, Snapshot> {
+    pub segment: LogSegment<Op, Output, Snapshot>,
     pub commit_number: CommitID,
 }
 
@@ -285,7 +487,8 @@ pub struct Client<Op> {
     next_request_number: RequestNumber,
     /// The request awaiting a reply, kept so it can be re-sent.
     pending: Option<(RequestNumber, Op)>,
-    outbox: Vec<(ReplicaID, Message<Op>)>,
+    /// Requests to send: the replica, the request number, and the op.
+    outbox: Vec<(ReplicaID, RequestNumber, Op)>,
 }
 
 impl<Op: Clone + Debug> Client<Op> {
@@ -315,14 +518,7 @@ impl<Op: Clone + Debug> Client<Op> {
         self.next_request_number += 1;
         self.pending = Some((request_number, op.clone()));
         let primary_id = self.config.primary_id(self.view_number);
-        self.outbox.push((
-            primary_id,
-            Message::Request {
-                client_id: self.client_id,
-                request_number,
-                op,
-            },
-        ));
+        self.outbox.push((primary_id, request_number, op));
         request_number
     }
 
@@ -359,20 +555,29 @@ impl<Op: Clone + Debug> Client<Op> {
             self.client_id
         );
         for replica_id in self.config.replicas() {
-            self.outbox.push((
-                *replica_id,
-                Message::Request {
-                    client_id: self.client_id,
-                    request_number: *request_number,
-                    op: op.clone(),
-                },
-            ));
+            self.outbox.push((*replica_id, *request_number, op.clone()));
         }
     }
 
-    /// Messages to send, with the replica each one goes to.
-    pub fn drain(&mut self) -> std::vec::Drain<'_, (ReplicaID, Message<Op>)> {
-        self.outbox.drain(..)
+    /// Messages to send, with the replica each one goes to. A client only
+    /// sends requests, so the message's other type parameters are whatever
+    /// the receiving replicas use.
+    pub fn drain<Output, Snapshot>(
+        &mut self,
+    ) -> impl Iterator<Item = (ReplicaID, Message<Op, Output, Snapshot>)> + '_ {
+        let client_id = self.client_id;
+        self.outbox
+            .drain(..)
+            .map(move |(replica_id, request_number, op)| {
+                (
+                    replica_id,
+                    Message::Request {
+                        client_id,
+                        request_number,
+                        op,
+                    },
+                )
+            })
     }
 }
 
@@ -392,37 +597,50 @@ pub enum Status {
     ViewChange,
 }
 
-/// What a replica remembers about a client: its latest request, and the
-/// reply to it once the request has been executed.
-#[derive(Debug)]
+/// What a replica remembers about a client: its latest executed request
+/// and the result. Requests still in the log's uncommitted suffix are
+/// found there.
+#[derive(Clone, Debug)]
 struct ClientEntry<Output> {
     request_number: RequestNumber,
-    reply: Option<Output>,
+    reply: Output,
 }
 
 /// What a replica reported in a `DoViewChange` message: the view it was
 /// last normal in, its log, and its commit number.
 #[derive(Debug)]
-struct DoViewChange<Op> {
+struct DoViewChange<Op, Output, Snapshot> {
     last_normal_view: ViewNumber,
-    log: Vec<LogEntry<Op>>,
+    segment: LogSegment<Op, Output, Snapshot>,
     commit_number: CommitID,
 }
+
+type DoViewChangeFor<SM> = DoViewChange<
+    <SM as StateMachine>::Input,
+    <SM as StateMachine>::Output,
+    <SM as StateMachine>::Snapshot,
+>;
 
 /// What a recovering replica keeps of a `RecoveryResponse`: the sender's
 /// view, and its state if it was the primary of that view.
 #[derive(Debug)]
-struct RecoveryResponse<Op> {
+struct RecoveryResponse<Op, Output, Snapshot> {
     view_number: ViewNumber,
-    state: Option<RecoveryState<Op>>,
+    state: Option<RecoveryState<Op, Output, Snapshot>>,
 }
+
+type RecoveryResponseFor<SM> = RecoveryResponse<
+    <SM as StateMachine>::Input,
+    <SM as StateMachine>::Output,
+    <SM as StateMachine>::Snapshot,
+>;
 
 /// Replica.
 ///
 /// The owner feeds it messages with [`Replica::on_message`], calls
-/// [`Replica::on_idle`] at a regular interval, and after each of those
-/// delivers what [`Replica::drain_messages`] and [`Replica::drain_replies`]
-/// yield.
+/// [`Replica::on_idle`] at a regular interval, persists what
+/// [`PersistentState`] describes, and after each of those delivers what
+/// [`Replica::drain_messages`] and [`Replica::drain_replies`] yield.
 #[derive(Debug)]
 pub struct Replica<SM: StateMachine> {
     config: Config,
@@ -433,12 +651,29 @@ pub struct Replica<SM: StateMachine> {
     /// The latest view in which this replica's status was normal.
     last_normal_view: ViewNumber,
     commit_number: CommitID,
+    /// The number of ops the state machine has executed, at most the
+    /// commit number. Committed ops are executed when the replies are
+    /// drained, after the owner has persisted the step.
+    applied: OpNumber,
+    /// The committed ops still to be replied to, as inclusive ranges of op
+    /// numbers: those this replica committed as the primary.
+    reply_ranges: Vec<(OpNumber, OpNumber)>,
+    /// The op number of the last entry compacted away. `log` holds the
+    /// entries after it, so entry `i` of `log` is op `log_start + i + 1`.
+    log_start: OpNumber,
     log: Vec<LogEntry<SM::Input>>,
+    /// The lowest op number whose entry changed since the owner last
+    /// asked, see [`Replica::take_log_changes`].
+    log_changed_from: Option<OpNumber>,
     /// For each uncommitted op number, the replicas that have acknowledged it.
     acks: BTreeMap<OpNumber, BTreeSet<ReplicaID>>,
-    /// The client table: the latest request seen from each client, and its
-    /// result once executed, so that a re-sent request is not run twice.
+    /// The client table: the latest executed request of each client and
+    /// its result, so that a re-sent request is not run twice.
     client_table: BTreeMap<ClientID, ClientEntry<SM::Output>>,
+    /// The latest request of each client in the log after `applied`, so
+    /// that a re-sent request that is still in progress is not appended
+    /// again.
+    pending: BTreeMap<ClientID, RequestNumber>,
     /// Whether the primary has been heard from since the last idle period.
     heard_from_primary: bool,
     /// Consecutive idle periods spent without hearing from the primary, or
@@ -462,15 +697,21 @@ pub struct Replica<SM: StateMachine> {
     do_view_change_sent: bool,
     /// Replicas that sent `DoViewChange` for the current view, with what they
     /// reported, if this replica is to be its primary.
-    do_view_change_from: BTreeMap<ReplicaID, DoViewChange<SM::Input>>,
-    /// Whether this replica has learned that the current view has started
-    /// without it, and is fetching the view's state from its primary.
-    catching_up: bool,
+    do_view_change_from: BTreeMap<ReplicaID, DoViewChangeFor<SM>>,
+    /// The replica this one has asked for the log from its commit number
+    /// on, and is waiting for: the primary of a view that started without
+    /// this replica, or, for the primary of a view being started, the
+    /// replica whose log it chose but which has compacted part of it.
+    catching_up: Option<ReplicaID>,
     /// The nonce of the recovery under way, if any.
     recovery_nonce: u64,
     /// `RecoveryResponse`s received for it, by sender.
-    recovery_responses: BTreeMap<ReplicaID, RecoveryResponse<SM::Input>>,
-    outbox: Vec<(ReplicaID, Message<SM::Input>)>,
+    recovery_responses: BTreeMap<ReplicaID, RecoveryResponseFor<SM>>,
+    /// Messages that may be sent before the step is persisted, see
+    /// [`Replica::drain_messages_before_persist`].
+    outbox_early: Vec<(ReplicaID, MessageFor<SM>)>,
+    /// Messages that must wait for the step to be persisted.
+    outbox: Vec<(ReplicaID, MessageFor<SM>)>,
     replies: Vec<Reply<SM::Output>>,
 }
 
@@ -484,9 +725,14 @@ impl<SM: StateMachine> Replica<SM> {
             view_number: 0,
             last_normal_view: 0,
             commit_number: 0,
+            applied: 0,
+            reply_ranges: Vec::new(),
+            log_start: 0,
             log: Vec::new(),
+            log_changed_from: None,
             acks: BTreeMap::new(),
             client_table: BTreeMap::new(),
+            pending: BTreeMap::new(),
             heard_from_primary: true,
             idle_periods_waiting: 0,
             view_change_attempts: 0,
@@ -494,9 +740,10 @@ impl<SM: StateMachine> Replica<SM> {
             start_view_change_from: BTreeSet::new(),
             do_view_change_sent: false,
             do_view_change_from: BTreeMap::new(),
-            catching_up: false,
+            catching_up: None,
             recovery_nonce: 0,
             recovery_responses: BTreeMap::new(),
+            outbox_early: Vec::new(),
             outbox: Vec::new(),
             replies: Vec::new(),
         }
@@ -518,14 +765,197 @@ impl<SM: StateMachine> Replica<SM> {
         let mut replica = Replica::new(self_id, config, state_machine);
         replica.status = Status::Recovering;
         replica.view_number = view_number;
-        replica.last_normal_view = view_number;
         replica.recovery_nonce = nonce;
         replica.send_recovery();
         replica
     }
 
+    /// Creates a replica that is back from a crash with the state the
+    /// owner persisted for it, and a state machine that has applied the
+    /// first `applied` operations, with the client table as of then. The
+    /// replica applies the committed ones after that once more, so
+    /// `applied` must be at least `log_start`.
+    ///
+    /// A state machine ahead of the log's commit number holds a checkpoint
+    /// it made durable before the log was persisted after it, as
+    /// [`StateMachine::restore`] requires: the log's entries up to there
+    /// give way to the checkpoint, and the ones after it, which this
+    /// replica acknowledged, stay.
+    ///
+    /// A backup that was normal in its view resumes there: its log is the
+    /// one it acknowledged. A primary starts the next view instead: it may
+    /// have sent a `Prepare` for an entry it never made durable, which a
+    /// backup then holds under an op number the primary would use again.
+    /// A replica that went down in the middle of a view change enters that
+    /// view change again. One that was still recovering starts a new
+    /// recovery with `nonce`, keeping the checkpoint its state machine may
+    /// hold.
+    pub fn restart(
+        self_id: ReplicaID,
+        config: Config,
+        state_machine: SM,
+        applied: OpNumber,
+        state: PersistentState<SM::Input, SM::Output>,
+        nonce: u64,
+    ) -> Replica<SM> {
+        let mut replica = if state.recovering {
+            let mut replica =
+                Replica::recover(self_id, config, state_machine, state.view_number, nonce);
+            replica.log_start = applied;
+            replica.commit_number = applied;
+            replica
+        } else {
+            let mut replica = Replica::new(self_id, config, state_machine);
+            replica.view_number = state.view_number;
+            replica.last_normal_view = state.last_normal_view;
+            if applied > state.commit_number {
+                replica.log_start = applied;
+                replica.commit_number = applied;
+                replica.log = state.log;
+                replica
+                    .log
+                    .drain(..(applied - state.log_start).min(replica.log.len()));
+            } else {
+                assert!(
+                    state.log_start <= applied,
+                    "state machine applied {applied} ops but the log starts after {}",
+                    state.log_start
+                );
+                replica.log_start = state.log_start;
+                replica.commit_number = state.commit_number;
+                replica.log = state.log;
+            }
+            replica
+        };
+        replica.applied = applied;
+        replica.client_table = state
+            .client_table
+            .into_iter()
+            .map(|record| {
+                (
+                    record.client_id,
+                    ClientEntry {
+                        request_number: record.request_number,
+                        reply: record.reply,
+                    },
+                )
+            })
+            .collect();
+        assert!(replica.commit_number <= replica.op_number());
+        replica.apply_committed();
+        trace!(
+            "Replica {self_id} restarts in view {} with {} ops, {} committed, {applied} applied",
+            replica.view_number,
+            replica.op_number(),
+            replica.commit_number
+        );
+        replica.rebuild_pending();
+        if replica.status == Status::Recovering {
+            return replica;
+        }
+        if state.last_normal_view < state.view_number {
+            replica.start_view_change(state.view_number);
+        } else if replica.is_primary() {
+            replica.start_view_change(state.view_number + 1);
+        }
+        replica
+    }
+
+    /// Everything the owner persists, see [`PersistentState`].
+    pub fn persistent_state(&self) -> PersistentState<SM::Input, SM::Output> {
+        PersistentState {
+            view_number: self.view_number,
+            last_normal_view: self.last_normal_view,
+            commit_number: self.commit_number,
+            log_start: self.log_start,
+            log: self.log.clone(),
+            client_table: self.client_table(),
+            recovering: self.status == Status::Recovering,
+        }
+    }
+
+    /// The lowest op number whose entry changed since the last call, if
+    /// any changed. The owner drops what it has persisted from that op
+    /// number on and writes [`Replica::log_from`] it instead. Compaction
+    /// is separate: the owner also drops what is at or below
+    /// [`Replica::log_start`].
+    pub fn take_log_changes(&mut self) -> Option<OpNumber> {
+        self.log_changed_from.take()
+    }
+
+    /// Drops the log entries up to `op_number` from memory. The op number
+    /// must be at most what the state machine has made durable, since
+    /// [`Replica::restart`] cannot apply an entry that is gone; anything
+    /// beyond what the state machine has applied is not compacted. A
+    /// replica that needs the dropped entries gets a checkpoint instead.
+    pub fn compact(&mut self, op_number: OpNumber) {
+        let op_number = op_number.min(self.applied);
+        if op_number <= self.log_start {
+            return;
+        }
+        self.log.drain(..op_number - self.log_start);
+        self.log_start = op_number;
+    }
+
+    /// Executes the committed operations the state machine has not yet, in
+    /// order, and produces the replies for those this replica committed as
+    /// the primary. The drains call it once the step is persisted.
+    fn apply_committed(&mut self) {
+        while self.applied < self.commit_number {
+            let op_number = self.applied + 1;
+            let entry = &self.log[op_number - self.log_start - 1];
+            let result = self.state_machine.apply(op_number, entry);
+            let (client_id, request_number) = (entry.client_id, entry.request_number);
+            self.applied = op_number;
+            if self.pending.get(&client_id) == Some(&request_number) {
+                self.pending.remove(&client_id);
+            }
+            self.client_table.insert(
+                client_id,
+                ClientEntry {
+                    request_number,
+                    reply: result.clone(),
+                },
+            );
+            if self
+                .reply_ranges
+                .iter()
+                .any(|(from, to)| (*from..=*to).contains(&op_number))
+            {
+                self.replies.push(Reply {
+                    view_number: self.view_number,
+                    client_id,
+                    request_number,
+                    result,
+                });
+            }
+        }
+        self.reply_ranges.clear();
+    }
+
+    /// What follows the owner persisting a step: the log is durable up to
+    /// the op number, so the primary counts its own acknowledgement for
+    /// every uncommitted entry, and the committed operations are executed.
+    /// [`Replica::drain_messages`] and [`Replica::drain_replies`] call it.
+    fn after_persist(&mut self) {
+        if self.status == Status::Normal && self.is_primary() {
+            let op_number = self.op_number();
+            self.register_ack(self.self_id, op_number);
+        }
+        self.apply_committed();
+    }
+
+    /// Rebuilds the pending requests from the log after `applied`.
+    fn rebuild_pending(&mut self) {
+        self.pending.clear();
+        for entry in &self.log[self.applied - self.log_start..] {
+            let latest = self.pending.entry(entry.client_id).or_insert(0);
+            *latest = (*latest).max(entry.request_number);
+        }
+    }
+
     /// The main entry point to replica logic.
-    pub fn on_message(&mut self, message: Message<SM::Input>) {
+    pub fn on_message(&mut self, message: MessageFor<SM>) {
         trace!("Replica {} <- {:?}", self.self_id, message);
         // A recovering replica knows nothing it could safely act on: not
         // which view is current, not what it acknowledged before the crash.
@@ -579,18 +1009,10 @@ impl<SM: StateMachine> Replica<SM> {
             }
             Message::NewState {
                 view_number,
-                log,
-                op_number_start,
-                op_number_end,
+                segment,
                 commit_number,
             } => {
-                self.on_new_state(
-                    view_number,
-                    log,
-                    op_number_start,
-                    op_number_end,
-                    commit_number,
-                );
+                self.on_new_state(view_number, segment, commit_number);
             }
             Message::StartViewChange {
                 view_number,
@@ -602,26 +1024,22 @@ impl<SM: StateMachine> Replica<SM> {
                 view_number,
                 replica_id,
                 last_normal_view,
-                log,
-                op_number,
+                segment,
                 commit_number,
             } => {
-                assert_eq!(log.len(), op_number);
                 let dvc = DoViewChange {
                     last_normal_view,
-                    log,
+                    segment,
                     commit_number,
                 };
                 self.on_do_view_change(view_number, replica_id, dvc);
             }
             Message::StartView {
                 view_number,
-                log,
-                op_number,
+                segment,
                 commit_number,
             } => {
-                assert_eq!(log.len(), op_number);
-                self.on_start_view(view_number, log, commit_number);
+                self.on_start_view(view_number, segment, commit_number);
             }
             Message::Recovery {
                 replica_id,
@@ -652,36 +1070,40 @@ impl<SM: StateMachine> Replica<SM> {
             return;
         }
         // Consult the client table. A request number no larger than the
-        // latest one from this client is a re-send: if it is the latest
-        // request and it has been executed, re-send the reply, otherwise
-        // drop it. The reply will follow once the request commits.
+        // latest executed one from this client is a re-send: if it is the
+        // latest request, re-send the reply, otherwise drop it.
         if let Some(entry) = self.client_table.get(&client_id) {
             if request_number < entry.request_number {
                 return;
             }
             if request_number == entry.request_number {
-                if let Some(result) = &entry.reply {
-                    let reply = Reply {
-                        view_number: self.view_number,
-                        client_id,
-                        request_number,
-                        result: result.clone(),
-                    };
-                    self.replies.push(reply);
-                }
+                let reply = Reply {
+                    view_number: self.view_number,
+                    client_id,
+                    request_number,
+                    result: entry.reply.clone(),
+                };
+                self.replies.push(reply);
                 return;
             }
         }
-        // Append the request to our log, which also records it in the
-        // client table.
+        // A request already in the log but not yet executed is dropped
+        // too; the reply will follow once it is.
+        if self
+            .pending
+            .get(&client_id)
+            .is_some_and(|latest| *latest >= request_number)
+        {
+            return;
+        }
         self.append_to_log(LogEntry {
             client_id,
             request_number,
             op: op.clone(),
         });
-        // And then register our own acknowledgement.
+        // Our own acknowledgement follows once the entry is persisted.
         let op_number = self.op_number();
-        self.acks.insert(op_number, BTreeSet::from([self.self_id]));
+        self.acks.insert(op_number, BTreeSet::new());
         // Send a prepare message to all the replicas.
         self.send_to_others(Message::Prepare {
             view_number: self.view_number,
@@ -731,9 +1153,11 @@ impl<SM: StateMachine> Replica<SM> {
     }
 
     /// Backup nodes send `PrepareOk` message to the primary to acknowledge that
-    /// they have appended an op to their logs. When the primary has
-    /// received `PrepareOk` messages from a quorum of replicas, it commits
-    /// the operation and replies to the client.
+    /// they have appended an op to their logs. The acknowledgement covers
+    /// every earlier op too: a backup only appends an op once it has every
+    /// earlier one. When the primary has received `PrepareOk` messages from
+    /// a quorum of replicas for an op, it commits that op and every earlier
+    /// one, and replies to the clients.
     fn on_prepare_ok(
         &mut self,
         view_number: ViewNumber,
@@ -743,28 +1167,37 @@ impl<SM: StateMachine> Replica<SM> {
         if view_number != self.view_number || !self.is_primary() || self.status != Status::Normal {
             return;
         }
+        self.register_ack(replica_id, op_number);
+    }
+
+    /// Registers that `replica_id` holds every op up to `op_number`, for
+    /// every uncommitted op that covers, and commits up to the last op
+    /// with a quorum. A quorum is a set of distinct replicas: the same
+    /// backup acknowledging twice, because the network replayed its
+    /// message or because it answered a re-sent `Prepare`, still counts
+    /// once.
+    fn register_ack(&mut self, replica_id: ReplicaID, op_number: OpNumber) {
         if op_number <= self.commit_number {
             return; // already committed
         }
-        // Register the acknowledgement. A quorum is a set of distinct
-        // replicas: the same backup acknowledging twice, because the network
-        // replayed its message or because it answered a re-sent `Prepare`,
-        // still counts once.
-        let Some(acked_by) = self.acks.get_mut(&op_number) else {
+        let quorum = self.config.quorum();
+        let mut committed = None;
+        for (acked_op_number, acked_by) in self.acks.range_mut(..=op_number) {
+            acked_by.insert(replica_id);
+            if acked_by.len() >= quorum {
+                committed = Some(*acked_op_number);
+            }
+        }
+        let Some(committed) = committed else {
             return;
         };
-        if !acked_by.insert(replica_id) || acked_by.len() != self.config.quorum() {
-            return;
-        }
-        // A quorum for `op_number` means the operation and all earlier ones
-        // are committed: backups only acknowledge an operation once they
-        // have every earlier one in their log. Earlier operations may not
-        // have reached a quorum on their own, for example because their
-        // `PrepareOk` messages were lost or overtaken, so commit everything
-        // up to `op_number`, in order, and reply to the client for each.
-        self.commit_up_to(op_number, true);
+        // A quorum for an op means the op and all earlier ones are
+        // committed. Earlier operations may not have reached a quorum on
+        // their own, for example because their `PrepareOk` messages were
+        // lost or overtaken, so commit everything up to it, in order.
+        self.commit_up_to(committed, true);
         self.acks
-            .retain(|acked_op_number, _| *acked_op_number > op_number);
+            .retain(|acked_op_number, _| *acked_op_number > committed);
     }
 
     /// A backup node typically commits its log as part of `Prepare`
@@ -812,29 +1245,51 @@ impl<SM: StateMachine> Replica<SM> {
         }
     }
 
-    /// A replica sends a `GetState` message to another replica to catch
-    /// up on its log. Only a replica in normal status and in the requested
-    /// view answers.
+    /// Answers a `GetState` with the log after `op_number`, or with a
+    /// checkpoint and the log after it when `op_number` is below what we
+    /// have compacted. A replica answers requests for its view while its
+    /// log is settled: in normal status, or in a view change once it has
+    /// sent `DoViewChange`, when the primary of that view may need the
+    /// part of our log we have compacted.
     fn on_get_state(
         &mut self,
         replica_id: ReplicaID,
         view_number: ViewNumber,
         op_number: OpNumber,
     ) {
-        if self.status != Status::Normal
-            || view_number != self.view_number
-            || op_number > self.op_number()
-        {
+        if view_number != self.view_number || op_number > self.op_number() {
+            return;
+        }
+        let settled = match self.status {
+            Status::Normal => true,
+            Status::ViewChange => self.do_view_change_sent && self.catching_up.is_none(),
+            Status::StateTransfer | Status::Recovering => false,
+        };
+        if !settled {
             return;
         }
         let message = Message::NewState {
             view_number,
-            log: self.log[op_number..].to_vec(),
-            op_number_start: op_number,
-            op_number_end: self.op_number(),
+            segment: self.segment_from(op_number),
             commit_number: self.commit_number,
         };
         self.send(replica_id, message);
+    }
+
+    /// The log after `op_number`, or, if that has been compacted, a
+    /// checkpoint of our state and the log after it.
+    fn segment_from(&self, op_number: OpNumber) -> LogSegment<SM::Input, SM::Output, SM::Snapshot> {
+        if op_number >= self.log_start {
+            LogSegment {
+                base: LogBase::Op(op_number),
+                entries: self.log_from(op_number + 1).to_vec(),
+            }
+        } else {
+            LogSegment {
+                base: LogBase::Checkpoint(self.checkpoint()),
+                entries: self.log_from(self.applied + 1).to_vec(),
+            }
+        }
     }
 
     /// A replica receives a `NewState` message in response to a
@@ -842,15 +1297,12 @@ impl<SM: StateMachine> Replica<SM> {
     fn on_new_state(
         &mut self,
         view_number: ViewNumber,
-        log: Vec<LogEntry<SM::Input>>,
-        op_number_start: OpNumber,
-        op_number_end: OpNumber,
+        segment: LogSegment<SM::Input, SM::Output, SM::Snapshot>,
         commit_number: CommitID,
     ) {
         if view_number != self.view_number {
             return;
         }
-        assert_eq!(log.len(), op_number_end - op_number_start);
         self.heard_from_primary = true;
         match self.status {
             Status::StateTransfer => {
@@ -861,36 +1313,80 @@ impl<SM: StateMachine> Replica<SM> {
                 // since within a view the overlapping entries are
                 // identical. A reply that starts past our log or that ends
                 // inside it is of no use, so keep waiting for another.
-                let op_number = self.op_number();
-                if op_number_start > op_number || op_number_end <= op_number {
+                if !self.install_segment_in_view(segment) {
                     return;
                 }
-                for entry in log.into_iter().skip(op_number - op_number_start) {
-                    self.append_to_log(entry);
-                }
-                assert_eq!(self.op_number(), op_number_end);
                 self.commit_up_to(commit_number, false);
                 self.status = Status::Normal;
             }
-            Status::ViewChange if self.catching_up => {
-                // We are catching up with a view that started without us,
-                // and asked for everything after our commit number. What
-                // we have beyond that is from an earlier view and never
-                // committed, so it is replaced by the new view's log.
-                if op_number_start != self.commit_number {
+            Status::ViewChange if self.catching_up.is_some() => {
+                // We asked for everything after our commit number: what we
+                // have beyond that is from an earlier view and never
+                // committed, so it is replaced by what the reply holds.
+                if !self.install_segment_from_commit(segment) {
                     return;
                 }
-                let mut new_log = self.log.clone();
-                new_log.truncate(op_number_start);
-                new_log.extend(log);
-                self.install_log(new_log);
-                assert_eq!(self.op_number(), op_number_end);
+                self.catching_up = None;
+                if self.is_primary() && self.do_view_change_from.len() >= self.config.quorum() {
+                    // We are the new primary, and asked the replica whose
+                    // log we chose for what it had compacted.
+                    self.try_start_view();
+                    return;
+                }
                 self.commit_up_to(commit_number, false);
                 self.enter_normal();
             }
             _ => return,
         }
         self.send_prepare_ok();
+    }
+
+    /// Installs a segment received within our view, which extends our log
+    /// if it reaches beyond it. Returns whether it did.
+    fn install_segment_in_view(
+        &mut self,
+        segment: LogSegment<SM::Input, SM::Output, SM::Snapshot>,
+    ) -> bool {
+        let op_number = self.op_number();
+        if segment.end() <= op_number {
+            return false;
+        }
+        match segment.base {
+            // A checkpoint beyond our log replaces it; one within our log
+            // covers ops we hold already, so only the entries matter.
+            LogBase::Checkpoint(checkpoint) if checkpoint.op_number > op_number => {
+                self.install_checkpoint(checkpoint, segment.entries);
+            }
+            base => {
+                if base.start() > op_number {
+                    return false;
+                }
+                self.merge_log(base.start(), segment.entries);
+            }
+        }
+        true
+    }
+
+    /// Installs a segment we asked for from our commit number, which
+    /// replaces everything after it. Returns whether the segment reaches
+    /// our commit number; one that starts beyond it answers a request we
+    /// made with a higher commit number, and is of no use.
+    fn install_segment_from_commit(
+        &mut self,
+        segment: LogSegment<SM::Input, SM::Output, SM::Snapshot>,
+    ) -> bool {
+        match segment.base {
+            LogBase::Checkpoint(checkpoint) if checkpoint.op_number >= self.commit_number => {
+                self.install_checkpoint(checkpoint, segment.entries);
+            }
+            base => {
+                if base.start() > self.commit_number {
+                    return false;
+                }
+                self.merge_log(base.start(), segment.entries);
+            }
+        }
+        true
     }
 
     /// Asks the primary for the log after our op number, to fill a gap
@@ -927,7 +1423,7 @@ impl<SM: StateMachine> Replica<SM> {
         &mut self,
         view_number: ViewNumber,
         replica_id: ReplicaID,
-        dvc: DoViewChange<SM::Input>,
+        dvc: DoViewChangeFor<SM>,
     ) {
         if view_number < self.view_number || self.config.primary_id(view_number) != self.self_id {
             return;
@@ -944,11 +1440,13 @@ impl<SM: StateMachine> Replica<SM> {
 
     /// The new primary starts the view with the log it chose. Backups
     /// replace their log with it, commit what it says is committed, and
-    /// acknowledge whatever is not.
+    /// acknowledge whatever is not. A backup that has committed less than
+    /// the primary has compacted cannot take the log as sent, and fetches
+    /// the primary's checkpoint instead.
     fn on_start_view(
         &mut self,
         view_number: ViewNumber,
-        log: Vec<LogEntry<SM::Input>>,
+        segment: LogSegment<SM::Input, SM::Output, SM::Snapshot>,
         commit_number: CommitID,
     ) {
         // A `StartView` for our own view is only new to us while we are
@@ -960,7 +1458,10 @@ impl<SM: StateMachine> Replica<SM> {
             return;
         }
         self.view_number = view_number;
-        self.install_log(log);
+        if !self.install_segment_from_commit(segment) {
+            self.catch_up_with_view(view_number);
+            return;
+        }
         self.commit_up_to(commit_number, false);
         self.enter_normal();
         self.acks.clear();
@@ -981,7 +1482,6 @@ impl<SM: StateMachine> Replica<SM> {
         }
         self.view_number = view_number;
         self.status = Status::ViewChange;
-        self.catching_up = false;
         self.idle_periods_waiting = 0;
         self.clear_view_change_state();
         self.send_to_others(Message::StartViewChange {
@@ -995,11 +1495,15 @@ impl<SM: StateMachine> Replica<SM> {
         self.start_view_change_from.clear();
         self.do_view_change_sent = false;
         self.do_view_change_from.clear();
+        self.catching_up = None;
     }
 
     /// Sends `DoViewChange` once `f` other replicas want the same view.
     fn maybe_send_do_view_change(&mut self) {
-        if self.status != Status::ViewChange || self.catching_up || self.do_view_change_sent {
+        if self.status != Status::ViewChange
+            || self.catching_up.is_some()
+            || self.do_view_change_sent
+        {
             return;
         }
         let f = self.config.replicas().len() / 2;
@@ -1016,7 +1520,10 @@ impl<SM: StateMachine> Replica<SM> {
         let view_number = self.view_number;
         let dvc = DoViewChange {
             last_normal_view: self.last_normal_view,
-            log: self.log.clone(),
+            segment: LogSegment {
+                base: LogBase::Op(self.log_start),
+                entries: self.log.clone(),
+            },
             commit_number: self.commit_number,
         };
         let primary_id = self.config.primary_id(view_number);
@@ -1029,8 +1536,7 @@ impl<SM: StateMachine> Replica<SM> {
                     view_number,
                     replica_id: self.self_id,
                     last_normal_view: dvc.last_normal_view,
-                    op_number: dvc.log.len(),
-                    log: dvc.log,
+                    segment: dvc.segment,
                     commit_number: dvc.commit_number,
                 },
             );
@@ -1038,19 +1544,40 @@ impl<SM: StateMachine> Replica<SM> {
     }
 
     /// Records a `DoViewChange` and, with a quorum of them, starts the
-    /// view: the log is the one from the latest normal view, the longest if
-    /// several, which by quorum intersection holds every committed op.
-    fn record_do_view_change(&mut self, replica_id: ReplicaID, dvc: DoViewChange<SM::Input>) {
+    /// view.
+    fn record_do_view_change(&mut self, replica_id: ReplicaID, dvc: DoViewChangeFor<SM>) {
         self.do_view_change_from.insert(replica_id, dvc);
         if self.do_view_change_from.len() < self.config.quorum() {
             return;
         }
-        let best = self
+        self.try_start_view();
+    }
+
+    /// Starts the view from the log with the latest normal view among the
+    /// `DoViewChange` messages, the longest if several, which by quorum
+    /// intersection holds every committed op. The sender may have compacted
+    /// entries beyond our commit number, which its message does not carry;
+    /// then we ask it for the log from our commit number on, checkpoint
+    /// included, and come back here once that is installed.
+    fn try_start_view(&mut self) {
+        let (best_id, best) = self
             .do_view_change_from
-            .values()
-            .max_by_key(|dvc| (dvc.last_normal_view, dvc.log.len()))
+            .iter()
+            .max_by_key(|(_, dvc)| (dvc.last_normal_view, dvc.segment.end()))
+            .map(|(id, dvc)| (*id, dvc))
             .unwrap();
-        let log = best.log.clone();
+        let segment = best.segment.clone();
+        if !self.install_segment_from_commit(segment) {
+            trace!(
+                "Replica {} needs the checkpoint of replica {best_id} to start view {}",
+                self.self_id,
+                self.view_number
+            );
+            self.catching_up = Some(best_id);
+            let op_number = self.commit_number;
+            self.send_get_state_to(best_id, op_number);
+            return;
+        }
         let commit_number = self
             .do_view_change_from
             .values()
@@ -1061,9 +1588,8 @@ impl<SM: StateMachine> Replica<SM> {
             "Replica {} starts view {} with {} ops, {commit_number} committed",
             self.self_id,
             self.view_number,
-            log.len()
+            self.op_number()
         );
-        self.install_log(log);
         // Execute what committed in earlier views but was not yet executed
         // here, and reply to the clients: the old primary may have failed
         // before it could.
@@ -1071,7 +1597,7 @@ impl<SM: StateMachine> Replica<SM> {
         self.enter_normal();
         self.acks.clear();
         for op_number in self.commit_number + 1..=self.op_number() {
-            self.acks.insert(op_number, BTreeSet::from([self.self_id]));
+            self.acks.insert(op_number, BTreeSet::new());
         }
         for replica_id in self.config.replicas().to_vec() {
             if replica_id != self.self_id {
@@ -1083,8 +1609,10 @@ impl<SM: StateMachine> Replica<SM> {
     fn send_start_view(&mut self, replica_id: ReplicaID) {
         let message = Message::StartView {
             view_number: self.view_number,
-            log: self.log.clone(),
-            op_number: self.op_number(),
+            segment: LogSegment {
+                base: LogBase::Op(self.log_start),
+                entries: self.log.clone(),
+            },
             commit_number: self.commit_number,
         };
         self.send(replica_id, message);
@@ -1093,7 +1621,8 @@ impl<SM: StateMachine> Replica<SM> {
     /// Learns that `view_number` has started, and asks its primary for the
     /// log from our commit number on.
     fn catch_up_with_view(&mut self, view_number: ViewNumber) {
-        if self.view_number == view_number && self.catching_up {
+        let primary_id = self.config.primary_id(view_number);
+        if self.view_number == view_number && self.catching_up == Some(primary_id) {
             return;
         }
         trace!(
@@ -1102,9 +1631,9 @@ impl<SM: StateMachine> Replica<SM> {
         );
         self.view_number = view_number;
         self.status = Status::ViewChange;
-        self.catching_up = true;
         self.idle_periods_waiting = 0;
         self.clear_view_change_state();
+        self.catching_up = Some(primary_id);
         self.send_get_state(self.commit_number);
     }
 
@@ -1114,7 +1643,6 @@ impl<SM: StateMachine> Replica<SM> {
     fn enter_normal(&mut self) {
         self.status = Status::Normal;
         self.last_normal_view = self.view_number;
-        self.catching_up = false;
         self.heard_from_primary = true;
         self.idle_periods_waiting = 0;
         self.idle_periods_stable = 0;
@@ -1122,7 +1650,7 @@ impl<SM: StateMachine> Replica<SM> {
     }
 
     /// A replica in normal status answers a recovering replica with its
-    /// view; if it is the primary, with its log and commit number too.
+    /// view; if it is the primary, with its state too.
     ///
     /// The recovering replica persisted `view_number` before it crashed.
     /// If that is ahead of us, it had started a view change we never heard
@@ -1136,8 +1664,10 @@ impl<SM: StateMachine> Replica<SM> {
         if self.status != Status::Normal {
             return;
         }
+        // The recovering replica has nothing, so it needs the whole log,
+        // or our checkpoint where the log has been compacted.
         let state = self.is_primary().then(|| RecoveryState {
-            log: self.log.clone(),
+            segment: self.segment_from(0),
             commit_number: self.commit_number,
         });
         let message = Message::RecoveryResponse {
@@ -1161,7 +1691,7 @@ impl<SM: StateMachine> Replica<SM> {
         view_number: ViewNumber,
         nonce: u64,
         replica_id: ReplicaID,
-        state: Option<RecoveryState<SM::Input>>,
+        state: Option<RecoveryState<SM::Input, SM::Output, SM::Snapshot>>,
     ) {
         if self.status != Status::Recovering || nonce != self.recovery_nonce {
             return;
@@ -1183,7 +1713,7 @@ impl<SM: StateMachine> Replica<SM> {
         let primary_id = self.config.primary_id(latest_view);
         let Some(RecoveryResponse {
             view_number: primary_view,
-            state: Some(state),
+            state: Some(_),
         }) = self.recovery_responses.get(&primary_id)
         else {
             return;
@@ -1191,27 +1721,44 @@ impl<SM: StateMachine> Replica<SM> {
         if *primary_view != latest_view {
             return;
         }
-        let state = state.clone();
+        let state = self
+            .recovery_responses
+            .remove(&primary_id)
+            .and_then(|response| response.state)
+            .unwrap();
         trace!(
             "Replica {} recovers into view {latest_view} with {} ops, {} committed",
             self.self_id,
-            state.log.len(),
+            state.segment.end(),
             state.commit_number
         );
         self.recovery_responses.clear();
         self.view_number = latest_view;
-        self.install_log(state.log);
+        // The state machine may hold a checkpoint from an earlier attempt,
+        // which the log keeps up to; the primary's log covers it either
+        // way.
+        assert!(self.install_segment_from_commit(state.segment));
         self.commit_up_to(state.commit_number, false);
         self.enter_normal();
     }
 
+    /// Asks the other replicas for their state: those that have not
+    /// answered this recovery, or everyone again if a quorum has answered
+    /// without completing it, since those answers are then stale.
     fn send_recovery(&mut self) {
         let message = Message::Recovery {
             replica_id: self.self_id,
             nonce: self.recovery_nonce,
             view_number: self.view_number,
         };
-        self.send_to_others(message);
+        let ask_everyone = self.recovery_responses.len() >= self.config.quorum();
+        for replica_id in self.config.replicas().to_vec() {
+            if replica_id != self.self_id
+                && (ask_everyone || !self.recovery_responses.contains_key(&replica_id))
+            {
+                self.send(replica_id, message.clone());
+            }
+        }
     }
 
     /// When there are no client requests, the primary node sends a
@@ -1224,7 +1771,7 @@ impl<SM: StateMachine> Replica<SM> {
     /// `Prepare` for every op that has not committed yet in case a `Prepare`
     /// or its `PrepareOk` was lost, replicas in a view change re-send
     /// their view change messages, and a recovering replica re-sends
-    /// `Recovery`.
+    /// `Recovery` to whoever has not answered.
     ///
     /// And they drive the timers: a backup that has not heard from the
     /// primary for `Config::primary_timeout` idle periods starts a view
@@ -1241,7 +1788,7 @@ impl<SM: StateMachine> Replica<SM> {
                     commit_number,
                 });
                 for op_number in commit_number + 1..=self.op_number() {
-                    let entry = self.log[op_number - 1].clone();
+                    let entry = self.entry(op_number).clone();
                     self.send_to_others(Message::Prepare {
                         view_number,
                         op_number,
@@ -1270,16 +1817,24 @@ impl<SM: StateMachine> Replica<SM> {
             Status::ViewChange => {
                 if self.wait_timed_out() {
                     self.start_view_change(self.view_number + 1);
-                } else if self.catching_up {
-                    self.send_get_state(self.commit_number);
-                } else {
+                    return;
+                }
+                if let Some(replica_id) = self.catching_up {
+                    let op_number = self.commit_number;
+                    self.send_get_state_to(replica_id, op_number);
+                }
+                // A replica catching up with a view that has started has
+                // nothing to say in the view change; the primary of a view
+                // being started, waiting for a checkpoint, keeps the
+                // others' `DoViewChange` coming.
+                if self.catching_up.is_none() || self.do_view_change_sent {
                     self.send_to_others(Message::StartViewChange {
                         view_number: self.view_number,
                         replica_id: self.self_id,
                     });
-                    if self.do_view_change_sent {
-                        self.send_do_view_change();
-                    }
+                }
+                if self.do_view_change_sent && self.catching_up.is_none() {
+                    self.send_do_view_change();
                 }
             }
         }
@@ -1305,82 +1860,119 @@ impl<SM: StateMachine> Replica<SM> {
         self.idle_periods_waiting >= self.config.primary_timeout() << backoff
     }
 
-    /// Appends `entry` to the log and records it as the client's latest
-    /// request, not yet executed.
+    /// The entry with op number `op_number`, which must be in the log.
+    fn entry(&self, op_number: OpNumber) -> &LogEntry<SM::Input> {
+        &self.log[op_number - self.log_start - 1]
+    }
+
+    /// Records that the entries from `op_number` on have changed.
+    fn mark_log_changed(&mut self, op_number: OpNumber) {
+        self.log_changed_from = Some(match self.log_changed_from {
+            Some(from) => from.min(op_number),
+            None => op_number,
+        });
+    }
+
+    /// Appends `entry` to the log.
     fn append_to_log(&mut self, entry: LogEntry<SM::Input>) {
-        self.client_table.insert(
-            entry.client_id,
-            ClientEntry {
-                request_number: entry.request_number,
-                reply: None,
-            },
-        );
+        self.mark_log_changed(self.op_number() + 1);
+        let latest = self.pending.entry(entry.client_id).or_insert(0);
+        *latest = (*latest).max(entry.request_number);
         self.log.push(entry);
     }
 
-    /// Replaces the log with `log`, which must contain our committed prefix,
-    /// and rebuilds the client table from it. Replies kept for committed
-    /// requests survive; the rest of the table follows the new log.
-    fn install_log(&mut self, log: Vec<LogEntry<SM::Input>>) {
-        assert!(log.len() >= self.commit_number);
-        let old_table = std::mem::take(&mut self.client_table);
-        for (i, entry) in log.iter().enumerate() {
-            let reply = if i < self.commit_number {
-                old_table
-                    .get(&entry.client_id)
-                    .filter(|old| old.request_number == entry.request_number)
-                    .and_then(|old| old.reply.clone())
-            } else {
-                None
-            };
-            self.client_table.insert(
-                entry.client_id,
-                ClientEntry {
-                    request_number: entry.request_number,
-                    reply,
-                },
-            );
-        }
-        self.log = log;
+    /// Replaces the log after `start` with `entries`, which must reach at
+    /// least as far as our commit number. The caller guarantees that our
+    /// entries up to `start` agree with the sender's: because they are
+    /// committed, or because they came from the same primary in the same
+    /// view. Our committed entries agree with the sender's too, since
+    /// committed prefixes agree everywhere, so they stay as well, and the
+    /// change is confined to the uncommitted suffix.
+    fn merge_log(&mut self, start: OpNumber, entries: Vec<LogEntry<SM::Input>>) {
+        let keep_up_to = start.max(self.commit_number);
+        assert!(keep_up_to <= self.op_number());
+        self.log.truncate(keep_up_to - self.log_start);
+        self.log
+            .extend(entries.into_iter().skip(keep_up_to - start));
+        assert!(self.op_number() >= self.commit_number);
+        self.mark_log_changed(keep_up_to + 1);
+        self.rebuild_pending();
     }
 
-    /// Commits every op up to `commit_number`, in order, replying to the
-    /// clients if `reply` is set. The commit number never moves backwards.
+    /// Replaces our state with `checkpoint`, and the log with `entries`,
+    /// which follow it. The checkpoint must be at or beyond our commit
+    /// number, so that nothing executed here is undone.
+    fn install_checkpoint(
+        &mut self,
+        checkpoint: Checkpoint<SM::Output, SM::Snapshot>,
+        entries: Vec<LogEntry<SM::Input>>,
+    ) {
+        assert!(checkpoint.op_number >= self.commit_number);
+        trace!(
+            "Replica {} installs a checkpoint at op {} with {} entries after it",
+            self.self_id,
+            checkpoint.op_number,
+            entries.len()
+        );
+        self.client_table = checkpoint
+            .client_table
+            .iter()
+            .map(|record| {
+                (
+                    record.client_id,
+                    ClientEntry {
+                        request_number: record.request_number,
+                        reply: record.reply.clone(),
+                    },
+                )
+            })
+            .collect();
+        self.commit_number = checkpoint.op_number;
+        self.applied = checkpoint.op_number;
+        self.reply_ranges.clear();
+        self.log_start = checkpoint.op_number;
+        self.log = entries;
+        self.mark_log_changed(self.log_start + 1);
+        self.rebuild_pending();
+        self.state_machine.restore(checkpoint);
+    }
+
+    /// Our state after every executed op, for a replica that has fallen
+    /// behind what we have compacted.
+    fn checkpoint(&self) -> Checkpoint<SM::Output, SM::Snapshot> {
+        Checkpoint {
+            op_number: self.applied,
+            state: self.state_machine.snapshot(),
+            client_table: self.client_table(),
+        }
+    }
+
+    /// Commits every op up to `commit_number`; they are executed, and
+    /// replied to if `reply` is set, when the replies are drained. The
+    /// commit number never moves backwards.
     fn commit_up_to(&mut self, commit_number: CommitID, reply: bool) {
-        while self.commit_number < commit_number {
-            let response = self.commit_op(self.commit_number);
-            if reply {
-                self.replies.push(response);
-            }
+        if commit_number <= self.commit_number {
+            return;
         }
-    }
-
-    /// Commits the operation at log index `op_idx` and returns the reply for
-    /// it. The result is also kept in the client table, if the request is
-    /// still the client's latest, so a re-sent request can be answered
-    /// without running it again.
-    fn commit_op(&mut self, op_idx: usize) -> Reply<SM::Output> {
-        let entry = self.log[op_idx].clone();
-        let result = self.state_machine.apply(entry.op);
-        self.commit_number += 1;
-        if let Some(client) = self.client_table.get_mut(&entry.client_id) {
-            if client.request_number == entry.request_number {
-                client.reply = Some(result.clone());
-            }
+        if reply {
+            self.reply_ranges
+                .push((self.commit_number + 1, commit_number));
         }
-        Reply {
-            view_number: self.view_number,
-            client_id: entry.client_id,
-            request_number: entry.request_number,
-            result,
-        }
+        self.commit_number = commit_number;
     }
 
     /// Acknowledges to the primary that we have every op up to our op
-    /// number.
+    /// number. An acknowledgement covers every earlier one, so one still
+    /// waiting to be sent for this view is dropped in favour of this one.
     fn send_prepare_ok(&mut self) {
+        let primary_id = self.primary_id();
+        let view_number = self.view_number;
+        self.outbox.retain(|(replica_id, message)| {
+            !(*replica_id == primary_id
+                && matches!(message, Message::PrepareOk { view_number: v, .. } if *v == view_number))
+        });
         let message = Message::PrepareOk {
-            view_number: self.view_number,
+            view_number,
             op_number: self.op_number(),
             replica_id: self.self_id,
         };
@@ -1388,20 +1980,25 @@ impl<SM: StateMachine> Replica<SM> {
     }
 
     fn send_get_state(&mut self, op_number: OpNumber) {
+        let primary_id = self.primary_id();
+        self.send_get_state_to(primary_id, op_number);
+    }
+
+    fn send_get_state_to(&mut self, replica_id: ReplicaID, op_number: OpNumber) {
         let message = Message::GetState {
             replica_id: self.self_id,
             view_number: self.view_number,
             op_number,
         };
-        self.send_to_primary(message);
+        self.send(replica_id, message);
     }
 
-    fn send_to_primary(&mut self, message: Message<SM::Input>) {
+    fn send_to_primary(&mut self, message: MessageFor<SM>) {
         let primary_id = self.primary_id();
         self.send(primary_id, message);
     }
 
-    fn send_to_others(&mut self, message: Message<SM::Input>) {
+    fn send_to_others(&mut self, message: MessageFor<SM>) {
         for replica_id in self.config.replicas().to_vec() {
             if replica_id != self.self_id {
                 self.send(replica_id, message.clone());
@@ -1409,8 +2006,25 @@ impl<SM: StateMachine> Replica<SM> {
         }
     }
 
-    fn send(&mut self, replica_id: ReplicaID, message: Message<SM::Input>) {
-        self.outbox.push((replica_id, message));
+    /// Queues a message. One that promises nothing about our durable
+    /// state may leave before the step is persisted: a `Prepare` or
+    /// `NewState` asks the receiver to hold entries, and it is the
+    /// receiver's acknowledgement that must wait; a `Commit` names ops
+    /// that are committed wherever we go; a `GetState` asks. The rest
+    /// carry our view, our log, or our acknowledgement, and wait.
+    fn send(&mut self, replica_id: ReplicaID, message: MessageFor<SM>) {
+        let early = matches!(
+            message,
+            Message::Prepare { .. }
+                | Message::Commit { .. }
+                | Message::GetState { .. }
+                | Message::NewState { .. }
+        );
+        if early {
+            self.outbox_early.push((replica_id, message));
+        } else {
+            self.outbox.push((replica_id, message));
+        }
     }
 
     /// Returns the ID of this replica.
@@ -1433,6 +2047,11 @@ impl<SM: StateMachine> Replica<SM> {
         self.view_number
     }
 
+    /// The latest view in which this replica's status was normal.
+    pub fn last_normal_view(&self) -> ViewNumber {
+        self.last_normal_view
+    }
+
     /// What this replica is doing right now.
     pub fn status(&self) -> Status {
         self.status
@@ -1443,34 +2062,86 @@ impl<SM: StateMachine> Replica<SM> {
         self.status == Status::Recovering
     }
 
-    /// Returns the commit number, i.e. the number of log entries that have
-    /// been applied to the state machine.
+    /// Returns the commit number, i.e. the number of log entries that are
+    /// committed.
     pub fn commit_number(&self) -> CommitID {
         self.commit_number
     }
 
-    /// Returns the op number, i.e. the number of entries in the log.
-    pub fn op_number(&self) -> OpNumber {
-        self.log.len()
+    /// The number of committed ops the state machine has executed, which
+    /// happens when the replies are drained.
+    pub fn applied(&self) -> OpNumber {
+        self.applied
     }
 
-    /// Returns the log.
+    /// Returns the op number, i.e. that of the last log entry.
+    pub fn op_number(&self) -> OpNumber {
+        self.log_start + self.log.len()
+    }
+
+    /// The op number of the last entry compacted away; the log holds the
+    /// entries after it.
+    pub fn log_start(&self) -> OpNumber {
+        self.log_start
+    }
+
+    /// The log entries after [`Replica::log_start`], in op number order.
     pub fn log(&self) -> &[LogEntry<SM::Input>] {
         &self.log
     }
 
-    /// Returns the state machine.
+    /// The log entries from `op_number` on, or from the first one held if
+    /// `op_number` has been compacted.
+    pub fn log_from(&self, op_number: OpNumber) -> &[LogEntry<SM::Input>] {
+        let skip = op_number
+            .saturating_sub(self.log_start + 1)
+            .min(self.log.len());
+        &self.log[skip..]
+    }
+
+    /// The client table: the latest executed request of each client, with
+    /// its result.
+    pub fn client_table(&self) -> Vec<ClientRecord<SM::Output>> {
+        self.client_table
+            .iter()
+            .map(|(client_id, entry)| ClientRecord {
+                client_id: *client_id,
+                request_number: entry.request_number,
+                reply: entry.reply.clone(),
+            })
+            .collect()
+    }
+
+    /// Returns the state machine, as far as the drained replies have
+    /// taken it.
     pub fn state_machine(&self) -> &SM {
         &self.state_machine
     }
 
-    /// Messages to send to other replicas.
-    pub fn drain_messages(&mut self) -> std::vec::Drain<'_, (ReplicaID, Message<SM::Input>)> {
-        self.outbox.drain(..)
+    /// Messages that may be sent before the step is persisted, because
+    /// they promise nothing about this replica's durable state. An owner
+    /// that sends them first overlaps its own write with the receivers';
+    /// one that skips this gets them from [`Replica::drain_messages`].
+    pub fn drain_messages_before_persist(
+        &mut self,
+    ) -> std::vec::Drain<'_, (ReplicaID, MessageFor<SM>)> {
+        self.outbox_early.drain(..)
     }
 
-    /// Replies to send to clients.
+    /// Messages to send to other replicas, once the step is persisted.
+    /// Calling it tells the replica the step is persisted: the primary
+    /// counts its own acknowledgement for its entries, and committed
+    /// operations are executed.
+    pub fn drain_messages(&mut self) -> impl Iterator<Item = (ReplicaID, MessageFor<SM>)> + '_ {
+        self.after_persist();
+        self.outbox_early.drain(..).chain(self.outbox.drain(..))
+    }
+
+    /// Replies to send to clients, once the step is persisted. Calling it
+    /// tells the replica the step is persisted, as [`Replica::drain_messages`]
+    /// does.
     pub fn drain_replies(&mut self) -> std::vec::Drain<'_, Reply<SM::Output>> {
+        self.after_persist();
         self.replies.drain(..)
     }
 }

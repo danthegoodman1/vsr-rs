@@ -59,17 +59,37 @@ A `Replica` and a `Client` are state machines that their owner steps:
 
 You provide the rest:
 
-- **State machine.** Implement `StateMachine` with an `apply` method. The
-  library calls it, in order, for every committed operation.
+- **State machine.** Implement `StateMachine`: `apply`, which the library
+  calls in order for every committed operation with its op number, and
+  `snapshot` and `restore`, which move the whole state to a replica that
+  fell behind a compacted log.
 - **Transport.** Serialize `Message` values and move them between
   replicas and clients. The library does not care how, or whether they
   arrive, are duplicated, or are reordered.
 - **Timers.** Call `on_idle` at a fixed period. The library measures time
   in idle periods, not seconds.
-- **One persisted integer.** Store `view_number()` after each step, before
-  delivering what the step produced, and pass it to `Replica::recover`
-  when the replica restarts. Without it a replica can forget it asked for
-  a view change and let two views run at once[^michael17].
+- **Persistence.** After each step, before delivering what the step
+  produced, write what `PersistentState` describes: a few counters, the
+  client table, and the log entries from the change marker on. Pass it to
+  `Replica::restart` when the replica restarts, with the number of ops the
+  state machine had made durable; the replica applies the rest again. That
+  ordering is the whole durability argument: an acknowledgement leaves only
+  after the entry it covers is on disk, and the replica executes committed
+  operations only when its replies are drained, after the step is
+  persisted, so a state machine that persists what it executes never gets
+  ahead of the log. Two things cost nothing in that argument, and the
+  library exposes both: messages that promise nothing about the sender's
+  durable state, a `Prepare` above all, can leave before the write, which
+  overlaps the primary's write with the backups', and a step that changed
+  only the commit number needs no write before delivery.
+- **Compaction.** Once the state machine has made its state durable, call
+  `compact` with the op number it reached. A replica that needs entries
+  another one has compacted gets a checkpoint of its state instead.
+
+A replica whose disk is gone comes back through `Replica::recover`, which
+fetches the state from the others. It needs the view number it had, or it
+can forget it asked for a view change and let two views run at
+once[^michael17].
 
 Reconfiguration, which changes the membership of a running cluster, is out
 of scope. The membership is fixed when the cluster is created. TigerBeetle
@@ -84,6 +104,8 @@ here.
 | View changes | 4.2 | done, with exponential backoff |
 | Recovery | 4.3 | done, with a persisted view number[^michael17] |
 | State transfer | 5.2 | done, without the truncation defect[^vanlightly22] |
+| Checkpoints and log compaction | 5.1 | done, checkpoints come from the state machine |
+| Durable log | | done, the owner persists after every step |
 | Reconfiguration | 7 | out of scope, membership is fixed |
 
 ## Getting started
@@ -93,17 +115,26 @@ process. A test or a simulator delivers the messages like this; a real
 program puts them on the wire.
 
 ```rust
-use vsr_rs::{Client, Config, Replica, StateMachine};
+use vsr_rs::{Checkpoint, Client, Config, LogEntry, OpNumber, Replica, StateMachine};
 
 struct Counter(i64);
 
 impl StateMachine for Counter {
     type Input = i64;
     type Output = i64;
+    type Snapshot = i64;
 
-    fn apply(&mut self, delta: i64) -> i64 {
-        self.0 += delta;
+    fn apply(&mut self, _op_number: OpNumber, entry: &LogEntry<i64>) -> i64 {
+        self.0 += entry.op;
         self.0
+    }
+
+    fn snapshot(&self) -> i64 {
+        self.0
+    }
+
+    fn restore(&mut self, checkpoint: Checkpoint<i64, i64>) {
+        self.0 = checkpoint.state;
     }
 }
 
@@ -135,8 +166,11 @@ loop {
 ```
 
 For a complete program, [`examples/kvstore`](examples/kvstore) is a
-replicated key-value store over TCP that speaks a Redis-like protocol.
-Start three nodes, each in its own terminal:
+replicated key-value store over TCP that speaks a Redis-like protocol. It
+persists the replica's log with the `writeahead` crate, one fsync per batch
+of events, and keeps the store in a `fjall` database that is persisted once
+a second, after which the log is compacted. Start three nodes, each in its
+own terminal:
 
 ```console
 cargo build --example kvstore
@@ -156,8 +190,10 @@ $3
 bar
 ```
 
-Stop node 0 with Ctrl-C. The others pick a new primary within a second and
-keep serving. Start node 0 again and it recovers and rejoins as a backup.
+Stop node 0 with Ctrl-C, or kill it. The others pick a new primary within
+a second and keep serving. Start node 0 again and it comes back from its
+disk and rejoins as a backup. Kill all three and start them again, and
+they come back with everything they had committed.
 
 ## Verification
 
@@ -173,13 +209,20 @@ cargo test --workspace
 [`simulator/`](simulator) is a deterministic simulator modeled on
 TigerBeetle's VOPR. It runs a cluster and its clients in one thread, passes
 every message through a network that loses, replays, and delays them,
-crashes and restarts replicas, sometimes with their memory wiped, and checks
-a set of safety properties after every tick:
+crashes and restarts replicas, sometimes from what they persisted after a
+power loss, sometimes with their disk wiped, cuts the power of every
+replica at once, or of a replica between sending what need not wait and
+persisting the step, makes state machines flush and replicas compact
+their logs, and checks a set of safety properties after every tick:
 
 - committed prefixes agree on every replica,
 - committed operations survive on enough replicas,
 - every reply matches a committed request,
 - no request runs twice.
+
+Each replica has a disk that the simulator writes the way an owner would,
+from the change marker after every step, and a replica that lost power
+is rebuilt from it.
 
 The seed determines the whole configuration, from cluster size to fault
 rates. Once the requests are done, faults stop and a random majority of
@@ -207,6 +250,21 @@ scripts/simulate --report          # the runs of the current commit
 scripts/simulate --report --all    # every commit ever run
 ```
 
+### Benchmark
+
+[`bench/`](bench) measures what the durable log costs. Three replicas run
+on their own threads with the event loop of the kvstore example and a
+fjall store, and a set of closed-loop clients drives them over channels.
+It compares the library as it was before the durable log, embedded from
+the commit that preceded it, with the current library with the journal
+off and on, so the cost of the new bookkeeping and the cost of the fsync
+per batch can be read apart.
+
+```console
+cargo run --release -p vsr-bench
+CLIENTS=1,16,256 cargo run --release -p vsr-bench
+```
+
 ### Coverage
 
 `scripts/coverage` runs a batch of random seeds under LLVM instrumentation
@@ -229,8 +287,8 @@ open target/coverage/html/index.html      # xdg-open on Linux
 
 The same simulator has a terminal viewer that draws the replicas, every
 message in flight, each replica's state, view, log and commit progress,
-and an event log. It takes faults from the keyboard: crash, restart,
-reboot without memory, partition, packet loss.
+and an event log. It takes faults from the keyboard: crash, power loss,
+blackout, restart, reboot without memory, flush, partition, packet loss.
 
 ```console
 cargo run --release -p vsr-simulator --bin vsr-simulator-tui -- --interactive

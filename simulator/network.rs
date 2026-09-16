@@ -4,7 +4,7 @@
 //! sent. The network decides for each message whether to lose, replay, or
 //! delay it, and every tick hands back whatever is due.
 
-use crate::state_machine::Op;
+use crate::state_machine::Msg;
 use log::trace;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
@@ -27,11 +27,11 @@ pub struct Envelope {
     pub to: ReplicaId,
     pub sent_at: u64,
     pub due_at: u64,
-    pub message: Message<Op>,
+    pub message: Msg,
 }
 
 /// The name of a message's kind, for display.
-pub fn message_kind(message: &Message<Op>) -> &'static str {
+pub fn message_kind(message: &Msg) -> &'static str {
     match message {
         Message::Request { .. } => "Request",
         Message::Prepare { .. } => "Prepare",
@@ -145,14 +145,7 @@ impl Network {
     }
 
     /// Accepts a message sent at tick `now`, applying faults.
-    pub fn send(
-        &mut self,
-        now: u64,
-        from: Origin,
-        dst: ReplicaId,
-        msg: Message<Op>,
-        rng: &mut ChaCha8Rng,
-    ) {
+    pub fn send(&mut self, now: u64, from: Origin, dst: ReplicaId, msg: Msg, rng: &mut ChaCha8Rng) {
         self.summary.sent += 1;
         if matches!(msg, Message::Request { .. }) && !self.options.fault_client_messages {
             self.enqueue_at(now, now, from, dst, msg);
@@ -183,14 +176,7 @@ impl Network {
         due.into_values().collect()
     }
 
-    fn enqueue(
-        &mut self,
-        now: u64,
-        from: Origin,
-        dst: ReplicaId,
-        msg: Message<Op>,
-        rng: &mut ChaCha8Rng,
-    ) {
+    fn enqueue(&mut self, now: u64, from: Origin, dst: ReplicaId, msg: Msg, rng: &mut ChaCha8Rng) {
         let delay = self.sample_delay(rng);
         if delay > self.options.one_way_delay_min {
             trace!("tick {now}: delaying {msg:?} to {dst} by {delay}");
@@ -211,7 +197,7 @@ impl Network {
         min + extra.round() as u64
     }
 
-    fn enqueue_at(&mut self, now: u64, at: u64, from: Origin, dst: ReplicaId, msg: Message<Op>) {
+    fn enqueue_at(&mut self, now: u64, at: u64, from: Origin, dst: ReplicaId, msg: Msg) {
         self.seq += 1;
         self.queue.insert(
             (at, self.seq),

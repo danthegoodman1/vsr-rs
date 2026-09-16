@@ -1,11 +1,19 @@
 //! Cluster tests: a few replicas and a client driven by hand through a
 //! tick function that decides which messages get delivered.
+//!
+//! Every replica has a disk: a copy of its persistent state that the
+//! cluster maintains the way an owner would, from the log change marker
+//! after every step, and checks against the replica. Restarts rebuild a
+//! replica from its disk.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use vsr_rs::{Client, Config, Message, Replica, ReplicaID, Reply, RequestNumber, StateMachine};
+use vsr_rs::{
+    Checkpoint, Client, Config, LogEntry, Message, MessageFor, OpNumber, PersistentState, Replica,
+    ReplicaID, Reply, RequestNumber, StateMachine, Status,
+};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Op {
     Add(i32),
     Sub(i32),
@@ -19,13 +27,58 @@ struct Accumulator {
 impl StateMachine for Accumulator {
     type Input = Op;
     type Output = ();
+    type Snapshot = i32;
 
-    fn apply(&mut self, op: Op) {
-        match op {
+    fn apply(&mut self, _op_number: OpNumber, entry: &LogEntry<Op>) {
+        match entry.op {
             Op::Add(value) => self.value += value,
             Op::Sub(value) => self.value -= value,
         }
     }
+
+    fn snapshot(&self) -> i32 {
+        self.value
+    }
+
+    fn restore(&mut self, checkpoint: Checkpoint<(), i32>) {
+        self.value = checkpoint.state;
+    }
+}
+
+type Msg = MessageFor<Accumulator>;
+type Disk = PersistentState<Op, ()>;
+
+/// Applies what a step changed to a persisted copy of the replica's state,
+/// the way an owner persists after every step, and checks the copy.
+fn persist(disk: &mut Disk, replica: &mut Replica<Accumulator>) {
+    // Compaction first, so that the entries kept below the change marker
+    // are contiguous with the ones written from it.
+    let log_start = replica.log_start();
+    if log_start > disk.log_start {
+        let dropped = (log_start - disk.log_start).min(disk.log.len());
+        disk.log.drain(..dropped);
+        disk.log_start = log_start;
+    }
+    if let Some(from) = replica.take_log_changes() {
+        let keep = from.saturating_sub(disk.log_start + 1).min(disk.log.len());
+        disk.log.truncate(keep);
+        disk.log.extend_from_slice(replica.log_from(from));
+    }
+    disk.view_number = replica.view_number();
+    disk.last_normal_view = replica.last_normal_view();
+    disk.commit_number = replica.commit_number();
+    disk.client_table = replica.client_table();
+    disk.recovering = replica.is_recovering();
+    assert_eq!(
+        *disk,
+        replica.persistent_state(),
+        "disk of replica {}",
+        replica.id()
+    );
+}
+
+fn empty_disk() -> Disk {
+    PersistentState::empty()
 }
 
 /// Replicas and one client, with the messages between them held in a queue
@@ -33,8 +86,9 @@ impl StateMachine for Accumulator {
 struct Cluster {
     config: Config,
     replicas: Vec<Replica<Accumulator>>,
+    disks: Vec<Disk>,
     client: Client<Op>,
-    queue: VecDeque<(ReplicaID, Message<Op>)>,
+    queue: VecDeque<(ReplicaID, Msg)>,
     replies: Vec<Reply<()>>,
 }
 
@@ -57,6 +111,7 @@ impl Cluster {
             .collect();
         Cluster {
             replicas,
+            disks: (0..replica_count).map(|_| empty_disk()).collect(),
             client: Client::new(0, config.clone()),
             config,
             queue: VecDeque::new(),
@@ -68,10 +123,11 @@ impl Cluster {
         self.client.on_request(op)
     }
 
-    /// Moves everything the replicas and the client want sent into the
-    /// queue, and collects the replies.
+    /// Persists every replica, then moves everything the replicas and the
+    /// client want sent into the queue, and collects the replies.
     fn collect(&mut self) {
-        for replica in &mut self.replicas {
+        for (replica, disk) in self.replicas.iter_mut().zip(&mut self.disks) {
+            persist(disk, replica);
             self.queue.extend(replica.drain_messages());
             self.replies.extend(replica.drain_replies());
         }
@@ -80,7 +136,7 @@ impl Cluster {
 
     /// Delivers every queued message for which `deliver` returns true, and
     /// whatever those deliveries produce, until nothing is left.
-    fn tick_with(&mut self, deliver: &dyn Fn(ReplicaID, &Message<Op>) -> bool) {
+    fn tick_with(&mut self, deliver: &dyn Fn(ReplicaID, &Msg) -> bool) {
         loop {
             self.collect();
             if self.queue.is_empty() {
@@ -109,6 +165,15 @@ impl Cluster {
         }
     }
 
+    /// Runs the idle logic of every replica but `dead`.
+    fn idle_without(&mut self, dead: ReplicaID) {
+        for replica in &mut self.replicas {
+            if replica.id() != dead {
+                replica.on_idle();
+            }
+        }
+    }
+
     /// One tick of a cluster whose messages take one tick to arrive, in
     /// the simulator's order: every replica gets an idle period, then
     /// everything queued so far is delivered, and what those deliveries
@@ -127,9 +192,9 @@ impl Cluster {
     /// Whether every replica is in normal status in the same view.
     fn settled(&self) -> bool {
         let view = self.replicas[0].view_number();
-        self.replicas.iter().all(|replica| {
-            replica.status() == vsr_rs::Status::Normal && replica.view_number() == view
-        })
+        self.replicas
+            .iter()
+            .all(|replica| replica.status() == Status::Normal && replica.view_number() == view)
     }
 
     fn take_replies(&mut self) -> Vec<Reply<()>> {
@@ -139,6 +204,37 @@ impl Cluster {
 
     fn value(&self, replica_id: ReplicaID) -> i32 {
         self.replicas[replica_id].state_machine().value
+    }
+
+    /// Replaces a replica with one rebuilt from its disk, as after a power
+    /// loss: the state machine starts over and applies the committed log
+    /// again. Whatever the replica had not sent yet is lost.
+    fn restart(&mut self, replica_id: ReplicaID) {
+        self.restart_with_applied(replica_id, 0, Accumulator::default());
+    }
+
+    /// Like `restart`, with a state machine that had made the first
+    /// `applied` ops durable.
+    fn restart_with_applied(&mut self, replica_id: ReplicaID, applied: OpNumber, sm: Accumulator) {
+        let disk = self.disks[replica_id].clone();
+        self.restart_with_state(replica_id, applied, sm, disk);
+    }
+
+    /// Like `restart`, from the given persisted state.
+    fn restart_with_state(
+        &mut self,
+        replica_id: ReplicaID,
+        applied: OpNumber,
+        sm: Accumulator,
+        state: Disk,
+    ) {
+        self.replicas[replica_id].drain_messages().for_each(drop);
+        self.replicas[replica_id].drain_replies().for_each(drop);
+        self.replicas[replica_id] =
+            Replica::restart(replica_id, self.config.clone(), sm, applied, state, 7);
+        // The disk is what the restarted replica now persists.
+        self.disks[replica_id] = self.replicas[replica_id].persistent_state();
+        self.replicas[replica_id].take_log_changes();
     }
 }
 
@@ -465,11 +561,6 @@ fn test_lost_request_resent_on_idle() {
 #[test]
 fn test_view_change_after_primary_crash() {
     let mut cluster = Cluster::new(3);
-    // Replica 0 has crashed: it gets nothing and runs no idle logic.
-    fn idle_without_0(cluster: &mut Cluster) {
-        cluster.replicas[1].on_idle();
-        cluster.replicas[2].on_idle();
-    }
 
     // Two ops commit everywhere in view 0.
     cluster.request(Op::Add(10));
@@ -494,7 +585,7 @@ fn test_view_change_after_primary_crash() {
 
     // The backups stop hearing from the primary and change view.
     for _ in 0..10 {
-        idle_without_0(&mut cluster);
+        cluster.idle_without(0);
         cluster.tick_without(0);
     }
     assert_eq!(1, cluster.replicas[1].view_number());
@@ -518,7 +609,7 @@ fn test_view_change_after_primary_crash() {
         .on_reply(replies[0].request_number, replies[0].view_number);
     cluster.request(Op::Add(40));
     cluster.tick_without(0);
-    idle_without_0(&mut cluster);
+    cluster.idle_without(0);
     cluster.tick_without(0);
     assert_eq!(4, cluster.replicas[1].commit_number());
     assert_eq!(4, cluster.replicas[2].commit_number());
@@ -586,6 +677,7 @@ fn test_recovery_after_reboot() {
     // Replica 1 reboots. It last persisted view 0, and picks nonce 42.
     cluster.replicas[1] =
         Replica::recover(1, cluster.config.clone(), Accumulator::default(), 0, 42);
+    cluster.disks[1] = empty_disk();
     assert!(cluster.replicas[1].is_recovering());
     assert_eq!(0, cluster.replicas[1].op_number());
 
@@ -643,7 +735,7 @@ fn test_view_change_does_not_start_the_next() {
     for _ in 0..3 {
         cluster.replicas[2].on_idle();
     }
-    assert_eq!(cluster.replicas[2].status(), vsr_rs::Status::ViewChange);
+    assert_eq!(cluster.replicas[2].status(), Status::ViewChange);
     let mut quiet = 0;
     for _ in 0..500 {
         let busy = cluster.step();
@@ -661,4 +753,607 @@ fn test_view_change_does_not_start_the_next() {
         quiet, 10,
         "the cluster never settled: replicas are in views {views:?}"
     );
+}
+
+/// A backup restarts from its disk with a fresh state machine. It applies
+/// the committed log again, comes back in normal status in its view, and
+/// takes part in the next op.
+#[test]
+fn test_restart_backup_from_disk() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    for id in 0..3 {
+        assert_eq!(30, cluster.value(id));
+    }
+
+    cluster.restart(1);
+    assert_eq!(Status::Normal, cluster.replicas[1].status());
+    assert_eq!(0, cluster.replicas[1].view_number());
+    assert_eq!(2, cluster.replicas[1].commit_number());
+    assert_eq!(30, cluster.value(1));
+
+    // Only replica 1 acknowledges the next op, so its acknowledgement is
+    // what commits it.
+    cluster.request(Op::Add(30));
+    cluster.tick_with(&|replica_id, message| {
+        replica_id != 2 || matches!(message, Message::Request { .. })
+    });
+    assert_eq!(3, cluster.replicas[0].commit_number());
+    assert_eq!(60, cluster.value(0));
+}
+
+/// A backup restarts with a state machine that had made some of the
+/// committed ops durable: only the rest are applied again.
+#[test]
+fn test_restart_applies_only_what_the_state_machine_lacks() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.request(Op::Add(30));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    assert_eq!(60, cluster.value(1));
+
+    // The state machine had applied op 1 when replica 1 went down, and
+    // that op alone must not be applied again.
+    cluster.restart_with_applied(1, 1, Accumulator { value: 10 });
+    assert_eq!(60, cluster.value(1));
+    assert_eq!(3, cluster.replicas[1].commit_number());
+}
+
+/// The primary restarts with an op in its log that the backups never
+/// acknowledged. It does not resume as the primary: it starts the next
+/// view. The view starts from the backups' logs, which lack the op, so
+/// the client's re-send is what gets it executed.
+#[test]
+fn test_restart_primary_starts_next_view() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.tick();
+    cluster.request(Op::Add(20));
+    // The `Prepare` for op 2 is lost, and the primary goes down.
+    cluster.tick_with(&|_, message| !matches!(message, Message::Prepare { op_number: 2, .. }));
+    assert_eq!(2, cluster.replicas[0].op_number());
+    assert_eq!(1, cluster.replicas[0].commit_number());
+
+    cluster.restart(0);
+    assert_eq!(Status::ViewChange, cluster.replicas[0].status());
+    assert_eq!(1, cluster.replicas[0].view_number());
+    assert_eq!(2, cluster.replicas[0].op_number());
+    assert_eq!(10, cluster.value(0));
+
+    for _ in 0..10 {
+        cluster.idle();
+        cluster.tick();
+    }
+    assert!(cluster.settled());
+    assert!(cluster.replicas[1].is_primary());
+    for id in 0..3 {
+        assert_eq!(1, cluster.replicas[id].commit_number());
+        assert_eq!(1, cluster.replicas[id].op_number());
+    }
+    cluster.client.on_idle();
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    for id in 0..3 {
+        assert_eq!(2, cluster.replicas[id].commit_number());
+        assert_eq!(30, cluster.value(id));
+    }
+}
+
+/// The primary sends the `Prepare` for an op before its own entry is
+/// durable, and loses power before it is. The backups hold the op under
+/// op number 2; the primary's disk does not. On restart the primary must
+/// not resume and assign op number 2 again: it starts the next view, and
+/// the op the backups hold commits there.
+#[test]
+fn test_prepare_sent_before_persist_survives_primary_crash() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    // The request reaches the primary, whose `Prepare` goes out before
+    // its disk has op 2.
+    let request_number = cluster.request(Op::Add(20));
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    let early: Vec<_> = cluster.replicas[0]
+        .drain_messages_before_persist()
+        .collect();
+    assert_eq!(2, early.len());
+    for (replica_id, message) in early {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    assert_eq!(1, cluster.disks[0].log.len());
+    // The primary restarts from that disk. The backups' acknowledgements
+    // reach nobody.
+    cluster.replicas[0].drain_messages().for_each(drop);
+    cluster.restart(0);
+    assert_eq!(1, cluster.replicas[0].op_number());
+    assert_eq!(Status::ViewChange, cluster.replicas[0].status());
+    cluster.replicas[1].drain_messages().for_each(drop);
+    cluster.replicas[2].drain_messages().for_each(drop);
+    assert_eq!(2, cluster.replicas[1].op_number());
+
+    for _ in 0..10 {
+        cluster.idle();
+        cluster.tick();
+    }
+    assert!(cluster.settled());
+    let replies = cluster.take_replies();
+    assert!(replies
+        .iter()
+        .any(|reply| reply.request_number == request_number));
+    for id in 0..3 {
+        assert_eq!(2, cluster.replicas[id].commit_number());
+        assert_eq!(30, cluster.value(id));
+    }
+}
+
+/// A backup that is down leaves the primary with itself and one backup,
+/// which is a quorum of three only if the primary counts its own
+/// acknowledgement, which it does once the step is persisted.
+#[test]
+fn test_primary_counts_own_acknowledgement_after_persist() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    // Before the persist, the primary has appended but acknowledged
+    // nothing; a backup's acknowledgement alone is no quorum.
+    let prepares: Vec<_> = cluster.replicas[0]
+        .drain_messages_before_persist()
+        .collect();
+    for (replica_id, message) in prepares {
+        if replica_id == 1 {
+            cluster.replicas[replica_id].on_message(message);
+        }
+    }
+    let acks: Vec<_> = cluster.replicas[1].drain_messages().collect();
+    for (_, message) in acks {
+        cluster.replicas[0].on_message(message);
+    }
+    assert_eq!(0, cluster.replicas[0].commit_number());
+    // The persist, marked by draining, adds the primary's own.
+    cluster.replicas[0].drain_messages().for_each(drop);
+    assert_eq!(1, cluster.replicas[0].commit_number());
+}
+
+/// A replica restarts in the middle of a view change. Its last normal
+/// view is behind its view number, so it must not resume as if the view
+/// had started: it enters the view change again, and the view completes.
+#[test]
+fn test_restart_during_view_change() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+
+    // The primary goes silent. Replica 2 starts a view change; replica 1
+    // joins it and goes down right after.
+    for _ in 0..4 {
+        cluster.replicas[2].on_idle();
+    }
+    cluster.tick_with(&|replica_id, message| {
+        replica_id == 1 && matches!(message, Message::StartViewChange { .. })
+    });
+    assert_eq!(Status::ViewChange, cluster.replicas[1].status());
+    assert_eq!(1, cluster.replicas[1].view_number());
+    assert_eq!(0, cluster.replicas[1].last_normal_view());
+
+    cluster.restart(1);
+    assert_eq!(Status::ViewChange, cluster.replicas[1].status());
+    assert_eq!(1, cluster.replicas[1].view_number());
+    assert!(cluster.replicas[1].is_primary());
+
+    for _ in 0..10 {
+        cluster.idle_without(0);
+        cluster.tick_without(0);
+    }
+    assert_eq!(Status::Normal, cluster.replicas[1].status());
+    assert_eq!(Status::Normal, cluster.replicas[2].status());
+    assert_eq!(1, cluster.replicas[1].view_number());
+    assert_eq!(1, cluster.replicas[2].view_number());
+    cluster.request(Op::Add(20));
+    cluster.client.on_idle();
+    cluster.tick_without(0);
+    assert_eq!(30, cluster.value(1));
+    cluster.idle_without(0);
+    cluster.tick_without(0);
+    assert_eq!(30, cluster.value(2));
+}
+
+/// A replica that was still recovering when it went down holds nothing
+/// it may act on, so a restart from its disk recovers again.
+#[test]
+fn test_restart_while_recovering() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.tick();
+    cluster.replicas[1] =
+        Replica::recover(1, cluster.config.clone(), Accumulator::default(), 0, 42);
+    cluster.disks[1] = empty_disk();
+    cluster.collect();
+    assert!(cluster.disks[1].recovering);
+
+    cluster.restart(1);
+    assert!(cluster.replicas[1].is_recovering());
+    cluster.tick();
+    assert!(!cluster.replicas[1].is_recovering());
+    assert_eq!(10, cluster.value(1));
+}
+
+/// The primary compacts its log, and a backup that missed an op cannot get
+/// it as entries any more. State transfer brings the primary's checkpoint
+/// instead, and the backup carries on from it.
+#[test]
+fn test_state_transfer_with_checkpoint() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.tick_without(1);
+    assert_eq!(2, cluster.replicas[0].commit_number());
+    cluster.replicas[0].compact(2);
+    assert_eq!(2, cluster.replicas[0].log_start());
+    assert_eq!(0, cluster.replicas[0].log().len());
+
+    cluster.request(Op::Add(30));
+    cluster.tick();
+    assert_eq!(2, cluster.replicas[1].log_start());
+    assert_eq!(3, cluster.replicas[1].op_number());
+    cluster.idle();
+    cluster.tick();
+    for id in 0..3 {
+        assert_eq!(60, cluster.value(id));
+    }
+    // The backup restarts from what it persisted: a checkpoint's worth of
+    // state, which the state machine must have kept, and the entries after
+    // it.
+    cluster.restart_with_applied(1, 2, Accumulator { value: 30 });
+    assert_eq!(60, cluster.value(1));
+    assert_eq!(3, cluster.replicas[1].commit_number());
+}
+
+/// Compaction stops at the commit number: uncommitted entries can still
+/// be replaced by a view change.
+#[test]
+fn test_compaction_stops_at_commit_number() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.tick();
+    cluster.request(Op::Add(20));
+    cluster.tick_with(&|_, message| !matches!(message, Message::PrepareOk { .. }));
+    assert_eq!(1, cluster.replicas[0].commit_number());
+    assert_eq!(2, cluster.replicas[0].op_number());
+    cluster.replicas[0].compact(2);
+    assert_eq!(1, cluster.replicas[0].log_start());
+    assert_eq!(1, cluster.replicas[0].log().len());
+    cluster.collect();
+}
+
+/// The new primary's commit number is behind what the replica with the
+/// best log has compacted, so that replica's `DoViewChange` cannot carry
+/// everything the primary needs. The primary fetches its checkpoint,
+/// starts the view from it, and answers a re-sent request from the client
+/// table that came with the checkpoint.
+#[test]
+fn test_view_change_fetches_checkpoint() {
+    let mut cluster = Cluster::new(3);
+    // Ops 1 to 3 commit on replicas 0 and 2; replica 1 misses everything.
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    let request_number = cluster.request(Op::Add(30));
+    cluster.tick_without(1);
+    cluster.idle_without(1);
+    cluster.tick_without(1);
+    assert_eq!(3, cluster.replicas[2].commit_number());
+    assert_eq!(0, cluster.replicas[1].op_number());
+    cluster.replicas[2].compact(3);
+
+    // The primary goes down. Replica 1 becomes the primary of view 1 with
+    // replica 2's log, whose entries it has compacted.
+    for _ in 0..10 {
+        cluster.idle_without(0);
+        cluster.tick_without(0);
+    }
+    assert_eq!(1, cluster.replicas[1].view_number());
+    assert_eq!(Status::Normal, cluster.replicas[1].status());
+    assert!(cluster.replicas[1].is_primary());
+    assert_eq!(3, cluster.replicas[1].log_start());
+    assert_eq!(3, cluster.replicas[1].commit_number());
+    assert_eq!(60, cluster.value(1));
+    assert_eq!(Status::Normal, cluster.replicas[2].status());
+    assert_eq!(1, cluster.replicas[2].view_number());
+
+    // The client's latest request, executed before the checkpoint, is
+    // answered from the client table.
+    cluster.take_replies();
+    cluster.replicas[1].on_message(Message::Request {
+        client_id: 0,
+        request_number,
+        op: Op::Add(30),
+    });
+    let replies = cluster.take_replies();
+    assert_eq!(1, replies.len());
+    assert_eq!(request_number, replies[0].request_number);
+
+    cluster.client.on_reply(request_number, 1);
+    cluster.request(Op::Add(40));
+    cluster.tick_without(0);
+    assert_eq!(100, cluster.value(1));
+    cluster.idle_without(0);
+    cluster.tick_without(0);
+    assert_eq!(100, cluster.value(2));
+}
+
+/// The new primary has compacted past a backup's commit number, so the
+/// backup cannot take the log in `StartView`. It fetches the primary's
+/// checkpoint and joins the view from it.
+#[test]
+fn test_start_view_beyond_backup_commit() {
+    let mut cluster = Cluster::new(3);
+    // Ops 1 to 3 commit on replicas 0 and 1; replica 2 misses everything.
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.request(Op::Add(30));
+    cluster.tick_without(2);
+    cluster.idle_without(2);
+    cluster.tick_without(2);
+    assert_eq!(3, cluster.replicas[1].commit_number());
+    assert_eq!(0, cluster.replicas[2].op_number());
+    cluster.replicas[1].compact(3);
+
+    for _ in 0..10 {
+        cluster.idle_without(0);
+        cluster.tick_without(0);
+    }
+    assert!(cluster.replicas[1].is_primary());
+    assert_eq!(Status::Normal, cluster.replicas[1].status());
+    assert_eq!(Status::Normal, cluster.replicas[2].status());
+    assert_eq!(1, cluster.replicas[2].view_number());
+    assert_eq!(3, cluster.replicas[2].log_start());
+    assert_eq!(3, cluster.replicas[2].commit_number());
+    assert_eq!(60, cluster.value(2));
+
+    cluster.request(Op::Add(40));
+    cluster.client.on_idle();
+    cluster.tick_without(0);
+    assert_eq!(100, cluster.value(1));
+    cluster.idle_without(0);
+    cluster.tick_without(0);
+    assert_eq!(100, cluster.value(2));
+}
+
+/// A replica recovers with no memory from a primary that has compacted
+/// its log: the recovery response carries the primary's checkpoint.
+#[test]
+fn test_recovery_with_checkpoint() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    cluster.replicas[0].compact(2);
+    cluster.request(Op::Add(30));
+    cluster.tick_with(&|_, message| !matches!(message, Message::PrepareOk { .. }));
+    assert_eq!(2, cluster.replicas[0].commit_number());
+    assert_eq!(3, cluster.replicas[0].op_number());
+
+    cluster.replicas[1] =
+        Replica::recover(1, cluster.config.clone(), Accumulator::default(), 0, 42);
+    cluster.disks[1] = empty_disk();
+    cluster.tick();
+    assert!(!cluster.replicas[1].is_recovering());
+    assert_eq!(2, cluster.replicas[1].log_start());
+    assert_eq!(2, cluster.replicas[1].commit_number());
+    assert_eq!(3, cluster.replicas[1].op_number());
+    assert_eq!(30, cluster.value(1));
+    // The re-sent `Prepare` for op 3 commits it, and the next heartbeat
+    // tells the backups.
+    cluster.idle();
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    for id in 0..3 {
+        assert_eq!(60, cluster.value(id));
+    }
+}
+
+/// A backup that handles several `Prepare` messages before its owner
+/// sends anything acknowledges once, for the last op: an acknowledgement
+/// covers every earlier op.
+#[test]
+fn test_prepare_ok_coalesced() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.request(Op::Add(30));
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        assert_eq!(0, replica_id);
+        cluster.replicas[0].on_message(message);
+    }
+    cluster.collect();
+    let prepares: Vec<_> = std::mem::take(&mut cluster.queue)
+        .into_iter()
+        .filter(|(replica_id, message)| {
+            *replica_id == 1 && matches!(message, Message::Prepare { .. })
+        })
+        .collect();
+    assert_eq!(3, prepares.len());
+    for (_, message) in prepares {
+        cluster.replicas[1].on_message(message);
+    }
+    let acks: Vec<_> = cluster.replicas[1]
+        .drain_messages()
+        .filter_map(|(_, message)| match message {
+            Message::PrepareOk { op_number, .. } => Some(op_number),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(vec![3], acks);
+}
+
+/// A replica restored a checkpoint, which its state machine made durable
+/// at once, and lost power before the log was persisted after it. The
+/// state machine is ahead of the log: the checkpoint stands and the older
+/// log is dropped, then the replica catches up from the primary.
+#[test]
+fn test_restart_with_state_machine_ahead_of_log() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.request(Op::Add(30));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    // What replica 1 had persisted before the checkpoint: op 1 committed,
+    // op 2 still uncommitted.
+    let mut stale = cluster.disks[1].clone();
+    stale.commit_number = 1;
+    stale.log.truncate(2);
+    stale.client_table = cluster.disks[1].client_table.clone();
+    cluster.restart_with_state(1, 3, Accumulator { value: 60 }, stale);
+    assert_eq!(3, cluster.replicas[1].commit_number());
+    assert_eq!(3, cluster.replicas[1].log_start());
+    assert_eq!(0, cluster.replicas[1].log().len());
+    assert_eq!(60, cluster.value(1));
+
+    cluster.request(Op::Add(40));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    for id in 0..3 {
+        assert_eq!(100, cluster.value(id));
+    }
+}
+
+/// Five replicas, so a quorum is three. One backup gets three ops at once
+/// and acknowledges only the last, another gets only the first op. An
+/// acknowledgement covers every earlier op, so the first op has a quorum
+/// and must commit at once.
+#[test]
+fn test_prepare_ok_covers_earlier_ops() {
+    let mut cluster = Cluster::new(5);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.request(Op::Add(30));
+    cluster.tick_with(&|replica_id, message| match message {
+        Message::Prepare { op_number, .. } => {
+            replica_id == 1 || (replica_id == 2 && *op_number == 1)
+        }
+        _ => true,
+    });
+    assert_eq!(1, cluster.replicas[0].commit_number());
+    assert_eq!(10, cluster.value(0));
+    cluster.idle();
+    cluster.tick();
+    assert_eq!(3, cluster.replicas[0].commit_number());
+}
+
+/// A backup restored a checkpoint, which its state machine made durable at
+/// once, and lost power before the log was persisted after it. The log it
+/// had persisted holds an op beyond the checkpoint that it had
+/// acknowledged, and that op must survive the restart: the primary is
+/// gone, and the op commits in the next view from this replica's log.
+#[test]
+fn test_restart_keeps_acknowledged_entries_beyond_checkpoint() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.request(Op::Add(30));
+    cluster.tick();
+    cluster.idle();
+    cluster.tick();
+    // Op 4 reaches the backups; the primary never sees their
+    // acknowledgements.
+    cluster.request(Op::Add(40));
+    cluster.tick_with(&|_, message| !matches!(message, Message::PrepareOk { op_number: 4, .. }));
+    assert_eq!(4, cluster.replicas[1].op_number());
+    assert_eq!(3, cluster.replicas[1].commit_number());
+    // Replica 1's disk is behind its state machine: it says op 1 is the
+    // last committed, while the state machine holds a checkpoint at op 3.
+    let mut stale = cluster.disks[1].clone();
+    stale.commit_number = 1;
+    cluster.restart_with_state(1, 3, Accumulator { value: 60 }, stale);
+    assert_eq!(3, cluster.replicas[1].log_start());
+    assert_eq!(3, cluster.replicas[1].commit_number());
+    assert_eq!(4, cluster.replicas[1].op_number());
+    assert_eq!(60, cluster.value(1));
+
+    for _ in 0..10 {
+        cluster.idle_without(0);
+        cluster.tick_without(0);
+    }
+    assert!(cluster.replicas[1].is_primary());
+    assert_eq!(4, cluster.replicas[1].commit_number());
+    assert_eq!(100, cluster.value(1));
+    assert_eq!(100, cluster.value(2));
+}
+
+/// A recovering replica restored the primary's checkpoint and lost power
+/// before it was persisted as recovered. It recovers again with its state
+/// machine at the checkpoint, and applies only what comes after it.
+#[test]
+fn test_restart_recovering_with_checkpoint() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.request(Op::Add(30));
+    cluster.tick();
+    cluster.replicas[1] =
+        Replica::recover(1, cluster.config.clone(), Accumulator::default(), 0, 42);
+    cluster.disks[1] = empty_disk();
+    cluster.collect();
+    assert!(cluster.disks[1].recovering);
+    cluster.restart_with_applied(1, 2, Accumulator { value: 30 });
+    assert!(cluster.replicas[1].is_recovering());
+    assert_eq!(2, cluster.replicas[1].log_start());
+    cluster.tick();
+    assert!(!cluster.replicas[1].is_recovering());
+    assert_eq!(3, cluster.replicas[1].commit_number());
+    assert_eq!(60, cluster.value(1));
+}
+
+/// Committed ops are executed when the replies are drained, after the
+/// owner has persisted the step, so a state machine that persists what it
+/// executes never gets ahead of the log.
+#[test]
+fn test_state_machine_applies_on_drain() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    // The primary has a quorum of acknowledgements and has committed op
+    // 1, but has not executed it.
+    assert_eq!(1, cluster.replicas[0].commit_number());
+    assert_eq!(0, cluster.replicas[0].applied());
+    assert_eq!(0, cluster.value(0));
+    let replies: Vec<_> = cluster.replicas[0].drain_replies().collect();
+    assert_eq!(1, replies.len());
+    assert_eq!(1, cluster.replicas[0].applied());
+    assert_eq!(10, cluster.value(0));
 }

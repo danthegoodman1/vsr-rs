@@ -4,12 +4,17 @@
 use crate::state_machine::{Accumulator, Op};
 use anyhow::{ensure, Result};
 use std::collections::{BTreeMap, BTreeSet};
-use vsr_rs::{ClientID, LogEntry, Replica, Reply, RequestNumber};
+use vsr_rs::{ClientID, LogEntry, OpNumber, Replica, Reply, RequestNumber};
 
 /// Read-only view of the simulated system handed to properties.
 pub struct SimContext<'a> {
     pub tick: u64,
     pub replicas: &'a [Replica<Accumulator>],
+    /// Every op committed so far, in op number order: the simulator
+    /// records each one from the log of the replica that committed it, at
+    /// the tick it did, before any replica can compact it. Op `n` is at
+    /// index `n - 1`.
+    pub committed: &'a [LogEntry<Op>],
     /// Replies the clients have received, in order.
     pub replies: &'a [Reply<i64>],
     /// The replicas that must converge: all of them during the safety
@@ -29,10 +34,11 @@ pub trait Property {
         Ok(())
     }
 
-    /// Called when a replica comes back from a crash with no memory: an
-    /// empty log, view 0, a fresh state machine. Whatever the property
-    /// tracked about that replica starts over.
-    fn on_reboot(&mut self, _replica_id: usize) {}
+    /// Called when a replica comes back from a crash as something other
+    /// than what it was in memory: with no memory at all, or from a disk
+    /// that lost the last step. Whatever the property tracked about that
+    /// replica starts over.
+    fn on_restart(&mut self, _replica_id: usize) {}
 }
 
 /// The default property set.
@@ -48,6 +54,13 @@ pub fn default_properties() -> Vec<Box<dyn Property>> {
     ]
 }
 
+/// Whether `replica` holds the committed op `op_number`, which is `entry`:
+/// in its log, or in its state if it has compacted the entry.
+fn holds(replica: &Replica<Accumulator>, op_number: OpNumber, entry: &LogEntry<Op>) -> bool {
+    let log_start = replica.log_start();
+    op_number <= log_start || replica.log().get(op_number - log_start - 1) == Some(entry)
+}
+
 /// Every committed op is held by enough replicas to survive any view
 /// change: every quorum the replicas that are not recovering could form
 /// must include one that holds it. With nobody recovering that is a
@@ -55,11 +68,12 @@ pub fn default_properties() -> Vec<Box<dyn Property>> {
 /// so it counts on neither side. A primary only commits on a quorum of
 /// `PrepareOk` messages, and a backup only acknowledges an op once it is in
 /// its log, so this must hold at the tick the commit happens, on whichever
-/// replica committed it. Committed prefixes are never truncated, so each
-/// committed index needs checking once per replica.
+/// replica committed it. A crashed replica still holds what is on its disk,
+/// which the simulator keeps equal to its log. Committed prefixes are never
+/// truncated, so each committed op needs checking once per replica.
 #[derive(Default)]
 pub struct Durability {
-    /// Per replica: number of committed entries already verified.
+    /// Per replica: number of committed ops already verified.
     verified: Vec<usize>,
 }
 
@@ -68,7 +82,7 @@ impl Property for Durability {
         "durability"
     }
 
-    fn on_reboot(&mut self, replica_id: usize) {
+    fn on_restart(&mut self, replica_id: usize) {
         if let Some(verified) = self.verified.get_mut(replica_id) {
             *verified = 0;
         }
@@ -85,16 +99,16 @@ impl Property for Durability {
         let needed = (participants + 1).saturating_sub(quorum);
         for (id, replica) in ctx.replicas.iter().enumerate() {
             let commit = replica.commit_number();
-            let log = replica.log();
-            for (i, entry) in log.iter().enumerate().take(commit).skip(self.verified[id]) {
+            for op_number in self.verified[id] + 1..=commit {
+                let entry = &ctx.committed[op_number - 1];
                 let copies = ctx
                     .replicas
                     .iter()
-                    .filter(|other| !other.is_recovering() && other.log().get(i) == Some(entry))
+                    .filter(|other| !other.is_recovering() && holds(other, op_number, entry))
                     .count();
                 ensure!(
                     copies >= needed,
-                    "tick {}: replica {id} committed op at index {i} held by {copies} of {participants} replicas not recovering, {needed} needed to meet every quorum of {quorum}",
+                    "tick {}: replica {id} committed op {op_number} held by {copies} of {participants} replicas not recovering, {needed} needed to meet every quorum of {quorum}",
                     ctx.tick
                 );
             }
@@ -105,7 +119,8 @@ impl Property for Durability {
 }
 
 /// A replica's commit number never decreases and never exceeds its op number,
-/// and its op number always equals its log length.
+/// its op number is the log start plus the log length, and the log start,
+/// where the log has been compacted, never exceeds the commit number.
 #[derive(Default)]
 pub struct CommitNumberMonotonic {
     last_commit: Vec<usize>,
@@ -116,7 +131,7 @@ impl Property for CommitNumberMonotonic {
         "commit-number-monotonic"
     }
 
-    fn on_reboot(&mut self, replica_id: usize) {
+    fn on_restart(&mut self, replica_id: usize) {
         if let Some(last) = self.last_commit.get_mut(replica_id) {
             *last = 0;
         }
@@ -127,15 +142,21 @@ impl Property for CommitNumberMonotonic {
         for (id, replica) in ctx.replicas.iter().enumerate() {
             let commit = replica.commit_number();
             let op = replica.op_number();
+            let log_start = replica.log_start();
             let len = replica.log().len();
             ensure!(
-                op == len,
-                "tick {}: replica {id} op_number {op} != log length {len}",
+                op == log_start + len,
+                "tick {}: replica {id} op_number {op} != log start {log_start} + log length {len}",
                 ctx.tick
             );
             ensure!(
                 commit <= op,
                 "tick {}: replica {id} commit_number {commit} > op_number {op}",
+                ctx.tick
+            );
+            ensure!(
+                log_start <= commit,
+                "tick {}: replica {id} compacted up to {log_start} but commit_number is {commit}",
                 ctx.tick
             );
             ensure!(
@@ -150,11 +171,11 @@ impl Property for CommitNumberMonotonic {
     }
 }
 
-/// A replica's state machine has applied exactly the committed prefix of its
-/// log, in order, and its value is the fold of those operations.
+/// A replica's state machine has applied exactly the committed ops, in
+/// order, and its value is the fold of those operations.
 #[derive(Default)]
 pub struct StateMatchesCommittedLog {
-    /// Per replica: (number of committed entries already verified, expected value).
+    /// Per replica: (number of committed ops already verified, expected value).
     verified: Vec<(usize, i64)>,
 }
 
@@ -163,7 +184,7 @@ impl Property for StateMatchesCommittedLog {
         "state-matches-committed-log"
     }
 
-    fn on_reboot(&mut self, replica_id: usize) {
+    fn on_restart(&mut self, replica_id: usize) {
         if let Some(verified) = self.verified.get_mut(replica_id) {
             *verified = (0, 0);
         }
@@ -173,7 +194,6 @@ impl Property for StateMatchesCommittedLog {
         self.verified.resize(ctx.replicas.len(), (0, 0));
         for (id, replica) in ctx.replicas.iter().enumerate() {
             let commit = replica.commit_number();
-            let log = replica.log();
             let state = replica.state_machine();
             let (verified, value) = &mut self.verified[id];
             ensure!(
@@ -182,12 +202,19 @@ impl Property for StateMatchesCommittedLog {
                 ctx.tick,
                 state.applied.len()
             );
-            for (i, entry) in log.iter().enumerate().take(commit).skip(*verified) {
+            for (i, entry) in ctx
+                .committed
+                .iter()
+                .enumerate()
+                .take(commit)
+                .skip(*verified)
+            {
                 ensure!(
                     state.applied[i] == entry.op,
-                    "tick {}: replica {id} applied {:?} at index {i} but log has {:?}",
+                    "tick {}: replica {id} applied {:?} as op {} but the committed op is {:?}",
                     ctx.tick,
                     state.applied[i],
+                    i + 1,
                     entry.op
                 );
                 *value = entry.op.kind.apply(*value);
@@ -204,13 +231,12 @@ impl Property for StateMatchesCommittedLog {
     }
 }
 
-/// All replicas agree on the committed prefix of the log: if two replicas
-/// have both committed index `i`, they hold the same operation there.
+/// All replicas agree on the committed prefix of the log: every committed
+/// entry a replica holds in its log is the one recorded as committed at
+/// that op number.
 #[derive(Default)]
 pub struct CommittedPrefixAgreement {
-    /// The union of all committed prefixes seen so far.
-    canonical: Vec<LogEntry<Op>>,
-    /// Per replica: number of committed entries already verified.
+    /// Per replica: number of committed ops already verified.
     verified: Vec<usize>,
 }
 
@@ -219,7 +245,7 @@ impl Property for CommittedPrefixAgreement {
         "committed-prefix-agreement"
     }
 
-    fn on_reboot(&mut self, replica_id: usize) {
+    fn on_restart(&mut self, replica_id: usize) {
         if let Some(verified) = self.verified.get_mut(replica_id) {
             *verified = 0;
         }
@@ -229,17 +255,15 @@ impl Property for CommittedPrefixAgreement {
         self.verified.resize(ctx.replicas.len(), 0);
         for (id, replica) in ctx.replicas.iter().enumerate() {
             let commit = replica.commit_number();
-            let log = replica.log();
-            for (i, entry) in log.iter().enumerate().take(commit).skip(self.verified[id]) {
-                if let Some(canonical) = self.canonical.get(i) {
-                    ensure!(
-                        *canonical == *entry,
-                        "tick {}: replica {id} committed {entry:?} at index {i} but another replica committed {canonical:?}",
-                        ctx.tick
-                    );
-                } else {
-                    self.canonical.push(entry.clone());
-                }
+            let log_start = replica.log_start();
+            for op_number in self.verified[id].max(log_start) + 1..=commit {
+                let entry = &replica.log()[op_number - log_start - 1];
+                let canonical = &ctx.committed[op_number - 1];
+                ensure!(
+                    *canonical == *entry,
+                    "tick {}: replica {id} committed {entry:?} as op {op_number} but another replica committed {canonical:?}",
+                    ctx.tick
+                );
             }
             self.verified[id] = commit;
         }
@@ -247,13 +271,14 @@ impl Property for CommittedPrefixAgreement {
     }
 }
 
-/// No operation appears twice in any replica's committed log. Entries
-/// beyond the commit number can be replaced by a view change, so only the
-/// committed prefix, which is append-only, is checked.
+/// No operation commits twice. Entries beyond the commit number can be
+/// replaced by a view change, so only the committed log, which is
+/// append-only, is checked.
 #[derive(Default)]
 pub struct NoDuplicateOps {
-    /// Per replica: (committed entries already verified, IDs seen).
-    seen: Vec<(usize, BTreeSet<u64>)>,
+    /// Committed ops already verified, and the op IDs seen.
+    verified: usize,
+    seen: BTreeSet<u64>,
 }
 
 impl Property for NoDuplicateOps {
@@ -261,29 +286,17 @@ impl Property for NoDuplicateOps {
         "no-duplicate-ops"
     }
 
-    fn on_reboot(&mut self, replica_id: usize) {
-        if let Some(seen) = self.seen.get_mut(replica_id) {
-            *seen = (0, BTreeSet::new());
-        }
-    }
-
     fn check(&mut self, ctx: &SimContext) -> Result<()> {
-        self.seen
-            .resize_with(ctx.replicas.len(), || (0, BTreeSet::new()));
-        for (id, replica) in ctx.replicas.iter().enumerate() {
-            let commit = replica.commit_number();
-            let log = replica.log();
-            let (verified, seen) = &mut self.seen[id];
-            for (i, entry) in log[..commit].iter().enumerate().skip(*verified) {
-                ensure!(
-                    seen.insert(entry.op.id),
-                    "tick {}: replica {id} committed duplicate op {:?} at index {i}",
-                    ctx.tick,
-                    entry.op
-                );
-            }
-            *verified = commit;
+        for (i, entry) in ctx.committed.iter().enumerate().skip(self.verified) {
+            ensure!(
+                self.seen.insert(entry.op.id),
+                "tick {}: op {:?} committed again as op {}",
+                ctx.tick,
+                entry.op,
+                i + 1
+            );
         }
+        self.verified = ctx.committed.len();
         Ok(())
     }
 }
@@ -292,9 +305,6 @@ impl Property for NoDuplicateOps {
 /// accumulator value right after that request's op. Replies may be
 /// duplicated, since the primary answers a re-sent request from its client
 /// table, but every committed request gets at least one reply by the end.
-///
-/// Committed prefixes agree across replicas, so the expected results come
-/// from whichever replica has committed furthest.
 #[derive(Default)]
 pub struct RepliesMatchCommits {
     /// Expected result per committed request.
@@ -313,23 +323,12 @@ impl Property for RepliesMatchCommits {
     }
 
     fn check(&mut self, ctx: &SimContext) -> Result<()> {
-        let furthest = ctx
-            .replicas
-            .iter()
-            .max_by_key(|replica| replica.commit_number())
-            .unwrap();
-        // Every replica that had committed further may have rebooted since,
-        // in which case there is nothing new to learn until one catches up.
-        let commit = furthest.commit_number();
-        if commit > self.committed {
-            let log = furthest.log();
-            for entry in &log[self.committed..commit] {
-                self.value = entry.op.kind.apply(self.value);
-                self.expected
-                    .insert((entry.client_id, entry.request_number), self.value);
-            }
-            self.committed = commit;
+        for entry in &ctx.committed[self.committed..] {
+            self.value = entry.op.kind.apply(self.value);
+            self.expected
+                .insert((entry.client_id, entry.request_number), self.value);
         }
+        self.committed = ctx.committed.len();
         for reply in &ctx.replies[self.verified..] {
             let key = (reply.client_id, reply.request_number);
             let Some(expected) = self.expected.get(&key) else {
@@ -362,8 +361,9 @@ impl Property for RepliesMatchCommits {
     }
 }
 
-/// Once the network is drained, every core replica has the same log, has
-/// committed all of it, and holds the same state machine value.
+/// Once the network is drained, every core replica has committed the same
+/// number of ops, all of its log, holds the committed entries, and holds
+/// the same state machine value.
 pub struct Convergence;
 
 impl Property for Convergence {
@@ -377,27 +377,28 @@ impl Property for Convergence {
 
     fn finalize(&mut self, ctx: &SimContext) -> Result<()> {
         let reference_id = ctx.core[0];
-        let reference_log = ctx.replicas[reference_id].log();
+        let reference_op_number = ctx.replicas[reference_id].op_number();
         let reference_value = ctx.replicas[reference_id].state_machine().value;
         for &id in ctx.core {
             let replica = &ctx.replicas[id];
-            let log = replica.log();
+            let op_number = replica.op_number();
             ensure!(
-                log.len() == reference_log.len(),
-                "replica {id} log length {} != replica {reference_id} log length {}",
-                log.len(),
-                reference_log.len()
+                op_number == reference_op_number,
+                "replica {id} op_number {op_number} != replica {reference_id} op_number {reference_op_number}"
             );
             ensure!(
-                *log == *reference_log,
-                "replica {id} log differs from replica {reference_id} log"
+                replica.commit_number() == op_number,
+                "replica {id} committed {} of {op_number} ops",
+                replica.commit_number()
             );
-            ensure!(
-                replica.commit_number() == log.len(),
-                "replica {id} committed {} of {} log entries",
-                replica.commit_number(),
-                log.len()
-            );
+            let log_start = replica.log_start();
+            for (i, entry) in replica.log().iter().enumerate() {
+                let op_number = log_start + i + 1;
+                ensure!(
+                    ctx.committed.get(op_number - 1) == Some(entry),
+                    "replica {id} holds {entry:?} as op {op_number}, which is not what committed"
+                );
+            }
             let value = replica.state_machine().value;
             ensure!(
                 value == reference_value,

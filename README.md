@@ -79,13 +79,14 @@ You provide the rest:
   it had applied, and the client table it keeps with them; the replica
   applies the rest again. That ordering is the whole durability argument:
   an acknowledgement leaves only after the entry it covers is on disk, and
-  the replica executes committed operations only once the write that holds
-  them is persisted, so a state machine that persists what it executes
-  never gets ahead of the log. Two things cost nothing in that argument,
-  and the library exposes both: messages that promise nothing about the
+  the replica executes a committed operation only once a handed-back write
+  holds it, so a state machine that persists what it executes never gets
+  ahead of the log. Three things cost nothing in that argument, and the
+  library exposes all three: messages that promise nothing about the
   sender's durable state, a `Prepare` above all, can leave before the
-  write, which overlaps the primary's write with the backups', and a
-  write that changed only the commit number needs no sync.
+  write, which overlaps the primary's write with the backups'; replies
+  can leave before it too, since an earlier write holds what they answer;
+  and a write that changed only the commit number needs no sync.
 - **Compaction.** Once the state machine has made its state durable, call
   `compact` with the op number it reached. A replica that needs entries
   another one has compacted gets a checkpoint of its state instead.
@@ -226,6 +227,7 @@ tick:
 
 - committed prefixes agree on every replica,
 - committed operations survive on enough disks,
+- every operation a replica executed is on its disk,
 - every reply matches a committed request,
 - no request runs twice.
 
@@ -234,9 +236,11 @@ takes part in a view change, or answers a recovery only with state its
 disk holds.
 
 Each replica has a disk that the simulator writes the way an owner would,
-from the replica's write after every step. A replica that loses power loses
-its memory at once, with any step it had not yet written, and is rebuilt
-from its disk.
+from the replica's write after every step. In most runs a write can also
+stay out for several steps while the replica goes on, as with an owner
+that writes on another thread. A replica that loses power loses its memory
+at once, with any step it had not yet written, lands a write that was out
+whole or not at all, and is rebuilt from its disk.
 
 The seed determines the whole configuration, from cluster size to fault
 rates. Once the requests are done, faults stop and a random majority of
@@ -302,10 +306,16 @@ It runs the nodes with the journal on and off, several times each, and
 reports the median and the spread of throughput, latency percentiles, and
 fsyncs per node per second, journal writes and store persists alike.
 
+It can also emulate other hardware: with the data on a tmpfs, where
+fsync costs nothing, `FSYNC_US` adds that many microseconds to every
+journal fsync, and `NET_US` delays every frame between nodes by that many
+microseconds each way.
+
 ```console
 cargo run --release -p vsr-bench --bin vsr-micro
 cargo run --release -p vsr-bench
 CLIENTS=1,16,256 REPEAT=5 cargo run --release -p vsr-bench
+NET_US=100 FSYNC_US=50 cargo run --release -p vsr-bench -- /dev/shm/vsr-bench
 ```
 
 ### Coverage

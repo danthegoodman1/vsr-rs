@@ -15,17 +15,18 @@
 //! Reads and writes both go through the replicated log, so a GET is
 //! linearizable.
 //!
-//! Each node keeps two things on disk. The replica's log and counters go
-//! to a write-ahead log through the `writeahead` crate: after every batch
-//! of events, before anything the batch produced is sent, the node writes
-//! what changed and fsyncs once. The store itself is a `fjall` database
-//! that never fsyncs on its own: every operation is one atomic batch that
-//! also records the op number and the client's reply, and a timer persists
-//! the database every second. What it had persisted is then durable, and
-//! the replica compacts its log up to there, less a retention window. On
-//! restart the node replays the write-ahead log, opens the store, persists
-//! whatever the store recovered, and applies the committed entries the
-//! store had not made durable. See README.md next to this file.
+//! Each node keeps two things on disk. The replica's log and counters go to
+//! a write-ahead log through the `writeahead` crate: a thread of its own
+//! writes what the replica changed and fsyncs once, while the event loop
+//! steps on and sends only what need not wait for the write. The store
+//! itself is a `fjall` database that never fsyncs on its own: every
+//! operation is one atomic batch that also records the op number and the
+//! client's reply, and a timer persists the database every second. What it
+//! had persisted is then durable, and the replica compacts its log up to
+//! there, less a retention window. On restart the node replays the
+//! write-ahead log, opens the store, persists whatever the store recovered,
+//! and applies the committed entries the store had not made durable. See
+//! README.md next to this file.
 //!
 //! The node itself, with its store and event loop, is in `node.rs`, which
 //! the benchmark shares; this file puts it on the network.
@@ -296,8 +297,34 @@ fn decode(line: &str) -> Result<Frame, String> {
 // ---------------------------------------------------------------------------
 // Networking between nodes
 
-/// Sends frames to other nodes, connecting on demand. A node that cannot be
-/// reached just loses the message; the protocol re-sends what matters.
+/// The most frames the sender takes into one write per node, so that a
+/// steady stream of them still goes out.
+const MAX_FRAMES_PER_FLUSH: usize = 1024;
+/// The most memory the sender keeps for a node's next write between
+/// batches; a larger batch, of a checkpoint say, gives back the rest.
+const MAX_KEPT_BATCH: usize = 1024 * 1024;
+
+/// Connects to a node.
+fn connect(address: SocketAddr) -> std::io::Result<TcpStream> {
+    let stream = TcpStream::connect_timeout(&address, Duration::from_millis(200))?;
+    no_delay(&stream);
+    Ok(stream)
+}
+
+/// Turns Nagle's algorithm off on `stream`: a write would otherwise wait
+/// for the peer to acknowledge the one before, a round trip. A stream that
+/// keeps it still works, only slower.
+fn no_delay(stream: &TcpStream) {
+    if let Err(err) = stream.set_nodelay(true) {
+        warn!("cannot turn off Nagle's algorithm: {err}");
+    }
+}
+
+/// Sends frames to other nodes, connecting on demand. The frames queued at
+/// once go out in one write per node: first to the nodes already
+/// connected, then to the others, whose connect may take until its
+/// timeout. A node that cannot be reached just loses the message; the
+/// protocol re-sends what matters.
 fn run_sender(
     self_id: ReplicaID,
     addresses: Vec<SocketAddr>,
@@ -306,44 +333,67 @@ fn run_sender(
 ) {
     let mut streams: HashMap<ReplicaID, TcpStream> = HashMap::new();
     let mut last_failure: HashMap<ReplicaID, Instant> = HashMap::new();
-    for (dst, frame) in frames {
-        if dst == self_id {
-            // A frame for this node goes straight to its event loop.
-            let _ = events.send(frame.into());
-            continue;
+    let mut batches: Vec<Vec<u8>> = vec![Vec::new(); addresses.len()];
+    while let Ok(first) = frames.recv() {
+        let queued = std::iter::once(first).chain(frames.try_iter());
+        for (dst, frame) in queued.take(MAX_FRAMES_PER_FLUSH) {
+            if dst == self_id {
+                // A frame for this node goes straight to its event loop.
+                let _ = events.send(frame.into());
+                continue;
+            }
+            batches[dst].extend_from_slice(encode(&frame).as_bytes());
+            batches[dst].push(b'\n');
         }
-        let stream = match streams.entry(dst) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                if last_failure
-                    .get(&dst)
-                    .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
-                {
-                    continue;
-                }
-                match TcpStream::connect_timeout(&addresses[dst], Duration::from_millis(200)) {
-                    Ok(stream) => {
-                        info!("connected to node {dst} at {}", addresses[dst]);
-                        entry.insert(stream)
-                    }
-                    Err(err) => {
-                        debug!("node {dst} unreachable: {err}");
-                        last_failure.insert(dst, Instant::now());
-                        continue;
-                    }
+        let (connected, others): (Vec<ReplicaID>, Vec<ReplicaID>) = (0..addresses.len())
+            .filter(|&dst| !batches[dst].is_empty())
+            .partition(|dst| streams.contains_key(dst));
+        for dst in connected.into_iter().chain(others) {
+            let batch = &mut batches[dst];
+            if let Some(stream) = stream_to(&mut streams, &mut last_failure, dst, addresses[dst]) {
+                if let Err(err) = stream.write_all(batch) {
+                    // Drop the stream but do not start the backoff: the peer
+                    // was reachable a moment ago, so the next frame retries
+                    // the connect right away. If that connect fails, the
+                    // backoff starts then.
+                    warn!("lost connection to node {dst}: {err}");
+                    streams.remove(&dst);
                 }
             }
-        };
-        let line = encode(&frame);
-        if let Err(err) = stream
-            .write_all(line.as_bytes())
-            .and_then(|_| stream.write_all(b"\n"))
-        {
-            // Drop the stream but do not start the backoff: the peer was
-            // reachable a moment ago, so the next frame retries the connect
-            // right away. If that connect fails, the backoff starts then.
-            warn!("lost connection to node {dst}: {err}");
-            streams.remove(&dst);
+            batch.clear();
+            batch.shrink_to(MAX_KEPT_BATCH);
+        }
+    }
+}
+
+/// The stream to node `dst`, connected if need be. None while the node is
+/// unreachable: for half a second after a connect to it failed.
+fn stream_to<'a>(
+    streams: &'a mut HashMap<ReplicaID, TcpStream>,
+    last_failure: &mut HashMap<ReplicaID, Instant>,
+    dst: ReplicaID,
+    address: SocketAddr,
+) -> Option<&'a mut TcpStream> {
+    match streams.entry(dst) {
+        std::collections::hash_map::Entry::Occupied(entry) => Some(entry.into_mut()),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            if last_failure
+                .get(&dst)
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
+            {
+                return None;
+            }
+            match connect(address) {
+                Ok(stream) => {
+                    info!("connected to node {dst} at {address}");
+                    Some(entry.insert(stream))
+                }
+                Err(err) => {
+                    debug!("node {dst} unreachable: {err}");
+                    last_failure.insert(dst, Instant::now());
+                    None
+                }
+            }
         }
     }
 }
@@ -398,6 +448,7 @@ fn run_client_connection(
     events: Sender<Event>,
 ) -> std::io::Result<()> {
     let (respond_tx, respond_rx) = channel::<String>();
+    no_delay(&stream);
     let mut writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
     // A read or write error breaks out of the loop rather than returning, or
@@ -575,7 +626,6 @@ fn main() {
         let events = events_tx.clone();
         thread::spawn(move || run_timer(events, || false));
     }
-    drop(events_tx);
 
     println!(
         "node {} of {}: replicas on {}, clients on {}, data in {}, primary is node {}",
@@ -586,15 +636,13 @@ fn main() {
         args.data_dir.display(),
         node.replica.primary_id()
     );
-    // Whatever the replica produced on the way up goes out now.
-    node.deliver(&frames_tx);
-    node.run(events_rx, frames_tx);
+    node.run(events_rx, events_tx, frames_tx);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vsr_rs::{Client, Config, LogEntry, Status};
+    use vsr_rs::{Client, Config, LogEntry, LogWrite, OpNumber, Status};
 
     /// A fresh directory for one node of one test.
     fn temp_dir(test: &str, id: ReplicaID) -> PathBuf {
@@ -647,6 +695,281 @@ mod tests {
             .collect();
         assert_eq!(vec![1, 2], prepared);
         assert!(sent.iter().all(|(dst, _)| *dst != 0), "{sent:?}");
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The event loop's step hands a write that needs a sync to the journal
+    /// thread and steps on while it is out: the next request's `Prepare`
+    /// leaves at once, and the replies and the next write wait for the
+    /// write that holds their op to come back. A crash with that next write
+    /// out restarts from the journal without it.
+    #[test]
+    fn deliver_steps_on_while_a_write_is_out() {
+        let dir = temp_dir("pipelined", 0);
+        let mut node = Node::open(0, config(3), &dir, Start::Init).unwrap();
+        let (frames, frames_rx) = channel();
+        let (writes, writes_rx) = channel();
+        let request = |node: &mut Node, connection: u64, key: &str| {
+            let (respond, responses) = channel();
+            node.handle(Event::Command {
+                connection: client_id(0, node.incarnation, connection),
+                command: Command::Set(key.into(), "1".into()),
+                respond,
+            });
+            node.deliver(&frames, &writes);
+            responses
+        };
+        let first_responses = request(&mut node, 0, "a");
+        let first = writes_rx.try_recv().unwrap();
+        assert_eq!(1, first.op_number());
+        let second_responses = request(&mut node, 1, "b");
+        assert!(writes_rx.try_recv().is_err());
+        let prepared: Vec<OpNumber> = frames_rx
+            .try_iter()
+            .filter_map(|(_, frame)| match frame {
+                Frame::Message(Message::Prepare { op_number, .. }) => Some(op_number),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vec![1, 1, 2, 2], prepared);
+        // A backup's acknowledgement of both ops is no quorum while the
+        // primary's own write is out.
+        node.handle(Event::Message(Message::PrepareOk {
+            view_number: 0,
+            op_number: 2,
+            replica_id: 1,
+        }));
+        node.deliver(&frames, &writes);
+        assert_eq!(0, node.replica.commit_number());
+        assert!(first_responses.try_recv().is_err());
+        node.journal.as_mut().unwrap().append(&first).unwrap();
+        node.handle(Event::Written(first));
+        node.deliver(&frames, &writes);
+        assert_eq!(1, node.replica.commit_number());
+        assert_eq!("+OK\r\n", first_responses.try_recv().unwrap());
+        assert!(second_responses.try_recv().is_err());
+        let second = writes_rx.try_recv().unwrap();
+        assert_eq!((2, 2), (second.entries_from, second.op_number()));
+        drop(node);
+        let node = Node::open(0, config(3), &dir, Start::Restart).unwrap();
+        assert_eq!(1, node.replica.op_number());
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The event loop stops only once the write that is out comes back.
+    #[test]
+    fn stop_waits_for_the_write_that_is_out() {
+        let dir = temp_dir("stop", 0);
+        let mut node = Node::open(0, config(3), &dir, Start::Init).unwrap();
+        let (frames, _frames_rx) = channel();
+        let (writes, writes_rx) = channel();
+        let (respond, _responses) = channel();
+        let command = Event::Command {
+            connection: client_id(0, node.incarnation, 0),
+            command: Command::Set("a".into(), "1".into()),
+            respond,
+        };
+        assert!(node.batch([command], &frames, &writes));
+        let write = writes_rx.try_recv().unwrap();
+        assert!(node.batch([Event::Stop], &frames, &writes));
+        node.journal.as_mut().unwrap().append(&write).unwrap();
+        assert!(!node.batch([Event::Written(write)], &frames, &writes));
+        assert!(!node.writing);
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write out for `STALLED_WRITE_TICKS` ticks silences the node, so
+    /// that the backups stop hearing from a primary whose disk stalled and
+    /// elect another. It speaks again once the write comes back.
+    #[test]
+    fn stalled_write_silences_the_node() {
+        let dir = temp_dir("stalled", 0);
+        let mut node = Node::open(0, config(3), &dir, Start::Init).unwrap();
+        let (frames, frames_rx) = channel();
+        let (writes, writes_rx) = channel();
+        let (respond, _responses) = channel();
+        let command = Event::Command {
+            connection: client_id(0, node.incarnation, 0),
+            command: Command::Set("a".into(), "1".into()),
+            respond,
+        };
+        assert!(node.batch([command], &frames, &writes));
+        let write = writes_rx.try_recv().unwrap();
+        assert!(frames_rx.try_iter().count() > 0);
+        for _ in 1..STALLED_WRITE_TICKS {
+            assert!(node.batch([Event::Tick], &frames, &writes));
+            assert!(frames_rx.try_iter().count() > 0);
+        }
+        for _ in 0..PRIMARY_TIMEOUT {
+            assert!(node.batch([Event::Tick], &frames, &writes));
+            assert_eq!(0, frames_rx.try_iter().count());
+        }
+        node.journal.as_mut().unwrap().append(&write).unwrap();
+        assert!(node.batch([Event::Written(write)], &frames, &writes));
+        assert!(frames_rx.try_iter().count() > 0);
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Three nodes stepped in batches as their event loops step them, with
+    /// the journal threads' work done in place: a node's write lands when
+    /// the test says, and stays out until then.
+    struct Pipelined {
+        dirs: Vec<PathBuf>,
+        nodes: Vec<Node>,
+        frames: Vec<(Sender<(ReplicaID, Frame)>, Receiver<(ReplicaID, Frame)>)>,
+        writes: Vec<(Sender<LogWrite<Op>>, Receiver<LogWrite<Op>>)>,
+        connections: u64,
+    }
+
+    impl Pipelined {
+        fn new(test: &str) -> Pipelined {
+            let dirs: Vec<PathBuf> = (0..3).map(|id| temp_dir(test, id)).collect();
+            let mut nodes = open_nodes(&dirs);
+            for node in &mut nodes {
+                node.announce_views = false;
+            }
+            Pipelined {
+                dirs,
+                nodes,
+                frames: (0..3).map(|_| channel()).collect(),
+                writes: (0..3).map(|_| channel()).collect(),
+                connections: 0,
+            }
+        }
+
+        fn batch(&mut self, id: ReplicaID, events: impl IntoIterator<Item = Event>) {
+            let (frames, writes) = (&self.frames[id].0, &self.writes[id].0);
+            assert!(self.nodes[id].batch(events, frames, writes));
+        }
+
+        /// A new client of node 0 sets `key`. Returns where its response
+        /// comes.
+        fn set(&mut self, key: &str) -> Receiver<String> {
+            let (respond, responses) = channel();
+            let connection = client_id(0, self.nodes[0].incarnation, self.connections);
+            self.connections += 1;
+            let command = Command::Set(key.into(), "1".into());
+            self.batch(
+                0,
+                [Event::Command {
+                    connection,
+                    command,
+                    respond,
+                }],
+            );
+            responses
+        }
+
+        /// Lands the writes of the nodes in `landing` and delivers what
+        /// every node sends, until nothing moves.
+        fn settle(&mut self, landing: &[ReplicaID]) {
+            loop {
+                let mut moved = false;
+                for &id in landing {
+                    if let Ok(write) = self.writes[id].1.try_recv() {
+                        let journal = self.nodes[id].journal.as_mut().unwrap();
+                        journal.append(&write).unwrap();
+                        self.batch(id, [Event::Written(write)]);
+                        moved = true;
+                    }
+                }
+                for id in 0..self.nodes.len() {
+                    let sent: Vec<_> = self.frames[id].1.try_iter().collect();
+                    for (dst, frame) in sent {
+                        self.batch(dst, [Event::from(frame)]);
+                        moved = true;
+                    }
+                }
+                if !moved {
+                    return;
+                }
+            }
+        }
+
+        fn tick(&mut self) {
+            for id in 0..self.nodes.len() {
+                self.batch(id, [Event::Tick]);
+            }
+        }
+
+        /// Node `id` loses power: the write it has out never lands, its
+        /// store goes back to its last persist, and it restarts from its
+        /// disk.
+        fn lose_power(&mut self, id: ReplicaID) {
+            drop(self.nodes.remove(id));
+            self.writes[id].1.try_iter().for_each(drop);
+            power::lose_power(&self.dirs[id]);
+            let mut node = Node::open(id, config(3), &self.dirs[id], Start::Restart).unwrap();
+            node.announce_views = false;
+            self.nodes.insert(id, node);
+            self.batch(id, []);
+        }
+    }
+
+    /// Node 2's writes stay out while nodes 0 and 1 commit an op, then it
+    /// loses power with a write out: it restarts without what that write
+    /// held, and catches up.
+    #[test]
+    fn pipelined_power_loss_with_a_write_out() {
+        let mut cluster = Pipelined::new("pipelined-power-loss");
+        let a = cluster.set("a");
+        cluster.settle(&[0, 1, 2]);
+        assert_eq!(Ok("+OK\r\n".to_string()), a.try_recv());
+        let b = cluster.set("b");
+        cluster.settle(&[0, 1]);
+        assert_eq!(Ok("+OK\r\n".to_string()), b.try_recv());
+        assert!(cluster.nodes[2].writing);
+        assert_eq!(2, cluster.nodes[2].replica.op_number());
+        cluster.lose_power(2);
+        assert_eq!(1, cluster.nodes[2].replica.op_number());
+        let c = cluster.set("c");
+        for _ in 0..3 {
+            cluster.tick();
+            cluster.settle(&[0, 1, 2]);
+        }
+        assert_eq!(Ok("+OK\r\n".to_string()), c.try_recv());
+        let node = &cluster.nodes[2];
+        assert_eq!(3, node.replica.commit_number());
+        assert_eq!(Some("1".to_string()), node.replica.state_machine().get("b"));
+        remove_dirs(cluster.nodes, &cluster.dirs);
+    }
+
+    /// The event loop, with its journal thread, answers a client of a
+    /// one-node cluster and stops on `Event::Stop`, with its journal back;
+    /// a restart finds the op in it.
+    #[test]
+    fn run_answers_and_stops() {
+        let dir = temp_dir("run", 0);
+        let mut node = Node::open(0, config(1), &dir, Start::Init).unwrap();
+        node.announce_views = false;
+        let incarnation = node.incarnation;
+        let (events, events_rx) = channel();
+        let (frames, _frames_rx) = channel();
+        let wake = events.clone();
+        let running = thread::spawn(move || {
+            node.run(events_rx, wake, frames);
+            node
+        });
+        let (respond, responses) = channel();
+        events
+            .send(Event::Command {
+                connection: client_id(0, incarnation, 0),
+                command: Command::Set("a".into(), "1".into()),
+                respond,
+            })
+            .unwrap();
+        let response = responses.recv_timeout(Duration::from_secs(10));
+        assert_eq!(Ok("+OK\r\n".to_string()), response);
+        events.send(Event::Stop).unwrap();
+        let node = running.join().unwrap();
+        assert!(node.journal.is_some());
+        drop(node);
+        let node = Node::open(0, config(1), &dir, Start::Restart).unwrap();
+        assert_eq!(1, node.replica.op_number());
         drop(node);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -805,8 +1128,9 @@ mod tests {
 
     /// The primary persists its store and compacts its log with no
     /// retention while a node misses every op. That node then catches up
-    /// from the primary's checkpoint, which restores its store, and a
-    /// restart brings it back with that state.
+    /// from the primary's checkpoint, which restores its store, and the op
+    /// after it. A power loss takes its store back to the checkpoint, and
+    /// it executes that op again from its journal.
     #[test]
     fn checkpoint_restores_store() {
         let dirs: Vec<PathBuf> = (0..3).map(|id| temp_dir("checkpoint", id)).collect();
@@ -827,14 +1151,14 @@ mod tests {
         assert_eq!(5, nodes[0].replica.log_start());
         assert_eq!(0, nodes[2].replica.op_number());
 
-        // Node 2 hears about op 6, finds the gap, and gets a checkpoint:
-        // the primary's state as executed, which trails its commit number
-        // within a batch, and the entries after it.
+        // With node 1 cut off, node 2 hears about op 6, finds the gap, and
+        // gets a checkpoint: the primary's state as executed, and op 6
+        // after it, which node 2's acknowledgement then commits.
         run(
             &mut nodes,
             &mut client,
             Op::Put("k5".into(), "v5".into()),
-            &[],
+            &[1],
         );
         idle(&mut nodes, &[]);
         deliver(&mut nodes, &mut client, &[]);
@@ -852,12 +1176,11 @@ mod tests {
             nodes[2].replica.state_machine().client_table().unwrap()
         );
 
-        let before = nodes[2].replica.persistent_state();
-        let node = nodes.remove(2);
-        drop(node);
-        let restarted = Node::open(2, config(3), &dirs[2], Start::Restart).unwrap();
-        nodes.insert(2, restarted);
-        assert_eq!(before, nodes[2].replica.persistent_state());
+        // Node 2 loses power. Its store goes back to the checkpoint, which
+        // it made durable as it restored it, and its journal holds op 6,
+        // which it executes again once it hears that op 6 committed.
+        reopen(&mut nodes, &dirs, 2, true);
+        assert_eq!(5, nodes[2].replica.state_machine().applied);
         assert_eq!(
             Some("v3".to_string()),
             nodes[2].replica.state_machine().get("k3")
@@ -871,6 +1194,11 @@ mod tests {
         idle(&mut nodes, &[]);
         deliver(&mut nodes, &mut client, &[]);
         assert_eq!(7, nodes[2].replica.commit_number());
+        assert_eq!(7, nodes[2].replica.state_machine().applied);
+        assert_eq!(
+            Some("v5".to_string()),
+            nodes[2].replica.state_machine().get("k5")
+        );
         remove_dirs(nodes, &dirs);
     }
 
@@ -1164,6 +1492,48 @@ mod tests {
             }
         }
     }
+
+    /// The sender's connections to other nodes have Nagle's algorithm
+    /// off. It writes more frames than one flush takes whole and in order,
+    /// and hands a frame for its own node to its event loop.
+    #[test]
+    fn sender_writes_queued_frames_in_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut streams = HashMap::new();
+        let stream = stream_to(&mut streams, &mut HashMap::new(), 1, address).unwrap();
+        assert!(stream.nodelay().unwrap());
+        let _ = listener.accept().unwrap();
+        let commit = |commit_number| {
+            Frame::Message(Message::Commit {
+                view_number: 1,
+                commit_number,
+            })
+        };
+        let (frames, frames_rx) = channel();
+        let count = 3 * MAX_FRAMES_PER_FLUSH + 1;
+        for commit_number in 0..count {
+            frames.send((1, commit(commit_number))).unwrap();
+        }
+        frames.send((0, commit(0))).unwrap();
+        drop(frames);
+        let (events, events_rx) = channel();
+        let sender = thread::spawn(move || run_sender(0, vec![address; 2], frames_rx, events));
+        let (stream, _) = listener.accept().unwrap();
+        let received: Vec<usize> = BufReader::new(stream)
+            .lines()
+            .map(|line| match decode(&line.unwrap()).unwrap() {
+                Frame::Message(Message::Commit { commit_number, .. }) => commit_number,
+                _ => panic!("not a commit"),
+            })
+            .collect();
+        sender.join().unwrap();
+        assert_eq!(received, (0..count).collect::<Vec<_>>());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(Event::Message(Message::Commit { .. }))
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1173,6 +1543,7 @@ mod disk_tests {
     use std::collections::HashSet;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::atomic::Ordering;
     use vsr_rs::{Config, LogEntry, OpNumber, StateMachine};
 
     fn temp_dir(test: &str) -> PathBuf {
@@ -1189,9 +1560,22 @@ mod disk_tests {
         config
     }
 
+    /// A restart writes and syncs the journal even when nothing it changed
+    /// needs a sync, so that records a process crash left in the page
+    /// cache, which the replay took for durable, reach the disk.
+    #[test]
+    fn restart_syncs_the_journal() {
+        let dir = temp_dir("restart-syncs");
+        drop(Node::open(1, config(), &dir, Start::Init).unwrap());
+        let node = Node::open(1, config(), &dir, Start::Restart).unwrap();
+        let writes = node.stats.journal_writes.load(Ordering::Relaxed);
+        assert_eq!(1, writes);
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Feeds a backup node the primary's `Prepare` for `op_number`, then
-    /// persists the journal and drains the replica, as the event loop does
-    /// after every batch.
+    /// writes the journal and drains the replica in one step.
     fn prepare(node: &mut Node, op_number: OpNumber) {
         prepare_committed(node, op_number, op_number - 1);
     }

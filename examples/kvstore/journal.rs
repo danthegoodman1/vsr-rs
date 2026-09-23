@@ -14,6 +14,7 @@ use futures::StreamExt;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use vsr_rs::{LogEntry, LogWrite, OpNumber, PersistentState};
 use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions, WriteHandle};
 
@@ -53,6 +54,10 @@ pub struct Journal<Op> {
     /// The file holding the latest write.
     last_file: u64,
     trimmed_before: u64,
+    /// Time each write spends after its fsync, as on a slower disk. The
+    /// benchmark sets it to emulate a disk with its data on a tmpfs, where
+    /// fsync costs nothing.
+    pub sync_delay: Duration,
     _wal: WriteAhead<SimpleFile>,
 }
 
@@ -124,6 +129,7 @@ impl<Op: Clone> Journal<Op> {
             runs: BTreeMap::new(),
             last_file: 0,
             trimmed_before: 0,
+            sync_delay: Duration::ZERO,
             _wal: wal,
         };
         let Some((header, last_file)) = header else {
@@ -197,6 +203,11 @@ impl<Op: Clone> Journal<Op> {
         );
         let ids = block_on(self.writer.write_batch(vec![record.into_bytes()]))
             .map_err(|err| format!("cannot write journal: {err}"))?;
+        // A spin, since a sleep this short overshoots by more than it waits.
+        let synced = Instant::now();
+        while synced.elapsed() < self.sync_delay {
+            std::hint::spin_loop();
+        }
         self.last_file = ids.last().map(|id| id.file_id).unwrap_or(self.last_file);
         // The replaced entries no longer pin their files; the new ones pin
         // this one, and the compacted ones leave the first run.

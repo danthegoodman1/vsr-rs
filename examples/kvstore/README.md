@@ -57,19 +57,25 @@ Each node keeps its data in `kvstore-node-N`, or the directory given with
 `--data`:
 
 - `journal/` holds the replica's log and counters, in a write-ahead log
-  from the `writeahead` crate, see [`journal.rs`](journal.rs). After every
-  batch of events, the node sends the messages that need not wait for the
-  write, then appends the replica's write and fsyncs once, then sends the
-  rest. A write is one checksummed record: the log entries that changed,
-  and the counters, which say how far the log is compacted and from which
-  op number the entries replace what came before. A torn write fails the
-  checksum, and recovery drops it whole. A write that changed only the
-  commit number is not written.
+  from the `writeahead` crate, see [`journal.rs`](journal.rs). A thread of
+  its own appends each of the replica's writes and fsyncs once, while the
+  event loop steps on. After every batch of events the loop sends the
+  messages that need not wait for a write, the `Prepare`s above all, and
+  the replies ready so far; what a write held back goes out once it comes
+  back, and the next write, with everything the batches since changed,
+  goes out then. A write that stays out for two ticks means a stalled
+  disk: the node sends nothing until it comes back, so that the others
+  elect a new primary instead of waiting on this one. A write is one
+  checksummed record: the log entries that changed, and the counters,
+  which say how far the log is compacted and from which op number the
+  entries replace what came before. A torn write fails the checksum, and
+  recovery drops it whole. A write that changed only the commit number is
+  not written.
 - `store/` is a `fjall` database with the keys and values, the client
   table, and the number of operations applied, all written in the same
   batch as each operation, and the number of times the node has started,
   which keeps its client ids apart from those of earlier runs. The replica
-  executes operations only after the journal is written, so every
+  executes an operation only once a journal write holds it, so every
   operation in the store is in the journal, except those of a checkpoint
   it restored, which it persists at once. The store never fsyncs on its own
   otherwise. A timer persists it once a second, and the replica then

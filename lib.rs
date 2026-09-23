@@ -18,17 +18,20 @@
 //! of it that must survive a crash. After every step, the owner persists
 //! the replica's [`LogWrite`]: the view state, and the log entries that
 //! changed since the last write. Handing the write back releases what
-//! waited for it: acknowledgements, view change messages, and the
-//! execution of committed operations. An acknowledgement thus leaves only
-//! after the entry it covers is on disk, a view change is on disk before
-//! anything sent in the new view, and a state machine that persists what it
-//! executes never gets ahead of the log. A replica comes back from a crash
-//! with what the owner persisted, a [`PersistentState`], through
+//! waited for it: acknowledgements and view change messages. An
+//! acknowledgement thus leaves only after the entry it covers is on disk,
+//! and a view change is on disk before anything sent in the new view. A
+//! committed operation executes once a handed-back write holds it: in the
+//! step that commits it, if an earlier write does, or else when its own
+//! write comes back. A state machine that persists what it executes thus
+//! never gets ahead of the log. A replica comes back from a crash with what
+//! the owner persisted, a [`PersistentState`], through
 //! [`Replica::restart`].
 //!
 //! ```text
 //! replica.on_message(message);                      // any number of steps
 //! send(replica.drain_messages_before_persist());    // optional
+//! reply(replica.drain_replies());                   // optional
 //! replica.persist(|write| {
 //!     if write.sync {
 //!         disk.append(write)?;                      // durable before it returns
@@ -44,14 +47,15 @@
 //! the replica goes on calls the two itself: one write is outstanding at a
 //! time, and what the steps in between change waits for the next.
 //!
-//! Two things soften the ordering without weakening it. Messages that
+//! Three things soften the ordering without weakening it. Messages that
 //! promise nothing about the sender's durable state can leave before the
 //! write, so that the primary's write overlaps the backups':
-//! [`Replica::drain_messages_before_persist`] yields them. And a write that
-//! changed nothing but the commit number need not be synced at all:
-//! [`LogWrite::sync`] is false, the next write carries the commit number,
-//! and a restart takes it from the state machine when the log is behind
-//! it.
+//! [`Replica::drain_messages_before_persist`] yields them. Replies can
+//! leave before it too, since they answer operations already on disk. And
+//! a write that changed nothing but the commit number need not be synced
+//! at all: [`LogWrite::sync`] is false, the next write carries the commit
+//! number, and a restart takes it from the state machine when the log is
+//! behind it.
 //!
 //! A replica that lost its disk comes back through [`Replica::recover`]
 //! instead, which fetches the state from the others. One thing must survive
@@ -100,13 +104,13 @@ pub type ViewNumber = usize;
 /// State machine.
 ///
 /// The replica executes committed operations through it, in op number
-/// order, in [`Replica::persisted`]: once the log that holds them is
-/// durable. A state machine that persists its state writes the op number
-/// it got with each operation alongside, and the client table, which it
-/// updates from the results. After a crash its owner makes whatever state
-/// it came back with durable, and hands [`Replica::restart`] that state
-/// with its op number and client table; the replica executes the committed
-/// operations after it once more.
+/// order, once a write its owner handed back holds them: in the step that
+/// commits them, or in [`Replica::persisted`]. A state machine that
+/// persists its state writes the op number it got with each operation
+/// alongside, and the client table, which it updates from the results.
+/// After a crash its owner makes whatever state it came back with durable,
+/// and hands [`Replica::restart`] that state with its op number and client
+/// table; the replica executes the committed operations after it once more.
 pub trait StateMachine {
     type Input: Clone + Debug;
     /// The result of applying an input. Replicas keep the latest result per
@@ -711,8 +715,8 @@ pub struct Replica<SM: StateMachine> {
     last_normal_view: ViewNumber,
     commit_number: CommitID,
     /// The number of ops the state machine has executed, at most the
-    /// commit number. Committed ops are executed once the log that holds
-    /// them is durable, see [`Replica::persisted`].
+    /// commit number. Committed ops execute once a handed-back write holds
+    /// them, see `durable`.
     applied: OpNumber,
     /// The committed ops still to be replied to, as inclusive ranges of op
     /// numbers: those this replica committed as the primary.
@@ -730,6 +734,10 @@ pub struct Replica<SM: StateMachine> {
     /// The number of writes taken, and the one out, if any.
     writes: u64,
     outstanding: Option<Outstanding>,
+    /// The op number up to which the handed-back writes hold the log as
+    /// it was when the last one was taken. Committed ops up to it, less
+    /// any entry changed since, execute as soon as they commit.
+    durable: OpNumber,
     /// The highest op number each replica has acknowledged in the current
     /// view, by replica id, this one included once its write is persisted.
     /// The primary commits up to the highest op number a quorum has
@@ -815,6 +823,7 @@ impl<SM: StateMachine> Replica<SM> {
             written: None,
             writes: 0,
             outstanding: None,
+            durable: 0,
             acked: vec![0; replica_count],
             resend_up_to: 0,
             client_table: HashMap::new(),
@@ -870,14 +879,17 @@ impl<SM: StateMachine> Replica<SM> {
     /// state machine back behind it. A state machine that writes through
     /// the page cache can come back from a process crash with operations
     /// it applied but never made durable; its owner makes them durable
-    /// before calling this.
+    /// before calling this. So must `state` be: the replica treats all of
+    /// it as on disk, and a log replayed after a process crash can hold a
+    /// write that reached only the page cache, which its owner syncs.
     ///
     /// A state machine ahead of the log's commit number applied operations
-    /// in steps that changed nothing else, which the owner need not write,
-    /// or holds a checkpoint it made durable before the log was persisted
-    /// after it, as [`StateMachine::restore`] requires. Either way the
-    /// log's entries up to `applied` give way to the state machine, and the
-    /// ones after it, which this replica acknowledged, stay.
+    /// whose commit no write recorded: in steps that changed nothing else,
+    /// which the owner need not write, or in a step whose write the crash
+    /// cut off. Or it holds a checkpoint it made durable before the log was
+    /// persisted after it, as [`StateMachine::restore`] requires. Either
+    /// way the log's entries up to `applied` give way to the state machine,
+    /// and the ones after it, which this replica acknowledged, stay.
     ///
     /// A backup that was normal in its view resumes there: its log is the
     /// one it acknowledged. A primary starts the next view instead: it may
@@ -946,7 +958,8 @@ impl<SM: StateMachine> Replica<SM> {
             })
             .collect();
         assert!(replica.commit_number <= replica.op_number());
-        replica.apply_committed(replica.op_number());
+        replica.durable = replica.op_number();
+        replica.apply_committed(replica.durable);
         trace!(
             "Replica {self_id} restarts in view {} with {} ops, {} committed, {applied} applied",
             replica.view_number,
@@ -1006,6 +1019,8 @@ impl<SM: StateMachine> Replica<SM> {
             "a write is out: hand it back with `persisted` before taking the next"
         );
         let op_number = self.op_number();
+        // The entries the write replaces are in doubt until it is back.
+        self.durable = self.durable_op();
         let changed = self.log_changed_from.take();
         let entries_from = changed.map_or(op_number + 1, |from| from.max(self.log_start + 1));
         let recovering = self.status == Status::Recovering;
@@ -1055,10 +1070,9 @@ impl<SM: StateMachine> Replica<SM> {
             outstanding.sequence, write.sequence,
             "a write handed back other than the one out"
         );
+        self.durable = outstanding.op_number;
         // The entries the write holds and memory still has.
-        let durable = self.log_changed_from.map_or(outstanding.op_number, |from| {
-            outstanding.op_number.min(from - 1)
-        });
+        let durable = self.durable_op();
         // Within a view the primary's log only grows, so a write taken
         // while normal in the current view holds a prefix of it.
         if self.status == Status::Normal
@@ -2136,9 +2150,10 @@ impl<SM: StateMachine> Replica<SM> {
         }
     }
 
-    /// Commits every op up to `commit_number`; they are executed, and
-    /// replied to if `reply` is set, once a persisted write holds them.
-    /// The commit number never moves backwards.
+    /// Commits every op up to `commit_number`, and executes them, replying
+    /// if `reply` is set: at once those that a handed-back write holds as
+    /// memory does, the rest once one does. The commit number never moves
+    /// backwards.
     fn commit_up_to(&mut self, commit_number: CommitID, reply: bool) {
         if commit_number <= self.commit_number {
             return;
@@ -2148,6 +2163,15 @@ impl<SM: StateMachine> Replica<SM> {
                 .push((self.commit_number + 1, commit_number));
         }
         self.commit_number = commit_number;
+        self.apply_committed(self.durable_op());
+    }
+
+    /// The op number up to which the handed-back writes hold the log as
+    /// memory does: `durable`, less the entries changed since the last
+    /// write was taken.
+    fn durable_op(&self) -> OpNumber {
+        self.log_changed_from
+            .map_or(self.durable, |from| self.durable.min(from - 1))
     }
 
     /// Acknowledges to the primary that we have every op up to our op
@@ -2330,7 +2354,9 @@ impl<SM: StateMachine> Replica<SM> {
     }
 
     /// Replies to send to clients: for operations executed, and for
-    /// re-sent requests answered from the client table.
+    /// re-sent requests answered from the client table. They answer
+    /// operations a handed-back write holds, so the owner may send them
+    /// before the next write.
     pub fn drain_replies(&mut self) -> std::vec::Drain<'_, Reply<SM::Output>> {
         self.replies.drain(..)
     }

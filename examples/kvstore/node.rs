@@ -8,12 +8,12 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 use vsr_rs::{
-    Checkpoint, Client, ClientID, ClientRecord, Config, LogEntry, LogSegment, MessageFor, OpNumber,
-    Replica, ReplicaID, Reply, RequestNumber, StateMachine, ViewNumber,
+    Checkpoint, Client, ClientID, ClientRecord, Config, LogEntry, LogSegment, LogWrite, MessageFor,
+    OpNumber, Replica, ReplicaID, Reply, RequestNumber, StateMachine, ViewNumber,
 };
 
 /// How often the replica and the clients run their idle logic.
@@ -25,6 +25,12 @@ pub(crate) const PRIMARY_TIMEOUT: usize = 5;
 /// Ticks between two persists of the store, each of which lets the
 /// replica compact its log.
 pub(crate) const FLUSH_TICKS: u64 = 10;
+/// Ticks a journal write may stay out before the node takes its disk for
+/// stalled, see [`Node::batch`].
+pub(crate) const STALLED_WRITE_TICKS: u64 = 2;
+/// The most events the event loop steps before it delivers, so that a
+/// steady stream of them still lets the next write go out.
+pub(crate) const MAX_BATCH_EVENTS: usize = 1024;
 /// Log entries kept behind what the store has persisted, so that a replica
 /// a little behind catches up from the log rather than from a checkpoint.
 pub(crate) const LOG_RETENTION: usize = 1_000;
@@ -453,6 +459,12 @@ pub(crate) enum Event {
     },
     Disconnect(u64),
     Tick,
+    /// The journal thread wrote the replica's write, see [`Node::run`].
+    Written(LogWrite<Op>),
+    /// Ends [`Node::run`] once no write is out. The kvstore runs until it
+    /// is killed; the benchmark and the tests stop their nodes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Stop,
 }
 
 /// A client connection's VSR client and the command it is waiting on.
@@ -504,7 +516,16 @@ pub(crate) struct Node {
     pub(crate) id: ReplicaID,
     pub(crate) config: Config,
     pub(crate) replica: Replica<Store>,
-    pub(crate) journal: Journal<Op>,
+    /// The journal, unless [`Node::run`] has handed it to its thread.
+    pub(crate) journal: Option<Journal<Op>>,
+    /// Whether the journal thread has a write of the replica's, and the
+    /// ticks since it took it.
+    pub(crate) writing: bool,
+    pub(crate) write_ticks: u64,
+    /// Whether the event loop is to end, once no write is out.
+    pub(crate) stopping: bool,
+    /// The connections whose clients may have requests to send.
+    pub(crate) requesting: Vec<u64>,
     /// The number of times this node has started, which its client ids
     /// carry.
     pub(crate) incarnation: u64,
@@ -637,7 +658,11 @@ impl Node {
             id,
             view: replica.view_number(),
             replica,
-            journal,
+            journal: Some(journal),
+            writing: false,
+            write_ticks: 0,
+            stopping: false,
+            requesting: Vec::new(),
             incarnation,
             config,
             connections: HashMap::new(),
@@ -647,16 +672,30 @@ impl Node {
             stats: Arc::default(),
             announce_views: true,
         };
-        node.write()?;
+        // A process crash can leave journal records that reached only the
+        // page cache: the replay took them for durable, and the replica
+        // restarts on them. The first write goes to the journal whether it
+        // needs a sync or not, and its sync covers them.
+        let journal = node
+            .journal
+            .as_mut()
+            .expect("the journal is with the event loop's thread");
+        node.replica.persist(|write| journal.append(write))?;
+        node.stats.journal_writes.fetch_add(1, Ordering::Relaxed);
         Ok(node)
     }
 
     /// Writes what the last steps changed to the journal, if the write
     /// needs a sync, and hands it back to the replica, which releases what
     /// waited for it. Returns whether the journal was written.
+    #[cfg(test)]
     pub(crate) fn write(&mut self) -> Result<bool, String> {
         let mut synced = false;
-        let (journal, journaled) = (&mut self.journal, self.journaled);
+        let journaled = self.journaled;
+        let journal = self
+            .journal
+            .as_mut()
+            .expect("the journal is with the event loop's thread");
         self.replica.persist(|write| {
             synced = write.sync && journaled;
             if synced {
@@ -670,19 +709,22 @@ impl Node {
         Ok(synced)
     }
 
-    /// Ends a batch of steps the way the library requires. The requests of
-    /// this node's clients come first: those for this node's replica go
-    /// straight to it, so that they join this batch's write, and the rest
-    /// go to `send`. Then the messages that need not wait go to `send`, so
-    /// that the other nodes' writes overlap this one's, then the journal
-    /// is written, then the rest goes to `send`, and the replies to
-    /// `replies`. Returns whether the journal was written.
-    pub(crate) fn step(
+    /// The part of ending a batch of steps that comes before the write.
+    /// The requests of this node's clients go first: those for this node's
+    /// replica go straight to it, so that they join the next write, and the
+    /// rest to `send`. Then the messages that need not wait go to `send`,
+    /// so that the other nodes' writes overlap this one's, and the replies
+    /// ready so far to `replies`.
+    fn before_write(
         &mut self,
-        mut send: impl FnMut(ReplicaID, KvMessage),
+        send: &mut impl FnMut(ReplicaID, KvMessage),
         replies: &mut Vec<KvReply>,
-    ) -> Result<bool, String> {
-        for connection in self.connections.values_mut() {
+    ) {
+        let mut requesting = std::mem::take(&mut self.requesting);
+        for id in requesting.drain(..) {
+            let Some(connection) = self.connections.get_mut(&id) else {
+                continue;
+            };
             for (dst, message) in connection.client.drain() {
                 if dst == self.id {
                     self.replica.on_message(message);
@@ -691,28 +733,81 @@ impl Node {
                 }
             }
         }
+        self.requesting = requesting;
         for (dst, message) in self.replica.drain_messages_before_persist() {
             send(dst, message);
         }
-        let written = self.write()?;
+        replies.extend(self.replica.drain_replies());
+    }
+
+    /// The part of ending a batch of steps that comes after the write:
+    /// what the write released goes to `send` and `replies`.
+    fn after_write(
+        &mut self,
+        send: &mut impl FnMut(ReplicaID, KvMessage),
+        replies: &mut Vec<KvReply>,
+    ) {
         for (dst, message) in self.replica.drain_messages() {
             send(dst, message);
         }
         replies.extend(self.replica.drain_replies());
+    }
+
+    /// Ends a batch of steps the way the library requires: what need not
+    /// wait for the write, see `before_write`, then the journal write,
+    /// then what it released. Returns whether the journal was written.
+    #[cfg(test)]
+    pub(crate) fn step(
+        &mut self,
+        mut send: impl FnMut(ReplicaID, KvMessage),
+        replies: &mut Vec<KvReply>,
+    ) -> Result<bool, String> {
+        self.before_write(&mut send, replies);
+        let written = self.write()?;
+        self.after_write(&mut send, replies);
         Ok(written)
     }
 
-    /// Steps the node, and sends what it and its clients produced:
-    /// protocol messages to the sender thread, and replies to the node
-    /// that owns the client connection, which may be this one.
-    pub(crate) fn deliver(&mut self, frames: &Sender<(ReplicaID, Frame)>) {
-        let mut replies = Vec::new();
-        let send = |dst, message| {
+    /// Ends a batch of steps the way `step` does, but with the journal
+    /// written on the thread behind `writes`, and sends what the node and
+    /// its clients produced as soon as it may: protocol messages to the
+    /// sender thread, and replies to the node that owns the client
+    /// connection, which may be this one. What the last write released
+    /// goes out first. Then, unless a write is out already, it takes the
+    /// replica's write: one that needs a sync goes to `writes`, and comes
+    /// back as an [`Event::Written`]; any other goes straight back to the
+    /// replica, and what that released goes out too.
+    pub(crate) fn deliver(
+        &mut self,
+        frames: &Sender<(ReplicaID, Frame)>,
+        writes: &Sender<LogWrite<Op>>,
+    ) {
+        let mut send = |dst, message| {
             let _ = frames.send((dst, Frame::Message(message)));
         };
-        self.step(send, &mut replies)
-            .unwrap_or_else(|err| fatal(&err));
-        for reply in replies {
+        let mut replies = Vec::new();
+        self.before_write(&mut send, &mut replies);
+        self.after_write(&mut send, &mut replies);
+        self.answer(&mut replies, frames);
+        if !self.writing {
+            let write = self.replica.take_write();
+            if write.sync && self.journaled {
+                self.writing = true;
+                if writes.send(write).is_err() {
+                    fatal("the journal thread is gone");
+                }
+            } else {
+                self.replica.persisted(write);
+            }
+        }
+        self.after_write(&mut send, &mut replies);
+        self.answer(&mut replies, frames);
+    }
+
+    /// Hands each of `replies` to the node that owns its client
+    /// connection, which may be this one.
+    fn answer(&mut self, replies: &mut Vec<KvReply>, frames: &Sender<(ReplicaID, Frame)>) {
+        for reply in replies.drain(..) {
             let owner = node_of(reply.client_id);
             if owner == self.id {
                 deliver_reply(&mut self.connections, reply);
@@ -744,27 +839,38 @@ impl Node {
                 };
                 let request_number = connection.client.on_request(op);
                 connection.pending = Some((request_number, command, respond));
+                self.requesting.push(id);
             }
             Event::Disconnect(id) => {
                 self.connections.remove(&id);
             }
             Event::Tick => {
                 self.ticks += 1;
+                if self.writing {
+                    self.write_ticks += 1;
+                }
                 self.replica.on_idle();
                 if self.ticks.is_multiple_of(CLIENT_RESEND_TICKS) {
-                    for connection in self.connections.values_mut() {
+                    for (id, connection) in &mut self.connections {
                         connection.client.on_idle();
+                        self.requesting.push(*id);
                     }
                 }
                 return self.ticks.is_multiple_of(FLUSH_TICKS);
             }
+            Event::Written(write) => {
+                self.writing = false;
+                self.write_ticks = 0;
+                self.replica.persisted(write);
+            }
+            Event::Stop => self.stopping = true,
         }
         false
     }
 
     /// Persists the store, which makes everything it has applied durable,
     /// and compacts the log up to there, less the retention window. The
-    /// compaction reaches the journal with the next batch.
+    /// compaction reaches the journal with the next write.
     pub(crate) fn flush_store(&mut self) -> Result<(), String> {
         let applied = self.replica.applied();
         self.replica.state_machine().persist()?;
@@ -773,43 +879,124 @@ impl Node {
         Ok(())
     }
 
-    /// Runs the event loop: every batch of events already queued is
-    /// stepped, and then delivered, see [`Node::step`].
-    pub(crate) fn run(&mut self, events: Receiver<Event>, frames: Sender<(ReplicaID, Frame)>) {
+    /// Runs the event loop until an [`Event::Stop`], stepping every batch
+    /// of events already queued, see [`Node::batch`]. The journal is
+    /// written on a thread of its own, which hands each write back through
+    /// `wake`, a sender of `events`; the node steps the events that arrive
+    /// meanwhile, and takes its next write once the last is back. The
+    /// journal thread keeps `events` open, so only a stop ends the loop.
+    pub(crate) fn run(
+        &mut self,
+        events: Receiver<Event>,
+        wake: Sender<Event>,
+        frames: Sender<(ReplicaID, Frame)>,
+    ) {
+        let journal = self
+            .journal
+            .take()
+            .expect("the journal is with the event loop's thread");
+        let (writes, writes_rx) = channel();
+        let stats = self.stats.clone();
+        let journal_thread = std::thread::Builder::new()
+            .name(format!("journal {}", self.id))
+            .spawn(move || run_journal(journal, writes_rx, wake, stats))
+            .unwrap_or_else(|err| fatal(&format!("cannot start the journal thread: {err}")));
+        // Whatever the replica produced on the way up goes out now.
+        self.deliver(&frames, &writes);
         while let Ok(event) = events.recv() {
-            let mut flush_store = self.handle(event);
-            while let Ok(event) = events.try_recv() {
-                flush_store |= self.handle(event);
-            }
-            self.deliver(&frames);
-            if flush_store {
-                self.flush_store().unwrap_or_else(|err| fatal(&err));
-            }
-            let stats = &self.stats;
-            stats.batches.fetch_add(1, Ordering::Relaxed);
-            let view_number = self.replica.view_number() as u64;
-            stats.view_number.store(view_number, Ordering::Relaxed);
-            let commit_number = self.replica.commit_number() as u64;
-            stats.commit_number.store(commit_number, Ordering::Relaxed);
-            let persists = self.replica.state_machine().persists.get();
-            stats.store_persists.store(persists, Ordering::Relaxed);
-            if self.replica.view_number() != self.view {
-                self.view = self.replica.view_number();
-                if self.announce_views {
-                    println!(
-                        "view {}: primary is node {}{}",
-                        self.view,
-                        self.replica.primary_id(),
-                        if self.replica.is_primary() {
-                            " (this node)"
-                        } else {
-                            ""
-                        }
-                    );
-                }
+            let batch = std::iter::once(event)
+                .chain(events.try_iter())
+                .take(MAX_BATCH_EVENTS);
+            if !self.batch(batch, &frames, &writes) {
+                break;
             }
         }
+        drop(writes);
+        let journal = journal_thread
+            .join()
+            .unwrap_or_else(|_| fatal("the journal thread panicked"));
+        self.journal = Some(journal);
     }
+
+    /// Steps the node with a batch of events, then delivers what it
+    /// produced, see [`Node::deliver`]. Returns false once the event loop
+    /// is done: after an [`Event::Stop`], once no write is out.
+    ///
+    /// A write out for [`STALLED_WRITE_TICKS`] ticks means a stalled disk.
+    /// Until it comes back the node delivers nothing, as if it wrote on its
+    /// own thread: a primary that went on sending would keep the backups
+    /// from electing another while it could answer no client.
+    pub(crate) fn batch(
+        &mut self,
+        events: impl IntoIterator<Item = Event>,
+        frames: &Sender<(ReplicaID, Frame)>,
+        writes: &Sender<LogWrite<Op>>,
+    ) -> bool {
+        let mut flush_store = false;
+        for event in events {
+            flush_store |= self.handle(event);
+        }
+        if self.stopping {
+            return self.writing;
+        }
+        if self.writing && self.write_ticks >= STALLED_WRITE_TICKS {
+            return true;
+        }
+        self.deliver(frames, writes);
+        if flush_store {
+            self.flush_store().unwrap_or_else(|err| fatal(&err));
+        }
+        let stats = &self.stats;
+        stats.batches.fetch_add(1, Ordering::Relaxed);
+        let view_number = self.replica.view_number() as u64;
+        stats.view_number.store(view_number, Ordering::Relaxed);
+        let commit_number = self.replica.commit_number() as u64;
+        stats.commit_number.store(commit_number, Ordering::Relaxed);
+        let persists = self.replica.state_machine().persists.get();
+        stats.store_persists.store(persists, Ordering::Relaxed);
+        if self.replica.view_number() != self.view {
+            self.view = self.replica.view_number();
+            if self.announce_views {
+                println!(
+                    "view {}: primary is node {}{}",
+                    self.view,
+                    self.replica.primary_id(),
+                    if self.replica.is_primary() {
+                        " (this node)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        true
+    }
+}
+
+/// Appends each write from `writes` to `journal` and hands it back to the
+/// event loop through `events`, until `writes` closes. Returns the journal.
+/// A write that never came back would stall the node for good, so a
+/// journal that fails, or panics, ends the process.
+fn run_journal(
+    mut journal: Journal<Op>,
+    writes: Receiver<LogWrite<Op>>,
+    events: Sender<Event>,
+    stats: Arc<Stats>,
+) -> Journal<Op> {
+    for write in writes {
+        let appended =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| journal.append(&write)));
+        match appended {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => fatal(&err),
+            Err(_) => fatal("the journal thread panicked"),
+        }
+        stats.journal_writes.fetch_add(1, Ordering::Relaxed);
+        if events.send(Event::Written(write)).is_err() {
+            break;
+        }
+    }
+    journal
 }
 
 /// Power losses for the tests. A node's journal keeps every write, since

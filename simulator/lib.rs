@@ -31,7 +31,7 @@ use rand_chacha::ChaCha8Rng;
 use std::fmt;
 use vsr_rs::{Client, Config, LogEntry, Replica, Reply, RequestNumber};
 
-use disk::{Disk, PowerLossOdds, Step};
+use disk::{Disk, PowerLossOdds, Step, WriteOdds};
 use network::Network;
 pub use network::{message_kind, Envelope, MessageSummary, NetworkOptions, Origin};
 use std::collections::BTreeSet;
@@ -272,6 +272,13 @@ pub struct Options {
     /// Idle periods a backup waits without hearing from the primary before
     /// it starts a view change.
     pub primary_timeout: usize,
+    /// Probability that a replica's write stays out after the step that
+    /// took it, as with an owner that writes on another thread while the
+    /// replica steps on. A crash lands a write that is out whole or not at
+    /// all.
+    pub write_out_probability: f64,
+    /// Probability that a write that is out lands at each later step.
+    pub write_land_probability: f64,
 }
 
 impl Options {
@@ -316,6 +323,12 @@ impl Options {
             full_core: false,
             primary_timeout,
             replica_process_crash_probability: f64::from(prng.gen_range(0..=100)) / 100.0,
+            write_out_probability: if prng.gen_bool(0.25) {
+                0.0
+            } else {
+                f64::from(prng.gen_range(1..=90)) / 100.0
+            },
+            write_land_probability: f64::from(prng.gen_range(5..=50)) / 100.0,
         }
     }
 
@@ -376,6 +389,8 @@ impl Options {
                 "step_power_loss_probability",
                 self.step_power_loss_probability,
             ),
+            ("write_out_probability", self.write_out_probability),
+            ("write_land_probability", self.write_land_probability),
         ] {
             ensure!(
                 (0.0..=1.0).contains(&p),
@@ -394,6 +409,10 @@ impl Options {
             (self.replica_crash_probability == 0.0 && self.blackout_probability == 0.0)
                 || self.replica_restart_probability > 0.0,
             "replica_restart_probability must be positive if replicas can crash"
+        );
+        ensure!(
+            self.write_out_probability == 0.0 || self.write_land_probability > 0.0,
+            "write_land_probability must be positive if writes can stay out"
         );
         self.network.validate()
     }
@@ -506,10 +525,20 @@ impl fmt::Display for Options {
         )?;
         writeln!(f, "          log_retention={} entries", self.log_retention)?;
         writeln!(f, "          full_core={}", self.full_core)?;
-        write!(
+        writeln!(
             f,
             "          primary_timeout={} idle periods",
             self.primary_timeout
+        )?;
+        writeln!(
+            f,
+            "          write_out_probability={}",
+            self.write_out_probability
+        )?;
+        write!(
+            f,
+            "          write_land_probability={}",
+            self.write_land_probability
         )
     }
 }
@@ -569,6 +598,10 @@ pub struct Simulator {
     /// than the commit number.
     pub lost_steps: usize,
     pub lost_writes: usize,
+    /// Number of crashes that found a write out, and of those writes that
+    /// landed.
+    pub writes_out_at_crash: usize,
+    pub writes_landed_at_crash: usize,
     config: Config,
     /// Each replica's disk, which it writes the way an owner does, see
     /// [`Disk::step`].
@@ -576,8 +609,9 @@ pub struct Simulator {
     /// How each crashed replica went down. One that lost power was rebuilt
     /// from its disk at once, and a later power loss changes nothing.
     crash_kind: Vec<CrashKind>,
-    /// Whether each replica has stepped since its last write: its memory
-    /// may be ahead of its disk, and a power loss loses the step.
+    /// Whether each replica has stepped since its last write, or has a
+    /// write out: its memory may be ahead of its disk, and a power loss
+    /// loses the step.
     stepped: Vec<bool>,
     /// Replicas that lose power in their next step, by script.
     lose_step: BTreeSet<usize>,
@@ -648,6 +682,8 @@ impl Simulator {
             flushes: 0,
             lost_steps: 0,
             lost_writes: 0,
+            writes_out_at_crash: 0,
+            writes_landed_at_crash: 0,
             config,
             disks: vec![Disk::default(); replica_count],
             crash_kind: vec![CrashKind::Pause; replica_count],
@@ -885,6 +921,12 @@ impl Simulator {
         snapshot
     }
 
+    /// Whether replica `id` is recovering, or has recovered only in memory:
+    /// until its disk says it is done too, a crash takes it back.
+    fn recovering(&self, id: usize) -> bool {
+        self.replicas[id].is_recovering() || self.disks[id].state.recovering
+    }
+
     /// Replaces a replica with one that lost its memory and its disk, all
     /// but the view number, and is recovering. It comes up at once.
     fn reboot_replica(&mut self, id: usize) {
@@ -950,10 +992,15 @@ impl Simulator {
     }
 
     /// Replaces a replica's memory with what its owner rebuilds from its
-    /// disk, after a power loss or a process crash. The disk holds what the replica does, but for the commit
-    /// number, unless the replica has stepped since its last write, and
-    /// the power loss loses that step.
+    /// disk, after a power loss or a process crash. A write that is out
+    /// lands whole or not at all. The disk then holds what the replica
+    /// does, but for the commit number, unless the replica has stepped
+    /// since its last write or had one out, and the crash loses that.
     fn lose_power(&mut self, id: usize) {
+        if let Some(landed) = self.disks[id].crash(&mut self.prng) {
+            self.writes_out_at_crash += 1;
+            self.writes_landed_at_crash += usize::from(landed);
+        }
         let behind = !self.disks[id].matches(&self.replicas[id]);
         if std::mem::take(&mut self.stepped[id]) {
             self.lost_steps += 1;
@@ -1000,10 +1047,14 @@ impl Simulator {
         self.flushes += 1;
     }
 
-    /// Records the ops committed this tick, from the log of a replica that
-    /// committed them. A replica compacts only after a flush, which comes
-    /// before the messages of a tick, so every op is still in the log of
-    /// the replica that committed it at the end of that tick.
+    /// Records the ops committed so far, from the log of a replica that
+    /// committed them. It runs before each round of the replicas' steps, as
+    /// well as at the end of each tick: a step can send what its replica
+    /// executed, a reply or a checkpoint, and then lose power, and with it
+    /// the commit number. A commit made inside a step, as its write lands,
+    /// is recorded after it: a step loses power only before its writes. A replica compacts only after a flush, which comes before
+    /// the messages of a tick, so every op is still in the log of the
+    /// replica that committed it when it is recorded.
     fn record_committed(&mut self) -> Result<()> {
         for (id, replica) in self.replicas.iter().enumerate() {
             let commit = replica.commit_number();
@@ -1066,9 +1117,8 @@ impl Simulator {
             let j = self.prng.gen_range(0..=i);
             candidates.swap(i, j);
         }
-        let (mut core, recovering): (Vec<usize>, Vec<usize>) = candidates
-            .into_iter()
-            .partition(|&id| !self.replicas[id].is_recovering());
+        let (mut core, recovering): (Vec<usize>, Vec<usize>) =
+            candidates.into_iter().partition(|&id| !self.recovering(id));
         assert!(core.len() >= quorum);
         // The first quorum of healthy replicas is in. The remaining slots
         // are filled from the other healthy ones and the recovering ones
@@ -1115,6 +1165,9 @@ impl Simulator {
             }
             if replica.commit_number() != replica.op_number() {
                 return Ok(Some("pending commit"));
+            }
+            if self.disks[id].outstanding.is_some() {
+                return Ok(Some("pending write"));
             }
         }
         let ctx = Self::context(
@@ -1205,10 +1258,8 @@ impl Simulator {
                 // The protocol tolerates f failed replicas, and one that lost
                 // its memory counts as failed until it has recovered, so
                 // reboot only while fewer than f are still recovering.
-                let recovering = self
-                    .replicas
-                    .iter()
-                    .filter(|replica| replica.is_recovering())
+                let recovering = (0..self.replicas.len())
+                    .filter(|&id| self.recovering(id))
                     .count();
                 let f = (self.replicas.len() - 1) / 2;
                 if recovering < f && self.prng.gen_bool(self.options.replica_reboot_probability) {
@@ -1287,6 +1338,20 @@ impl Simulator {
     /// lose power before its write. Then moves the clients' messages into
     /// the network.
     fn flush(&mut self) -> Result<()> {
+        self.record_committed()?;
+        let ctx = Self::context(
+            self.ticks,
+            &self.replicas,
+            &self.disks,
+            &self.committed,
+            &self.replies,
+            &self.core,
+        );
+        for property in &mut self.properties {
+            property
+                .before_steps(&ctx)
+                .with_context(|| format!("property '{}' failed", property.name()))?;
+        }
         let mut sent = Vec::new();
         let mut replies = Vec::new();
         for id in 0..self.replicas.len() {
@@ -1319,6 +1384,10 @@ impl Simulator {
                     &mut self.replicas[id],
                     &mut self.prng,
                     odds,
+                    WriteOdds {
+                        out: self.options.write_out_probability,
+                        land: self.options.write_land_probability,
+                    },
                     send,
                     &mut replies,
                 )
@@ -1327,16 +1396,6 @@ impl Simulator {
                 self.network
                     .send(self.ticks, Origin::Replica(id), to, message, &mut self.prng);
             }
-            if step == Step::PowerLost {
-                debug!(
-                    "tick {}: replica {id} loses power before persisting the step",
-                    self.ticks
-                );
-                self.crash_replica(id, CrashKind::PowerLoss);
-                self.replica_stable_until[id] = self.ticks + self.options.replica_crash_stability;
-                continue;
-            }
-            self.stepped[id] = false;
             for reply in replies.drain(..) {
                 debug!("tick {}: reply {reply:?}", self.ticks);
                 // A reply completes the request its client is waiting for.
@@ -1349,6 +1408,19 @@ impl Simulator {
                     self.requests_replied += 1;
                 }
                 self.replies.push(reply);
+            }
+            match step {
+                Step::PowerLost => {
+                    debug!(
+                        "tick {}: replica {id} loses power before persisting the step",
+                        self.ticks
+                    );
+                    self.crash_replica(id, CrashKind::PowerLoss);
+                    self.replica_stable_until[id] =
+                        self.ticks + self.options.replica_crash_stability;
+                }
+                Step::Persisted => self.stepped[id] = false,
+                Step::WriteOut => self.stepped[id] = true,
             }
         }
         for (id, client) in self.clients.iter_mut().enumerate() {

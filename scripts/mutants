@@ -3,15 +3,17 @@
 
 Each mutation plants one bug in a scratch copy of the working tree. The
 script builds the simulator from the copy and runs a fixed set of seeds in
-the full swarm configuration, since a --lite run is often too short to see
-a view change; a run that fails or times out has caught the bug. The
-unmutated copy runs the same seeds first, and must pass them all.
+the full swarm configuration, with the simulator arguments the mutation
+names, if any, since a --lite run is often too short to see a view change;
+a run that fails or times out has caught the bug. The unmutated copy runs
+the same seeds first, once with each set of arguments the mutations use,
+and must pass them all.
 
     scripts/mutants [--seeds N] [--min-rate R] [--timeout SECONDS]
                     [--concurrency N] [MUTATION...]
 
 Prints the catch rate of each mutation, with the reasons runs failed, and
-exits non-zero if the baseline failed or any rate is below --min-rate.
+exits non-zero if a baseline failed or any rate is below --min-rate.
 """
 
 import argparse
@@ -25,6 +27,16 @@ import sys
 from pathlib import Path
 
 # Each mutation replaces `old` with `new` in `path`; `old` must occur once.
+# A fifth element gives the simulator arguments that reach the bug: M9 needs
+# writes that stay out, and M12 an odd number of replicas, since with an
+# even number one acknowledgement fewer than a majority still meets every
+# view change's quorum. Bugs that need a view change while a write is out,
+# or a primary re-elected over its own stale acknowledgements, occur in too
+# few runs to catch here; tests/cluster.rs tests each of them. Dropping the
+# view check on the primary's own acknowledgement in `persisted` changes
+# nothing today: a replica becomes primary only by installing a log, which
+# marks it changed from the commit number on, so a write taken in an
+# earlier view comes back holding nothing uncommitted.
 MUTATIONS = {
     "M1": (
         "PrepareOk leaves before the step is persisted",
@@ -54,6 +66,26 @@ MUTATIONS = {
         "                    || written.last_normal_view != self.last_normal_view",
         "                written.last_normal_view != self.last_normal_view",
     ),
+    "M9": (
+        "a commit executes ops no handed-back write holds",
+        "lib.rs",
+        "        self.apply_committed(self.durable_op());",
+        "        self.apply_committed(self.op_number());",
+        ["--write-out-probability", "0.5"],
+    ),
+    "M12": (
+        "the primary commits one acknowledgement short of a quorum",
+        "lib.rs",
+        "select_nth_unstable_by(quorum - 1,",
+        "select_nth_unstable_by(quorum - 2,",
+        ["--replicas", "3"],
+    ),
+    "M13": (
+        "a write of new entries needs no sync",
+        "lib.rs",
+        "        let sync = changed.is_some()\n            || self.written",
+        "        let sync = self.written",
+    ),
 }
 
 
@@ -80,7 +112,7 @@ def build(root, src, target, name, mutation):
     the binary's path."""
     copy_tree(root, src)
     if mutation is not None:
-        _, path, old, new = mutation
+        path, old, new = mutation[1:4]
         text = (src / path).read_text()
         count = text.count(old)
         if count != 1:
@@ -98,9 +130,10 @@ def build(root, src, target, name, mutation):
     return binary
 
 
-def run(binary, seed, timeout):
-    """Runs one seed. Returns None if it passed, or why it failed."""
-    args = [str(binary), str(seed)]
+def run(binary, seed, extra, timeout):
+    """Runs one seed with the simulator arguments `extra`. Returns None if
+    it passed, or why it failed."""
+    args = [str(binary), *extra, str(seed)]
     try:
         result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -138,22 +171,29 @@ def main():
     work = root / "target" / "mutants"
     seeds = range(1, args.seeds + 1)
 
-    def check(name, mutation):
-        binary = build(root, work / "src", work / "target", name, mutation)
-        with concurrent.futures.ThreadPoolExecutor(args.concurrency) as pool:
-            failures = [f for f in pool.map(lambda seed: run(binary, seed, args.timeout), seeds) if f]
-        return failures
+    def extra(name):
+        return MUTATIONS[name][4] if len(MUTATIONS[name]) > 4 else []
 
+    def check(binary, extra):
+        with concurrent.futures.ThreadPoolExecutor(args.concurrency) as pool:
+            runs = pool.map(lambda seed: run(binary, seed, extra, args.timeout), seeds)
+            return [f for f in runs if f]
+
+    # The unmutated simulator must pass every seed with each set of
+    # arguments the mutations use.
     ok = True
-    failures = check("baseline", None)
-    print(f"baseline: {len(failures)} of {len(seeds)} seeds failed")
-    if failures:
+    baseline = build(root, work / "src", work / "target", "baseline", None)
+    for arguments in sorted({tuple(extra(name)) for name in names} | {()}):
+        failures = check(baseline, list(arguments))
+        label = " ".join(arguments) or "default"
+        print(f"baseline ({label}): {len(failures)} of {len(seeds)} seeds failed")
         for reason, count in collections.Counter(failures).most_common():
             print(f"  {count:5}  {reason}")
-        ok = False
+        ok = ok and not failures
     for name in names:
         description = MUTATIONS[name][0]
-        failures = check(name, MUTATIONS[name])
+        binary = build(root, work / "src", work / "target", name, MUTATIONS[name])
+        failures = check(binary, extra(name))
         rate = len(failures) / len(seeds)
         verdict = "caught" if rate >= args.min_rate else "MISSED"
         print(f"{name}: {description}: {verdict} by {len(failures)} of {len(seeds)} seeds ({rate:.0%})")

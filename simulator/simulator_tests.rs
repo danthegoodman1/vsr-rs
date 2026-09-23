@@ -118,8 +118,8 @@ fn fault_script() {
 }
 
 /// A quiet cluster: perfect network, no random crashes, restarts,
-/// blackouts, or flushes, every replica in the liveness core, so that a
-/// script alone decides what happens.
+/// blackouts, or flushes, every write landing in its step, every replica in
+/// the liveness core, so that a script alone decides what happens.
 fn quiet(seed: u64, requests_max: usize) -> Simulator {
     let _ = env_logger::try_init();
     let mut prng = ChaCha8Rng::seed_from_u64(seed);
@@ -135,6 +135,7 @@ fn quiet(seed: u64, requests_max: usize) -> Simulator {
     options.log_retention = 0;
     options.full_core = true;
     options.requests_max = requests_max;
+    options.write_out_probability = 0.0;
     Simulator::init(seed, options).expect("options are valid")
 }
 
@@ -435,6 +436,109 @@ fn power_loss_between_send_and_persist() {
             options.log_retention = 0;
         });
         assert!(simulator.lost_writes > 0, "seed {seed} lost no write");
+    }
+}
+
+/// Writes stay out while their replicas step on, and replicas lose power
+/// often, for a few seeds. Some crashes find a write out, which lands in
+/// some and is lost in others; replicas execute only what landed writes
+/// hold.
+#[test]
+fn power_loss_with_a_write_out() {
+    for seed in [25, 26, 27] {
+        let simulator = run(seed, |options| {
+            options.write_out_probability = 0.9;
+            options.replica_crash_probability = 0.0;
+            options.replica_restart_probability = 0.02;
+            options.replica_reboot_probability = 0.0;
+            options.replica_flush_probability = 0.05;
+            options.step_power_loss_probability = 0.002;
+        });
+        assert!(simulator.writes_landed_at_crash > 0, "seed {seed}");
+        assert!(
+            simulator.writes_landed_at_crash < simulator.writes_out_at_crash,
+            "seed {seed}"
+        );
+    }
+}
+
+/// Replica 1's write of op 1 stays out, and it loses power: the write
+/// lands whole or not at all, and the restart holds op 1 exactly when it
+/// landed. Over a few seeds both happen, and no acknowledgement of op 1
+/// leaves first.
+#[test]
+fn power_loss_with_a_write_out_lands_it_or_not() {
+    let mut outcomes = [0; 2];
+    for seed in 30..50 {
+        let mut simulator = quiet(seed, 1);
+        simulator.options.request_probability = 0.0;
+        while simulator.ticks < 2 {
+            simulator.step_run(Limits::default()).unwrap();
+        }
+        simulator.options.request_probability = 1.0;
+        simulator.options.write_out_probability = 1.0;
+        simulator.options.write_land_probability = 0.0;
+        while simulator.replicas()[1].op_number() == 0 {
+            simulator.step_run(Limits::default()).unwrap();
+        }
+        simulator.apply(Fault::PowerLoss(1));
+        assert_eq!(1, simulator.writes_out_at_crash, "seed {seed}");
+        let landed = simulator.writes_landed_at_crash;
+        assert_eq!(landed, simulator.replicas()[1].op_number(), "seed {seed}");
+        outcomes[landed] += 1;
+    }
+    assert!(outcomes.iter().all(|&count| count > 0), "{outcomes:?}");
+}
+
+/// A primary executes an op in the step that commits it, sends what it
+/// executed, and loses power before the step's write, taking its commit
+/// number with it; a quorum's disks hold the op. The simulator recorded
+/// commits only at the end of a tick, and failed these seeds of the full
+/// swarm, and one of the lite one, at d452641 with execution at commit
+/// added: in 17626432488707759623 the primary sends a lagging replica a
+/// checkpoint that holds the op, and in 5371941143654615824 it replies to
+/// the client. Every write lands in its step.
+#[test]
+fn op_executed_in_a_step_that_lost_power() {
+    let seeds = [
+        (17626432488707759623, false),
+        (15906584926357116181, false),
+        (860930819270137469, false),
+        (5273492533068031821, false),
+        (5371941143654615824, true),
+    ];
+    for (seed, lite) in seeds {
+        let mut prng = ChaCha8Rng::seed_from_u64(seed);
+        let mut options = if lite {
+            Options::lite(&mut prng)
+        } else {
+            Options::swarm(&mut prng)
+        };
+        options.write_out_probability = 0.0;
+        let mut simulator = Simulator::init(seed, options).expect("options are valid");
+        if let Err(err) = simulator.run(Limits::default()) {
+            panic!("seed {seed} failed at tick {}: {err:#}", simulator.ticks);
+        }
+    }
+}
+
+/// A replica acknowledges an op and enters a view change, and the write
+/// that holds the acknowledged op stays out while the replica goes on into
+/// a later view, whose log replaces the one it acknowledged. The
+/// acknowledgement leaves once the write lands, backed by the log of its
+/// view on disk. `durable-promise` judged it by the replica's log instead,
+/// and failed seeds 2086361338446829227 and 16092517535111013271 of the
+/// full swarm at d452641 with writes that stay out added.
+#[test]
+fn acknowledgement_released_after_a_later_view_started() {
+    for seed in [2086361338446829227, 16092517535111013271] {
+        let mut prng = ChaCha8Rng::seed_from_u64(seed);
+        let options = Options::swarm(&mut prng);
+        assert!(options.write_out_probability > 0.0);
+        let mut simulator = Simulator::init(seed, options).expect("options are valid");
+        if let Err(err) = simulator.run(Limits::default()) {
+            panic!("seed {seed} failed at tick {}: {err:#}", simulator.ticks);
+        }
     }
 }
 

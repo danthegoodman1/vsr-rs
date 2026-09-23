@@ -1,10 +1,13 @@
 //! A replica's disk, and the owner's step that writes it.
 //!
 //! A disk holds what a real owner's would: the replica's persistent state
-//! as of its last written step, and the state machine as of its last
+//! as of its last landed write, and the state machine as of its last
 //! flush. [`Disk::step`] is the owner's side of a step, in the order the
 //! library requires: send what need not wait, persist the replica's write,
-//! hand it back, then deliver the rest. A power loss can cut a step off before its write, and a
+//! hand it back, then deliver the rest. The write may also stay out while
+//! the replica steps on, as with an owner that writes on another thread,
+//! and land at a later step. A power loss can cut a step off before its
+//! write, a crash lands a write that is out whole or not at all, and a
 //! replica that lost power is rebuilt from its disk with
 //! [`Disk::restart`].
 
@@ -12,9 +15,8 @@ use crate::state_machine::{Accumulator, Msg, Op};
 use anyhow::Result;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
-use std::convert::Infallible;
 use vsr_rs::{
-    ClientRecord, Config, LogEntry, OpNumber, PersistentState, Replica, ReplicaID, Reply,
+    ClientRecord, Config, LogEntry, LogWrite, OpNumber, PersistentState, Replica, ReplicaID, Reply,
     StateMachine, ViewNumber,
 };
 
@@ -38,21 +40,35 @@ impl PowerLossOdds {
     }
 }
 
+/// The chances that a write stays out after the step that took it, and
+/// that a write that is out lands at a later step.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteOdds {
+    pub out: f64,
+    pub land: f64,
+}
+
 /// How a step ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     /// The step is on disk, and everything it produced was delivered.
     Persisted,
     /// The replica lost power before the write. What need not wait was
-    /// sent; the rest of the step is lost.
+    /// sent, and the replies ready before the write delivered; the rest of
+    /// the step is lost.
     PowerLost,
+    /// The step is done, but a write is out: the replica's memory is ahead
+    /// of its disk until the write lands.
+    WriteOut,
 }
 
 /// A replica's disk.
 #[derive(Clone, Debug)]
 pub struct Disk {
-    /// The replica's persistent state as of its last written step.
+    /// The replica's persistent state as of its last landed write.
     pub state: PersistentState<Op>,
+    /// The write the owner has taken and not yet landed, if any.
+    pub outstanding: Option<LogWrite<Op>>,
     /// The state machine as of its last flush, the number of ops it had
     /// applied then, and the client table as of then, which a durable
     /// state machine keeps alongside what it applies.
@@ -65,6 +81,7 @@ impl Default for Disk {
     fn default() -> Disk {
         Disk {
             state: PersistentState::empty(),
+            outstanding: None,
             state_machine: Accumulator::default(),
             applied: 0,
             client_table: Vec::new(),
@@ -87,17 +104,22 @@ impl Disk {
         }
     }
 
-    /// The owner's side of one step: sends what need not wait, writes the
-    /// step, then sends the rest and delivers the replies to `replies`.
-    /// `send` gets each message as it leaves, with the disk and the replica
-    /// as of then. The replica loses power before the write with `odds`;
-    /// what left before it is out, and the rest of the step is lost with
-    /// the replica's memory.
+    /// The owner's side of one step: sends what need not wait and delivers
+    /// the replies ready so far to `replies`; lands the write that is out
+    /// with probability `writes.land`, and sends and delivers what it
+    /// released; takes the next write if none is out, and keeps it out with
+    /// probability `writes.out`, or else lands it at once and sends and
+    /// delivers what that released. What a write released thus leaves
+    /// before the next write lands. `send` gets each
+    /// message as it leaves, with the disk and the replica as of then. The
+    /// replica loses power before any write with `odds`; what left before
+    /// is out, and the rest of the step is lost with the replica's memory.
     pub fn step(
         &mut self,
         replica: &mut Replica<Accumulator>,
         prng: &mut ChaCha8Rng,
         odds: PowerLossOdds,
+        writes: WriteOdds,
         mut send: impl FnMut(&PersistentState<Op>, &Replica<Accumulator>, ReplicaID, Msg) -> Result<()>,
         replies: &mut Vec<Reply<i64>>,
     ) -> Result<Step> {
@@ -105,6 +127,7 @@ impl Disk {
         for (to, message) in early {
             send(&self.state, replica, to, message)?;
         }
+        replies.extend(replica.drain_replies());
         // A checkpoint the replica installed moved its log start past what
         // the state machine had flushed: the state machine made the
         // checkpoint durable when it restored it, as the library requires.
@@ -117,21 +140,63 @@ impl Disk {
         if odds > 0.0 && prng.gen_bool(odds) {
             return Ok(Step::PowerLost);
         }
-        // A write that changed nothing but the commit number needs no
-        // sync, and this owner skips it: the disk keeps its prior image.
-        let state = &mut self.state;
-        let Ok(()) = replica.persist(|write| {
-            if write.sync {
-                state.apply(write);
+        if self.outstanding.is_some() && prng.gen_bool(writes.land) {
+            self.land(replica);
+            self.release(replica, &mut send, replies)?;
+        }
+        if self.outstanding.is_none() {
+            // A write that needs no sync has nothing to wait for.
+            let write = replica.take_write();
+            let keep_out = write.sync && writes.out > 0.0 && prng.gen_bool(writes.out);
+            self.outstanding = Some(write);
+            if !keep_out {
+                self.land(replica);
+                self.release(replica, &mut send, replies)?;
             }
-            Ok::<(), Infallible>(())
-        });
-        let rest: Vec<_> = replica.drain_messages().collect();
-        for (to, message) in rest {
+        }
+        Ok(if self.outstanding.is_some() {
+            Step::WriteOut
+        } else {
+            Step::Persisted
+        })
+    }
+
+    /// Sends the messages and delivers the replies that the writes handed
+    /// back so far released.
+    fn release(
+        &self,
+        replica: &mut Replica<Accumulator>,
+        send: &mut impl FnMut(&PersistentState<Op>, &Replica<Accumulator>, ReplicaID, Msg) -> Result<()>,
+        replies: &mut Vec<Reply<i64>>,
+    ) -> Result<()> {
+        let released: Vec<_> = replica.drain_messages().collect();
+        for (to, message) in released {
             send(&self.state, replica, to, message)?;
         }
         replies.extend(replica.drain_replies());
-        Ok(Step::Persisted)
+        Ok(())
+    }
+
+    /// The write that is out reaches the disk, whole, and goes back to the
+    /// replica. A write that changed only the commit number needs no sync,
+    /// and this owner skips it: the disk keeps its prior image.
+    fn land(&mut self, replica: &mut Replica<Accumulator>) {
+        let write = self.outstanding.take().expect("a write is out");
+        if write.sync {
+            self.state.apply(&write);
+        }
+        replica.persisted(write);
+    }
+
+    /// Settles the write that is out as a crash leaves it: on disk whole,
+    /// or not at all. Returns whether it landed, if one was out.
+    pub fn crash(&mut self, prng: &mut ChaCha8Rng) -> Option<bool> {
+        let write = self.outstanding.take()?;
+        let landed = prng.gen_bool(0.5);
+        if landed && write.sync {
+            self.state.apply(&write);
+        }
+        Some(landed)
     }
 
     /// The state machine writes its state to disk.

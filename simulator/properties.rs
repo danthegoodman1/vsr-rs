@@ -35,6 +35,13 @@ pub trait Property {
     /// Called after every tick.
     fn check(&mut self, ctx: &SimContext) -> Result<()>;
 
+    /// Called before each round of the replicas' steps, after whatever
+    /// came before them in the tick: a step can lose power and take its
+    /// replica's commit number with it.
+    fn before_steps(&mut self, _ctx: &SimContext) -> Result<()> {
+        Ok(())
+    }
+
     /// Called once at the end of the run, after the network has been drained
     /// with faults disabled.
     fn finalize(&mut self, _ctx: &SimContext) -> Result<()> {
@@ -69,20 +76,23 @@ pub fn default_properties() -> Vec<Box<dyn Property>> {
         Box::new(NoDuplicateOps::default()),
         Box::new(RepliesMatchCommits::default()),
         Box::new(Durability::default()),
+        Box::new(ExecutedOpsDurable::default()),
         Box::new(DurablePromise),
         Box::new(Convergence),
     ]
 }
 
-/// Every committed op is on enough disks to survive any view change:
-/// every quorum that the replicas whose disks are not recovering could form
-/// must include a disk that holds it. With nobody recovering that is a
-/// majority. A recovering replica holds nothing and takes part in no
-/// quorum, so it counts on neither side. A primary commits only on a
-/// quorum of `PrepareOk` messages, and a replica sends one only once its
-/// disk holds the op, so this must hold at the tick the commit happens, on
-/// whichever replica committed it. Committed prefixes are never truncated,
-/// so each committed op needs checking once per replica.
+/// Every committed op is on enough disks to survive any view change: every
+/// quorum that the replicas whose disks are not recovering could form must
+/// include a disk that holds it. With nobody recovering that is a majority.
+/// A recovering replica holds nothing and takes part in no quorum, so it
+/// counts on neither side. A primary commits only on a quorum of
+/// `PrepareOk` messages, and a replica sends one only once its disk holds
+/// the op, so this must hold as soon as the commit happens, on whichever
+/// replica committed it: it is checked before every round of steps, which
+/// can lose power and the commit number with it, and after every tick.
+/// Committed prefixes are never truncated, so each committed op needs
+/// checking once per replica.
 #[derive(Default)]
 pub struct Durability {
     /// Per replica: number of committed ops already verified.
@@ -98,6 +108,10 @@ impl Property for Durability {
         if let Some(verified) = self.verified.get_mut(replica_id) {
             *verified = 0;
         }
+    }
+
+    fn before_steps(&mut self, ctx: &SimContext) -> Result<()> {
+        self.check(ctx)
     }
 
     fn check(&mut self, ctx: &SimContext) -> Result<()> {
@@ -130,12 +144,60 @@ impl Property for Durability {
     }
 }
 
+/// Every op a replica has executed is on its disk: in the state machine's
+/// flush, or in the log as memory holds it. Otherwise a state machine that
+/// persists what it executes could hold an op that a restart cannot find
+/// in the log. Once verified, an op stays so: the disk drops a log entry
+/// only after the state machine has flushed it. It holds after each step,
+/// not before: a replica that restored a checkpoint in a delivery has its
+/// owner make it durable as its step begins.
+#[derive(Default)]
+pub struct ExecutedOpsDurable {
+    /// Per replica: the ops already verified.
+    verified: Vec<OpNumber>,
+}
+
+impl Property for ExecutedOpsDurable {
+    fn name(&self) -> &'static str {
+        "executed-ops-durable"
+    }
+
+    fn on_restart(&mut self, replica_id: usize) {
+        if let Some(verified) = self.verified.get_mut(replica_id) {
+            *verified = 0;
+        }
+    }
+
+    fn check(&mut self, ctx: &SimContext) -> Result<()> {
+        self.verified.resize(ctx.replicas.len(), 0);
+        for (id, replica) in ctx.replicas.iter().enumerate() {
+            let disk = &ctx.disks[id];
+            let applied = replica.applied();
+            for op_number in self.verified[id].max(disk.applied) + 1..=applied {
+                let entry = op_number
+                    .checked_sub(replica.log_start() + 1)
+                    .and_then(|index| replica.log().get(index));
+                ensure!(
+                    entry.is_some_and(|entry| disk.holds(op_number, entry)),
+                    "tick {}: replica {id} executed op {op_number}, which its disk does not hold",
+                    ctx.tick
+                );
+            }
+            self.verified[id] = applied;
+        }
+        Ok(())
+    }
+}
+
 /// A replica sends these only for state on its disk, which each message is
 /// checked against as it leaves:
 ///
 /// - `PrepareOk` for op `n` in view `v`: the disk was last normal in `v`
 ///   and holds the replica's uncommitted entries up to op `n`, or was last
-///   normal in a later view.
+///   normal in a later view. A write can be out while the replica goes on
+///   into a later view, whose log replaces the one the acknowledgement
+///   covers; once the replica was last normal after `v`, the disk's log of
+///   view `v` is the reference instead of the replica's.
 /// - `StartViewChange`, `DoViewChange`, and `StartView` for view `v`: the
 ///   disk's view is at least `v`.
 /// - `DoViewChange` and `StartView`: the disk holds the log they carry.
@@ -179,7 +241,8 @@ impl Property for DurablePromise {
                     && (disk.last_normal_view > *view_number
                         || (disk.last_normal_view == *view_number
                             && disk.log_start + disk.log.len() >= *op_number
-                            && holds_uncommitted(disk, replica, *op_number)))
+                            && (replica.last_normal_view() > *view_number
+                                || holds_uncommitted(disk, replica, *op_number))))
             }
             Message::StartViewChange { view_number, .. } => disk.view_number >= *view_number,
             Message::DoViewChange {
@@ -336,11 +399,13 @@ impl Property for CommitNumberMonotonic {
     }
 }
 
-/// A replica's state machine has applied exactly the committed ops, in
-/// order, and its value is the fold of those operations.
+/// A replica's state machine has applied a prefix of the committed ops, in
+/// order, and its value is the fold of those operations. The prefix is
+/// every committed op unless the replica has a write out: an op executes
+/// only once a landed write holds it.
 #[derive(Default)]
 pub struct StateMatchesCommittedLog {
-    /// Per replica: (number of committed ops already verified, expected value).
+    /// Per replica: (number of applied ops already verified, expected value).
     verified: Vec<(usize, i64)>,
 }
 
@@ -361,17 +426,22 @@ impl Property for StateMatchesCommittedLog {
             let commit = replica.commit_number();
             let state = replica.state_machine();
             let (verified, value) = &mut self.verified[id];
+            let applied = state.applied.len();
             ensure!(
-                state.applied.len() == commit,
-                "tick {}: replica {id} applied {} ops but commit_number is {commit}",
-                ctx.tick,
-                state.applied.len()
+                applied <= commit,
+                "tick {}: replica {id} applied {applied} ops but commit_number is {commit}",
+                ctx.tick
+            );
+            ensure!(
+                applied == commit || ctx.disks[id].outstanding.is_some(),
+                "tick {}: replica {id} applied {applied} of {commit} committed ops with no write out",
+                ctx.tick
             );
             for (i, entry) in ctx
                 .committed
                 .iter()
                 .enumerate()
-                .take(commit)
+                .take(applied)
                 .skip(*verified)
             {
                 ensure!(
@@ -384,7 +454,7 @@ impl Property for StateMatchesCommittedLog {
                 );
                 *value = entry.op.kind.apply(*value);
             }
-            *verified = commit;
+            *verified = applied;
             ensure!(
                 state.value == *value,
                 "tick {}: replica {id} value {} != expected {value}",

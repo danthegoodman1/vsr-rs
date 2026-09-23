@@ -8,9 +8,10 @@
 //! to node 0 the way the kvstore's client connections do, each waiting for
 //! its reply before it sends the next. Two configurations:
 //!
-//! - `journal`: the kvstore as it runs: one journal write and fsync per
-//!   batch of events that changes more than the commit number, and a store
-//!   persist every second.
+//! - `journal`: the kvstore as it runs: a journal thread that writes and
+//!   fsyncs what the replica changed more than the commit number, one
+//!   write at a time while the event loop steps on, and a store persist
+//!   every second.
 //! - `no-journal`: the same with the journal off. The difference is what
 //!   the journal costs.
 //!
@@ -32,9 +33,17 @@
 //! CONFIG=journal cargo run --release -p vsr-bench
 //! ```
 //!
-//! Data goes under `target/bench`, so fsync hits whatever disk the
-//! repository is on; a tmpfs would make it free and the numbers
-//! meaningless.
+//! Data goes under `target/bench`, or the directory given as the
+//! argument, so fsync hits whatever disk that is on. To emulate other
+//! hardware, put the data on a tmpfs, where fsync costs nothing, and set
+//! `FSYNC_US` to the microseconds each journal write spends after its
+//! fsync, and `NET_US` to the one-way delay of every frame between nodes.
+//! The clients stay on node 0, as if on its machine, and the store's
+//! persists, once a second, stay free.
+//!
+//! ```console
+//! NET_US=100 FSYNC_US=50 cargo run --release -p vsr-bench -- /dev/shm/vsr-bench
+//! ```
 
 #[allow(dead_code)]
 #[path = "../../examples/kvstore/journal.rs"]
@@ -46,9 +55,10 @@ mod node;
 use node::{client_id, config, run_timer, Command, Event, Frame, Node, Start, Stats, TICK};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -63,6 +73,15 @@ const STALL: Duration = Duration::from_secs(3);
 /// How long the threads of a run may take to stop.
 const SHUTDOWN: Duration = Duration::from_secs(10);
 const CONFIGURATIONS: [(&str, bool); 2] = [("journal", true), ("no-journal", false)];
+
+/// The hardware the bench emulates, see the module documentation.
+#[derive(Clone, Copy)]
+struct Emulation {
+    /// One-way delay of every frame between nodes.
+    network: Duration,
+    /// Time each journal write spends after its fsync.
+    fsync: Duration,
+}
 
 /// What one run measured.
 struct Measurement {
@@ -104,7 +123,7 @@ fn spawn<T: Send + 'static>(
 impl Cluster {
     /// Starts three new nodes in `dir`, with the journal on or off, a timer
     /// and a router for each.
-    fn start(dir: &Path, journaled: bool) -> Result<Cluster, String> {
+    fn start(dir: &Path, journaled: bool, emulation: Emulation) -> Result<Cluster, String> {
         let config = config(REPLICAS);
         let stop = Arc::new(AtomicBool::new(false));
         let mut cluster = Cluster {
@@ -128,6 +147,9 @@ impl Cluster {
             };
             node.journaled = journaled;
             node.announce_views = false;
+            if let Some(journal) = node.journal.as_mut() {
+                journal.sync_delay = emulation.fsync;
+            }
             cluster.stats.push(node.stats.clone());
             let (events, events_rx) = channel();
             let (timer_events, stop) = (events.clone(), stop.clone());
@@ -142,11 +164,11 @@ impl Cluster {
             let (frames, frames_rx) = channel::<(ReplicaID, Frame)>();
             let (peers, stop) = (cluster.events.clone(), stop.clone());
             cluster.helpers.push(spawn(format!("router {id}"), move || {
-                route(frames_rx, peers, stop)
+                route(frames_rx, peers, stop, emulation.network)
             }));
+            let wake = cluster.events[id].clone();
             cluster.nodes.push(spawn(format!("node {id}"), move || {
-                node.deliver(&frames);
-                node.run(events_rx, frames);
+                node.run(events_rx, wake, frames);
             }));
         }
         Ok(cluster)
@@ -232,11 +254,12 @@ impl Cluster {
     }
 
     /// Stops every thread, and fails with a report if one does not stop in
-    /// time. The nodes stop once nothing can send them events: the timers,
-    /// the routers, the clients, and the senders dropped here.
+    /// time. The nodes stop on the `Event::Stop` sent here.
     fn stop(mut self) -> Result<(), String> {
         self.stop.store(true, Ordering::Relaxed);
-        self.events.clear();
+        for events in self.events.drain(..) {
+            let _ = events.send(Event::Stop);
+        }
         let deadline = Instant::now() + SHUTDOWN;
         while !self
             .nodes
@@ -256,16 +279,42 @@ impl Cluster {
     }
 }
 
-/// Moves what a node sends to the nodes it is for, until stopped.
-fn route(frames: Receiver<(ReplicaID, Frame)>, nodes: Vec<Sender<Event>>, stop: Arc<AtomicBool>) {
-    while !stop.load(Ordering::Relaxed) {
-        match frames.recv_timeout(TICK) {
-            Ok((dst, frame)) => {
-                let _ = nodes[dst].send(frame.into());
+/// Moves what a node sends to the nodes it is for, until stopped, each
+/// frame `delay` after it was sent. A delay spins the router's thread,
+/// since a sleep this short overshoots by more than it waits.
+fn route(
+    frames: Receiver<(ReplicaID, Frame)>,
+    nodes: Vec<Sender<Event>>,
+    stop: Arc<AtomicBool>,
+    delay: Duration,
+) {
+    if delay.is_zero() {
+        while !stop.load(Ordering::Relaxed) {
+            match frames.recv_timeout(TICK) {
+                Ok((dst, frame)) => {
+                    let _ = nodes[dst].send(frame.into());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
         }
+        return;
+    }
+    let mut due = VecDeque::new();
+    while !stop.load(Ordering::Relaxed) {
+        loop {
+            match frames.try_recv() {
+                Ok((dst, frame)) => due.push_back((Instant::now() + delay, dst, frame)),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        let now = Instant::now();
+        while due.front().is_some_and(|(at, _, _)| *at <= now) {
+            let (_, dst, frame) = due.pop_front().expect("a frame is due");
+            let _ = nodes[dst].send(frame.into());
+        }
+        std::hint::spin_loop();
     }
 }
 
@@ -281,9 +330,14 @@ fn wait(replies: &Receiver<String>, stop: &AtomicBool) -> bool {
 }
 
 /// Runs `clients` closed-loop clients against three new nodes in `dir`.
-fn run(dir: &Path, journaled: bool, clients: usize) -> Result<Measurement, String> {
+fn run(
+    dir: &Path,
+    journaled: bool,
+    clients: usize,
+    emulation: Emulation,
+) -> Result<Measurement, String> {
     let _ = std::fs::remove_dir_all(dir);
-    let mut cluster = Cluster::start(dir, journaled)?;
+    let mut cluster = Cluster::start(dir, journaled, emulation)?;
     let started = Instant::now();
     let measure_from = started + WARMUP;
     let end = measure_from + MEASURE;
@@ -404,12 +458,24 @@ fn main() {
         },
         Err(_) => CONFIGURATIONS.to_vec(),
     };
+    let micros = |name| Duration::from_micros(env_list(name, &[0])[0] as u64);
+    let emulation = Emulation {
+        network: micros("NET_US"),
+        fsync: micros("FSYNC_US"),
+    };
     std::fs::create_dir_all(&data).expect("data directory");
     println!(
         "{REPLICAS} kvstore nodes on their own threads, channels between them, data in {}; median of {repeat} runs of {}s",
         data.display(),
         MEASURE.as_secs()
     );
+    if emulation.network > Duration::ZERO || emulation.fsync > Duration::ZERO {
+        println!(
+            "emulating {} µs between nodes each way and {} µs more per journal fsync",
+            emulation.network.as_micros(),
+            emulation.fsync.as_micros()
+        );
+    }
     println!();
     println!(
         "{:<13} {:>7} {:>10} {:>17} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6}",
@@ -429,7 +495,7 @@ fn main() {
         for i in 0..repeat {
             for (runs, (name, journaled)) in runs.iter_mut().zip(&configurations) {
                 let dir = data.join(format!("{name}-{clients}-{i}"));
-                match run(&dir, *journaled, clients) {
+                match run(&dir, *journaled, clients, emulation) {
                     Ok(measurement) => runs.push(measurement),
                     Err(err) => {
                         eprintln!("{name} with {clients} clients, run {i}: {err}");

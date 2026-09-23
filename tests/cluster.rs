@@ -436,9 +436,9 @@ fn test_get_state_retried_on_idle() {
     }
 }
 
-/// Every `PrepareOk` for the last ops is lost. On the next idle period
-/// the primary must re-send the uncommitted `Prepare` messages so the
-/// backups acknowledge them again.
+/// Every `PrepareOk` for the last ops is lost. Once the ops have gone a
+/// whole idle period unacknowledged, the primary must re-send their
+/// `Prepare` messages so the backups acknowledge them again.
 #[test]
 fn test_prepare_resent_on_idle_when_prepare_ok_lost() {
     let mut cluster = Cluster::new(3);
@@ -447,6 +447,9 @@ fn test_prepare_resent_on_idle_when_prepare_ok_lost() {
     cluster.tick_with(&|_, message| !matches!(message, Message::PrepareOk { .. }));
     assert_eq!(2, cluster.replicas[1].op_number());
     assert_eq!(2, cluster.replicas[2].op_number());
+    assert_eq!(0, cluster.replicas[0].commit_number());
+    cluster.idle();
+    cluster.tick();
     assert_eq!(0, cluster.replicas[0].commit_number());
     cluster.idle();
     cluster.tick();
@@ -459,8 +462,8 @@ fn test_prepare_resent_on_idle_when_prepare_ok_lost() {
 }
 
 /// The `Prepare` for the last op never reaches any backup, so no backup
-/// can notice a gap. On the next idle period the primary must re-send
-/// it.
+/// can notice a gap. Once the op has gone a whole idle period
+/// unacknowledged, the primary must re-send it.
 #[test]
 fn test_prepare_resent_on_idle_when_prepare_lost() {
     let mut cluster = Cluster::new(3);
@@ -469,6 +472,9 @@ fn test_prepare_resent_on_idle_when_prepare_lost() {
     cluster.tick_with(&|_, message| !matches!(message, Message::Prepare { op_number: 2, .. }));
     assert_eq!(1, cluster.replicas[1].op_number());
     assert_eq!(1, cluster.replicas[2].op_number());
+    assert_eq!(1, cluster.replicas[0].commit_number());
+    cluster.idle();
+    cluster.tick();
     assert_eq!(1, cluster.replicas[0].commit_number());
     cluster.idle();
     cluster.tick();
@@ -508,7 +514,11 @@ fn test_duplicate_prepare_ok_is_not_a_quorum() {
     assert_eq!(0, cluster.replicas[1].op_number());
     assert_eq!(0, cluster.replicas[2].op_number());
     assert_eq!(0, cluster.replicas[0].commit_number());
-    // Once the other backups get the re-sent Prepare, it commits.
+    // Once the other backups get the re-sent Prepare, a whole idle period
+    // later, it commits.
+    cluster.idle();
+    cluster.tick();
+    assert_eq!(0, cluster.replicas[0].commit_number());
     cluster.idle();
     cluster.tick();
     assert_eq!(1, cluster.replicas[0].commit_number());
@@ -1027,6 +1037,80 @@ fn test_persisted_executes_only_what_the_write_holds() {
     assert_eq!(3, cluster.value(2));
 }
 
+/// A primary counts acknowledgements within its view: one it counted when
+/// it led an earlier view commits nothing once it leads again. Replica 0
+/// leads view 0, where backup 1 acknowledges op 1 before the primary's own
+/// write is persisted, then view 3, whose log holds another op 1.
+#[test]
+fn test_reelected_primary_counts_only_new_acknowledgements() {
+    let mut config = Config::new();
+    for _ in 0..3 {
+        config.add_replica();
+    }
+    let mut replica = Replica::new(0, config, Accumulator::default());
+    replica.on_message(Message::Request {
+        client_id: 5,
+        request_number: 0,
+        op: Op::Add(10),
+    });
+    replica.on_message(Message::PrepareOk {
+        view_number: 0,
+        op_number: 1,
+        replica_id: 1,
+    });
+    assert_eq!(0, replica.commit_number());
+    let entry = |value| LogEntry {
+        client_id: 6,
+        request_number: 0,
+        op: Op::Add(value),
+    };
+    replica.on_message(Message::StartViewChange {
+        view_number: 3,
+        replica_id: 2,
+    });
+    replica.on_message(Message::DoViewChange {
+        view_number: 3,
+        replica_id: 2,
+        last_normal_view: 0,
+        segment: LogSegment {
+            base: LogBase::Op(0),
+            entries: vec![entry(1), entry(2)],
+        },
+        commit_number: 0,
+    });
+    assert_eq!(Status::Normal, replica.status());
+    assert_eq!(3, replica.view_number());
+    assert_eq!(entry(1), replica.log()[0]);
+    let write = replica.take_write();
+    replica.persisted(write);
+    assert_eq!(0, replica.commit_number());
+}
+
+/// The primary re-sends a `Prepare` only to the backups that have not
+/// acknowledged, once an idle period has passed since it was sent.
+#[test]
+fn test_prepare_resent_only_to_backups_that_did_not_acknowledge() {
+    let mut cluster = Cluster::new(5);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.tick_with(
+        &|_, message| !matches!(message, Message::PrepareOk { replica_id, .. } if *replica_id != 1),
+    );
+    assert_eq!(0, cluster.replicas[0].commit_number());
+    let mut resent_to = Vec::new();
+    for _ in 0..2 {
+        cluster.replicas[0].on_idle();
+        cluster.persist(0);
+        for (to, message) in cluster.replicas[0].drain_messages() {
+            if let Message::Prepare { op_number, .. } = message {
+                assert_eq!(2, op_number);
+                resent_to.push(to);
+            }
+        }
+    }
+    assert_eq!(vec![2, 3, 4], resent_to);
+}
+
 /// One write is out at a time.
 #[test]
 #[should_panic(expected = "a write is out")]
@@ -1310,12 +1394,13 @@ fn test_recovery_with_checkpoint() {
     assert_eq!(2, cluster.replicas[1].commit_number());
     assert_eq!(3, cluster.replicas[1].op_number());
     assert_eq!(30, cluster.value(1));
-    // The re-sent `Prepare` for op 3 commits it, and the next heartbeat
-    // tells the backups.
-    cluster.idle();
-    cluster.tick();
-    cluster.idle();
-    cluster.tick();
+    // The `Prepare` for op 3, re-sent once it has gone a whole idle
+    // period unacknowledged, commits it, and the next heartbeat tells the
+    // backups.
+    for _ in 0..3 {
+        cluster.idle();
+        cluster.tick();
+    }
     for id in 0..3 {
         assert_eq!(60, cluster.value(id));
     }

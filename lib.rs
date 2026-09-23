@@ -69,7 +69,7 @@
 
 use log::trace;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
 };
 
@@ -730,15 +730,27 @@ pub struct Replica<SM: StateMachine> {
     /// The number of writes taken, and the one out, if any.
     writes: u64,
     outstanding: Option<Outstanding>,
-    /// For each uncommitted op number, the replicas that have acknowledged it.
-    acks: BTreeMap<OpNumber, BTreeSet<ReplicaID>>,
+    /// The highest op number each replica has acknowledged in the current
+    /// view, by replica id, this one included once its write is persisted.
+    /// The primary commits up to the highest op number a quorum has
+    /// acknowledged.
+    acked: Vec<OpNumber>,
+    /// The primary's op number as of its last idle period, or its commit
+    /// number as the view started. The ops up to it have had a whole idle
+    /// period to be acknowledged, and the next idle period re-sends to a
+    /// backup that has not acknowledged them all.
+    resend_up_to: OpNumber,
     /// The client table: the latest executed request of each client and
-    /// its result, so that a re-sent request is not run twice.
-    client_table: BTreeMap<ClientID, ClientEntry<SM::Output>>,
+    /// its result, so that a re-sent request is not run twice. Every op
+    /// looks its client up here and in `pending`, on every replica, so both
+    /// are hash maps: with many clients at work, the paths of a tree fall
+    /// out of the cache. They keep the default hasher, since the keys come
+    /// from clients.
+    client_table: HashMap<ClientID, ClientEntry<SM::Output>>,
     /// The latest request of each client in the log after `applied`, so
     /// that a re-sent request that is still in progress is not appended
     /// again.
-    pending: BTreeMap<ClientID, RequestNumber>,
+    pending: HashMap<ClientID, RequestNumber>,
     /// Whether the primary has been heard from since the last idle period.
     heard_from_primary: bool,
     /// Consecutive idle periods spent without hearing from the primary, or
@@ -786,6 +798,7 @@ pub struct Replica<SM: StateMachine> {
 
 impl<SM: StateMachine> Replica<SM> {
     pub fn new(self_id: ReplicaID, config: Config, state_machine: SM) -> Replica<SM> {
+        let replica_count = config.replicas().len();
         Replica {
             self_id,
             config,
@@ -802,9 +815,10 @@ impl<SM: StateMachine> Replica<SM> {
             written: None,
             writes: 0,
             outstanding: None,
-            acks: BTreeMap::new(),
-            client_table: BTreeMap::new(),
-            pending: BTreeMap::new(),
+            acked: vec![0; replica_count],
+            resend_up_to: 0,
+            client_table: HashMap::new(),
+            pending: HashMap::new(),
             heard_from_primary: true,
             idle_periods_waiting: 0,
             view_change_attempts: 0,
@@ -1086,8 +1100,10 @@ impl<SM: StateMachine> Replica<SM> {
             let result = self.state_machine.apply(op_number, entry);
             let (client_id, request_number) = (entry.client_id, entry.request_number);
             self.applied = op_number;
-            if self.pending.get(&client_id) == Some(&request_number) {
-                self.pending.remove(&client_id);
+            if let Entry::Occupied(pending) = self.pending.entry(client_id) {
+                if *pending.get() == request_number {
+                    pending.remove();
+                }
             }
             self.client_table.insert(
                 client_id,
@@ -1269,9 +1285,7 @@ impl<SM: StateMachine> Replica<SM> {
             request_number,
             op: op.clone(),
         });
-        // Our own acknowledgement follows once the entry is persisted.
         let op_number = self.op_number();
-        self.acks.insert(op_number, BTreeSet::new());
         // Send a prepare message to all the replicas.
         self.send_to_others(Message::Prepare {
             view_number: self.view_number,
@@ -1332,40 +1346,35 @@ impl<SM: StateMachine> Replica<SM> {
         op_number: OpNumber,
         replica_id: ReplicaID,
     ) {
-        if view_number != self.view_number || !self.is_primary() || self.status != Status::Normal {
+        if view_number != self.view_number
+            || !self.is_primary()
+            || self.status != Status::Normal
+            || replica_id >= self.acked.len()
+        {
             return;
         }
         self.register_ack(replica_id, op_number);
     }
 
-    /// Registers that `replica_id` holds every op up to `op_number`, for
-    /// every uncommitted op that covers, and commits up to the last op
-    /// with a quorum. A quorum is a set of distinct replicas: the same
-    /// backup acknowledging twice, because the network replayed its
-    /// message or because it answered a re-sent `Prepare`, still counts
-    /// once.
+    /// Registers that `replica_id` holds every op up to `op_number`, and
+    /// commits up to the highest op number a quorum of replicas holds. An
+    /// acknowledgement covers every earlier op, so each replica's highest
+    /// is all that counts: the same backup acknowledging twice, because the
+    /// network replayed its message or because it answered a re-sent
+    /// `Prepare`, still counts once, and an op whose own acknowledgements
+    /// were lost or overtaken commits with the later ones that cover it.
     fn register_ack(&mut self, replica_id: ReplicaID, op_number: OpNumber) {
-        if op_number <= self.commit_number {
-            return; // already committed
-        }
-        let quorum = self.config.quorum();
-        let mut committed = None;
-        for (acked_op_number, acked_by) in self.acks.range_mut(..=op_number) {
-            acked_by.insert(replica_id);
-            if acked_by.len() >= quorum {
-                committed = Some(*acked_op_number);
-            }
-        }
-        let Some(committed) = committed else {
+        let op_number = op_number.min(self.op_number());
+        if op_number <= self.acked[replica_id] {
             return;
-        };
-        // A quorum for an op means the op and all earlier ones are
-        // committed. Earlier operations may not have reached a quorum on
-        // their own, for example because their `PrepareOk` messages were
-        // lost or overtaken, so commit everything up to it, in order.
+        }
+        self.acked[replica_id] = op_number;
+        // A quorum holds every op up to the quorum-th highest watermark.
+        let mut acked = self.acked.clone();
+        let quorum = self.config.quorum();
+        let (_, committed, _) = acked.select_nth_unstable_by(quorum - 1, |a, b| b.cmp(a));
+        let committed = *committed;
         self.commit_up_to(committed, true);
-        self.acks
-            .retain(|acked_op_number, _| *acked_op_number > committed);
     }
 
     /// A backup node typically commits its log as part of `Prepare`
@@ -1632,7 +1641,6 @@ impl<SM: StateMachine> Replica<SM> {
         }
         self.commit_up_to(commit_number, false);
         self.enter_normal();
-        self.acks.clear();
         self.send_prepare_ok();
     }
 
@@ -1763,10 +1771,6 @@ impl<SM: StateMachine> Replica<SM> {
         // before it could.
         self.commit_up_to(commit_number, true);
         self.enter_normal();
-        self.acks.clear();
-        for op_number in self.commit_number + 1..=self.op_number() {
-            self.acks.insert(op_number, BTreeSet::new());
-        }
         for replica_id in self.config.replicas().to_vec() {
             if replica_id != self.self_id {
                 self.send_start_view(replica_id);
@@ -1811,6 +1815,10 @@ impl<SM: StateMachine> Replica<SM> {
     fn enter_normal(&mut self) {
         self.status = Status::Normal;
         self.last_normal_view = self.view_number;
+        // Acknowledgements count within a view, and the first idle period
+        // of a view re-sends nothing: `StartView` has just carried the log.
+        self.acked.fill(0);
+        self.resend_up_to = self.commit_number;
         self.heard_from_primary = true;
         self.idle_periods_waiting = 0;
         self.idle_periods_stable = 0;
@@ -1935,11 +1943,15 @@ impl<SM: StateMachine> Replica<SM> {
     ///
     /// Idle periods also drive retransmission, which the paper leaves out of
     /// its description: a backup waiting for `NewState` asks again in case
-    /// its `GetState` or the reply was lost, the primary re-sends the
-    /// `Prepare` for every op that has not committed yet in case a `Prepare`
-    /// or its `PrepareOk` was lost, replicas in a view change re-send
-    /// their view change messages, and a recovering replica re-sends
-    /// `Recovery` to whoever has not answered.
+    /// its `GetState` or the reply was lost, replicas in a view change
+    /// re-send their view change messages, and a recovering replica
+    /// re-sends `Recovery` to whoever has not answered. The primary
+    /// re-sends one `Prepare` to each backup that has not acknowledged, a
+    /// whole idle period after it was sent, an uncommitted op: that of the
+    /// last such op. A backup that holds every op before it acknowledges
+    /// them all; one that lacks some finds the gap and asks for them with a
+    /// state transfer. A lost `Prepare` or `PrepareOk` is thus repaired one
+    /// to two idle periods after it was sent.
     ///
     /// And they drive the timers: a backup that has not heard from the
     /// primary for `Config::primary_timeout` idle periods starts a view
@@ -1955,16 +1967,25 @@ impl<SM: StateMachine> Replica<SM> {
                     view_number,
                     commit_number,
                 });
-                for op_number in commit_number + 1..=self.op_number() {
-                    let entry = self.entry(op_number).clone();
-                    self.send_to_others(Message::Prepare {
-                        view_number,
-                        op_number,
-                        client_id: entry.client_id,
-                        request_number: entry.request_number,
-                        op: entry.op,
-                        commit_number,
-                    });
+                let last_op = self.op_number();
+                let due = std::mem::replace(&mut self.resend_up_to, last_op).min(last_op);
+                if due > commit_number {
+                    let entry = self.entry(due).clone();
+                    for replica_id in self.config.replicas().to_vec() {
+                        if replica_id != self.self_id && self.acked[replica_id] < due {
+                            self.send(
+                                replica_id,
+                                Message::Prepare {
+                                    view_number,
+                                    op_number: due,
+                                    client_id: entry.client_id,
+                                    request_number: entry.request_number,
+                                    op: entry.op.clone(),
+                                    commit_number,
+                                },
+                            );
+                        }
+                    }
                 }
             }
             Status::Recovering => self.send_recovery(),
@@ -2268,16 +2289,20 @@ impl<SM: StateMachine> Replica<SM> {
     }
 
     /// The client table: the latest executed request of each client, with
-    /// its result.
+    /// its result, in client id order. It is built and sorted on every
+    /// call, for a checkpoint or a state machine that persists it.
     pub fn client_table(&self) -> Vec<ClientRecord<SM::Output>> {
-        self.client_table
+        let mut table: Vec<_> = self
+            .client_table
             .iter()
             .map(|(client_id, entry)| ClientRecord {
                 client_id: *client_id,
                 request_number: entry.request_number,
                 reply: entry.reply.clone(),
             })
-            .collect()
+            .collect();
+        table.sort_unstable_by_key(|record| record.client_id);
+        table
     }
 
     /// Returns the state machine, as far as the persisted writes have

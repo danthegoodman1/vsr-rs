@@ -3,8 +3,8 @@
 //! A disk holds what a real owner's would: the replica's persistent state
 //! as of its last written step, and the state machine as of its last
 //! flush. [`Disk::step`] is the owner's side of a step, in the order the
-//! library requires: send what need not wait, write the step, then deliver
-//! the rest. A power loss can cut a step off before its write, and a
+//! library requires: send what need not wait, persist the replica's write,
+//! hand it back, then deliver the rest. A power loss can cut a step off before its write, and a
 //! replica that lost power is rebuilt from its disk with
 //! [`Disk::restart`].
 
@@ -12,6 +12,7 @@ use crate::state_machine::{Accumulator, Msg, Op};
 use anyhow::Result;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
+use std::convert::Infallible;
 use vsr_rs::{
     ClientRecord, Config, LogEntry, OpNumber, PersistentState, Replica, ReplicaID, Reply,
     StateMachine, ViewNumber,
@@ -51,7 +52,7 @@ pub enum Step {
 #[derive(Clone, Debug)]
 pub struct Disk {
     /// The replica's persistent state as of its last written step.
-    pub state: PersistentState<Op, i64>,
+    pub state: PersistentState<Op>,
     /// The state machine as of its last flush, the number of ops it had
     /// applied then, and the client table as of then, which a durable
     /// state machine keeps alongside what it applies.
@@ -97,12 +98,7 @@ impl Disk {
         replica: &mut Replica<Accumulator>,
         prng: &mut ChaCha8Rng,
         odds: PowerLossOdds,
-        mut send: impl FnMut(
-            &PersistentState<Op, i64>,
-            &Replica<Accumulator>,
-            ReplicaID,
-            Msg,
-        ) -> Result<()>,
+        mut send: impl FnMut(&PersistentState<Op>, &Replica<Accumulator>, ReplicaID, Msg) -> Result<()>,
         replies: &mut Vec<Reply<i64>>,
     ) -> Result<Step> {
         let early: Vec<_> = replica.drain_messages_before_persist().collect();
@@ -121,36 +117,21 @@ impl Disk {
         if odds > 0.0 && prng.gen_bool(odds) {
             return Ok(Step::PowerLost);
         }
-        self.write(replica);
+        // A write that changed nothing but the commit number needs no
+        // sync, and this owner skips it: the disk keeps its prior image.
+        let state = &mut self.state;
+        let Ok(()) = replica.persist(|write| {
+            if write.sync {
+                state.apply(write);
+            }
+            Ok::<(), Infallible>(())
+        });
         let rest: Vec<_> = replica.drain_messages().collect();
         for (to, message) in rest {
             send(&self.state, replica, to, message)?;
         }
         replies.extend(replica.drain_replies());
         Ok(Step::Persisted)
-    }
-
-    /// Writes what a step changed, the way an owner that keeps a copy
-    /// does: the log change marker says which entries changed. A step that
-    /// changed nothing but the commit number is not written, as the
-    /// library allows: the disk keeps its prior counters. The log is
-    /// changed only by a step that is written.
-    fn write(&mut self, replica: &mut Replica<Accumulator>) {
-        let state = &mut self.state;
-        let prior = (
-            state.view_number,
-            state.last_normal_view,
-            state.commit_number,
-            state.recovering,
-        );
-        if !state.update_from(replica) {
-            (
-                state.view_number,
-                state.last_normal_view,
-                state.commit_number,
-                state.recovering,
-            ) = prior;
-        }
     }
 
     /// The state machine writes its state to disk.
@@ -191,18 +172,15 @@ impl Disk {
     }
 
     /// The replica its owner rebuilds from this disk after a power loss,
-    /// with the client table as of what the state machine flushed.
+    /// with the state machine and its client table as of its last flush.
     pub fn restart(&self, id: ReplicaID, config: Config, nonce: u64) -> Replica<Accumulator> {
-        let state = PersistentState {
-            client_table: self.client_table.clone(),
-            ..self.state.clone()
-        };
         Replica::restart(
             id,
             config,
             self.state_machine.clone(),
             self.applied,
-            state,
+            self.client_table.clone(),
+            self.state.clone(),
             nonce,
         )
     }

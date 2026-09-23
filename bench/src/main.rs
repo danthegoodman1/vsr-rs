@@ -371,7 +371,7 @@ impl Version for Current {
             store,
         );
         let journal = journaled.then(|| {
-            Journal::open::<()>(&dir.join("journal"), WAL_FILE_SIZE, ENTRY_CODEC)
+            Journal::open(&dir.join("journal"), WAL_FILE_SIZE, ENTRY_CODEC)
                 .expect("open journal")
                 .0
         });
@@ -408,19 +408,20 @@ impl Version for Current {
         replica.replica.on_idle();
     }
     fn persist(replica: &mut Self::Replica) {
-        match &mut replica.journal {
-            Some(journal) => {
-                if journal
-                    .persist(&mut replica.replica)
-                    .expect("write journal")
-                {
-                    replica.batches.fetch_add(1, Ordering::Relaxed);
+        let Durable {
+            replica,
+            journal,
+            batches,
+        } = replica;
+        replica
+            .persist(|write| {
+                if let (Some(journal), true) = (journal.as_mut(), write.sync) {
+                    journal.append(write)?;
+                    batches.fetch_add(1, Ordering::Relaxed);
                 }
-            }
-            None => {
-                replica.replica.take_log_changes();
-            }
-        }
+                Ok::<(), String>(())
+            })
+            .expect("write journal");
     }
     fn flush_store(replica: &mut Self::Replica) {
         let applied = replica.replica.applied();

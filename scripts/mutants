@@ -48,11 +48,11 @@ MUTATIONS = {
         "        self.mark_log_changed(keep_up_to + 2);\n        self.rebuild_pending();",
     ),
     "M7": (
-        "a view change alone is not written",
+        "a write that changes only the view needs no sync",
         "lib.rs",
-        "        changed |= self.view_number != replica.view_number()\n"
-        "            || self.last_normal_view != replica.last_normal_view()",
-        "        changed |= self.last_normal_view != replica.last_normal_view()",
+        "                written.view_number != self.view_number\n"
+        "                    || written.last_normal_view != self.last_normal_view",
+        "                written.last_normal_view != self.last_normal_view",
     ),
 }
 

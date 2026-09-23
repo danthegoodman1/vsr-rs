@@ -54,8 +54,9 @@ A `Replica` and a `Client` are state machines that their owner steps:
 2. Tell each one that time has passed with `on_idle`, at a regular
    interval. That drives heartbeats, retransmission, and the view change
    timer.
-3. Afterwards, drain what they want sent with `drain_messages`,
-   `drain_replies`, and `drain`, and deliver it however you like.
+3. Afterwards, persist the replica's write with `persist`. Then drain
+   what they want sent with `drain_messages`, `drain_replies`, and
+   `drain`, and deliver it however you like.
 
 You provide the rest:
 
@@ -68,21 +69,23 @@ You provide the rest:
   arrive, are duplicated, or are reordered.
 - **Timers.** Call `on_idle` at a fixed period. The library measures time
   in idle periods, not seconds.
-- **Persistence.** After each step, before delivering what the step
-  produced, write what `PersistentState` describes: a few counters, the
-  client table, and the log entries from the change marker on. Pass it to
-  `Replica::restart` when the replica restarts, with a state machine made
-  durable as of the ops it had applied; the replica applies the rest
-  again. That
-  ordering is the whole durability argument: an acknowledgement leaves only
-  after the entry it covers is on disk, and the replica executes committed
-  operations only when its replies are drained, after the step is
-  persisted, so a state machine that persists what it executes never gets
-  ahead of the log. Two things cost nothing in that argument, and the
-  library exposes both: messages that promise nothing about the sender's
-  durable state, a `Prepare` above all, can leave before the write, which
-  overlaps the primary's write with the backups', and a step that changed
-  only the commit number needs no write before delivery.
+- **Persistence.** After each step, call `persist` with a function that
+  makes the replica's `LogWrite` durable: a few counters and the log
+  entries that changed. Handing the write back releases what waited for
+  it. An owner that writes while the replica goes on takes the write with
+  `take_write` and hands it back with `persisted` itself. Rebuild the
+  replica's `PersistentState` from the writes when it restarts, and pass
+  it to `Replica::restart` with a state machine made durable as of the ops
+  it had applied, and the client table it keeps with them; the replica
+  applies the rest again. That ordering is the whole durability argument:
+  an acknowledgement leaves only after the entry it covers is on disk, and
+  the replica executes committed operations only once the write that holds
+  them is persisted, so a state machine that persists what it executes
+  never gets ahead of the log. Two things cost nothing in that argument,
+  and the library exposes both: messages that promise nothing about the
+  sender's durable state, a `Prepare` above all, can leave before the
+  write, which overlaps the primary's write with the backups', and a
+  write that changed only the commit number needs no sync.
 - **Compaction.** Once the state machine has made its state durable, call
   `compact` with the op number it reached. A replica that needs entries
   another one has compacted gets a checkpoint of its state instead.
@@ -106,14 +109,14 @@ here.
 | Recovery | 4.3 | done, with a persisted view number[^michael17] |
 | State transfer | 5.2 | done, without the truncation defect[^vanlightly22] |
 | Checkpoints and log compaction | 5.1 | done, checkpoints come from the state machine |
-| Durable log | | done, the owner persists after every step |
+| Durable log | | done, the owner persists a write after every step |
 | Reconfiguration | 7 | out of scope, membership is fixed |
 
 ## Getting started
 
 A replicated counter, with three replicas and one client in a single
 process. A test or a simulator delivers the messages like this; a real
-program puts them on the wire.
+program persists each write and puts the messages on the wire.
 
 ```rust
 use vsr_rs::{Checkpoint, Client, Config, LogEntry, OpNumber, Replica, StateMachine};
@@ -152,6 +155,9 @@ client.on_request(5);
 loop {
     let mut queue: Vec<_> = client.drain().collect();
     for replica in &mut replicas {
+        // Nothing to make durable in memory: hand the write straight back.
+        let write = replica.take_write();
+        replica.persisted(write);
         queue.extend(replica.drain_messages());
         for reply in replica.drain_replies() {
             println!("request {} -> {}", reply.request_number, reply.result);
@@ -228,7 +234,7 @@ takes part in a view change, or answers a recovery only with state its
 disk holds.
 
 Each replica has a disk that the simulator writes the way an owner would,
-from the change marker after every step. A replica that loses power loses
+from the replica's write after every step. A replica that loses power loses
 its memory at once, with any step it had not yet written, and is rebuilt
 from its disk.
 

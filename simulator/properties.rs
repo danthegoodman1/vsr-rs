@@ -53,7 +53,7 @@ pub trait Property {
         &mut self,
         _id: ReplicaID,
         _replica: &Replica<Accumulator>,
-        _disk: &PersistentState<Op, i64>,
+        _disk: &PersistentState<Op>,
         _message: &Msg,
     ) -> Result<()> {
         Ok(())
@@ -166,7 +166,7 @@ impl Property for DurablePromise {
         &mut self,
         id: ReplicaID,
         replica: &Replica<Accumulator>,
-        disk: &PersistentState<Op, i64>,
+        disk: &PersistentState<Op>,
         message: &Msg,
     ) -> Result<()> {
         let backed = match message {
@@ -241,7 +241,7 @@ impl Property for DurablePromise {
 /// committed ones are what `Durability` and `CommittedPrefixAgreement`
 /// look after.
 fn holds_uncommitted(
-    disk: &PersistentState<Op, i64>,
+    disk: &PersistentState<Op>,
     replica: &Replica<Accumulator>,
     op_number: OpNumber,
 ) -> bool {
@@ -256,10 +256,7 @@ fn holds_uncommitted(
 
 /// Whether the disk holds every entry of `segment`, or has compacted it,
 /// which only committed entries are.
-fn holds_segment(
-    disk: &PersistentState<Op, i64>,
-    segment: &LogSegment<Op, i64, Accumulator>,
-) -> bool {
+fn holds_segment(disk: &PersistentState<Op>, segment: &LogSegment<Op, i64, Accumulator>) -> bool {
     let start = segment.start();
     let skip = disk.log_start.saturating_sub(start);
     if skip >= segment.entries.len() {

@@ -1,41 +1,37 @@
 //! A replica's persistent state in a write-ahead log from the `writeahead`
 //! crate. The kvstore example and the benchmark share it.
 //!
-//! The log is append-only, so the state is kept as batches, one
-//! writeahead record each: what the last steps changed, as one line per
-//! change. A line is an entry (`E`), a truncation of the entries from an op
-//! number on (`T`), a compaction of the entries up to an op number (`C`),
-//! or the counters (`H`), which end every batch. A record is checksummed,
-//! and recovery keeps the longest valid prefix of records, so a batch is on
-//! disk whole or not at all. A step that changed nothing but the commit
-//! number is not written: the next batch's counters carry it, and a restart
-//! takes the commit number from the state machine when the log is behind
-//! it. Files that hold nothing a replay needs are deleted.
+//! The log is append-only, so the state is kept as the library's writes,
+//! one writeahead record each: a line per entry (`E`), then a line with the
+//! counters (`H`), which says how far the log is compacted and from which
+//! op number the entries replace what came before. A record is
+//! checksummed, and recovery keeps the longest valid prefix of records, so
+//! a write is on disk whole or not at all. Files that hold nothing a replay
+//! needs are deleted.
 
 use futures::executor::block_on;
 use futures::StreamExt;
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use vsr_rs::{LogEntry, OpNumber, PersistentState, Replica, StateMachine};
+use vsr_rs::{LogEntry, LogWrite, OpNumber, PersistentState};
 use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions, WriteHandle};
 
-/// The replica's counters, as last written to the journal.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The counters of one write.
+#[derive(Clone, Copy, Debug)]
 struct Header {
     view_number: usize,
     last_normal_view: usize,
     commit_number: usize,
     log_start: OpNumber,
+    entries_from: OpNumber,
     op_number: OpNumber,
     recovering: bool,
 }
 
-/// One line of a batch, as read back.
+/// One line of a write, as read back.
 enum Record<Op> {
     Entry(OpNumber, LogEntry<Op>),
-    Truncate(OpNumber),
-    Compact(OpNumber),
     Header(Header),
 }
 
@@ -49,21 +45,19 @@ pub struct Journal<Op> {
     dir: PathBuf,
     writer: WriteHandle,
     codec: EntryCodec<Op>,
-    /// The counters as last written, or `None` before the first batch.
-    header: Option<Header>,
     /// The files holding the retained entries: each maps the first op
     /// number of a run of entries to the file that holds the run, which
     /// lasts until the next run. Later runs were written later, so their
     /// files are no older.
     runs: BTreeMap<OpNumber, u64>,
-    /// The file holding the latest batch.
+    /// The file holding the latest write.
     last_file: u64,
     trimmed_before: u64,
     _wal: WriteAhead<SimpleFile>,
 }
 
 /// A journal and the state it replayed, if it had run before.
-pub type Opened<Op, Output> = (Journal<Op>, Option<PersistentState<Op, Output>>);
+pub type Opened<Op> = (Journal<Op>, Option<PersistentState<Op>>);
 
 fn number(word: Option<&str>) -> Result<usize, String> {
     let word = word.ok_or("truncated journal record")?;
@@ -73,13 +67,12 @@ fn number(word: Option<&str>) -> Result<usize, String> {
 
 impl<Op: Clone> Journal<Op> {
     /// Opens the journal in `dir` and replays it. Returns the replica's
-    /// state if it has run before, without the client table, which the
-    /// state machine keeps.
-    pub fn open<Output: Clone>(
+    /// state if it has run before.
+    pub fn open(
         dir: &Path,
         max_file_size: u64,
         codec: EntryCodec<Op>,
-    ) -> Result<Opened<Op, Output>, String> {
+    ) -> Result<Opened<Op>, String> {
         let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
             log_dir: dir.to_path_buf(),
             max_file_size,
@@ -98,30 +91,28 @@ impl<Op: Clone> Journal<Op> {
         block_on(async {
             while let Some(item) = stream.next().await {
                 let (id, bytes) = item.map_err(|err| format!("cannot read journal: {err}"))?;
-                let batch = String::from_utf8(bytes)
-                    .map_err(|_| "journal batch is not UTF-8".to_string())?;
-                let mut latest = None;
-                for line in batch.lines() {
-                    if latest.is_some() {
-                        return Err("journal batch continues after its counters".to_string());
+                let write = String::from_utf8(bytes)
+                    .map_err(|_| "journal record is not UTF-8".to_string())?;
+                let mut written = Vec::new();
+                let mut counters = None;
+                for line in write.lines() {
+                    if counters.is_some() {
+                        return Err("journal record continues after its counters".to_string());
                     }
                     match Self::decode(&codec, line)? {
-                        Record::Entry(op_number, entry) => {
-                            entries.insert(op_number, (entry, id.file_id));
-                        }
-                        Record::Truncate(from) => {
-                            entries.split_off(&from);
-                        }
-                        Record::Compact(log_start) => {
-                            entries = entries.split_off(&(log_start + 1));
-                        }
-                        Record::Header(counters) => latest = Some(counters),
+                        Record::Entry(op_number, entry) => written.push((op_number, entry)),
+                        Record::Header(latest) => counters = Some(latest),
                     }
                 }
-                let latest = latest.ok_or(
-                    "journal batch without counters, as an older kvstore wrote them: remove the data directory and start the node with --recover",
+                let counters = counters.ok_or(
+                    "journal record without counters, as an older kvstore wrote them: remove the data directory and start the node with --recover",
                 )?;
-                header = Some((latest, id.file_id));
+                entries = entries.split_off(&(counters.log_start + 1));
+                entries.split_off(&counters.entries_from);
+                for (op_number, entry) in written {
+                    entries.insert(op_number, (entry, id.file_id));
+                }
+                header = Some((counters, id.file_id));
             }
             Ok::<(), String>(())
         })?;
@@ -130,7 +121,6 @@ impl<Op: Clone> Journal<Op> {
             dir: dir.to_path_buf(),
             writer,
             codec,
-            header: None,
             runs: BTreeMap::new(),
             last_file: 0,
             trimmed_before: 0,
@@ -149,7 +139,6 @@ impl<Op: Clone> Journal<Op> {
                 journal.runs.insert(op_number, file);
             }
         }
-        journal.header = Some(header);
         journal.last_file = last_file;
         let state = PersistentState {
             view_number: header.view_number,
@@ -157,7 +146,6 @@ impl<Op: Clone> Journal<Op> {
             commit_number: header.commit_number,
             log_start: header.log_start,
             log,
-            client_table: Vec::new(),
             recovering: header.recovering,
         };
         Ok((journal, Some(state)))
@@ -175,13 +163,12 @@ impl<Op: Clone> Journal<Op> {
                     .ok_or("truncated journal record")?;
                 Record::Entry(op_number, (codec.decode)(text)?)
             }
-            "T" => Record::Truncate(number(words.next())?),
-            "C" => Record::Compact(number(words.next())?),
             "H" => Record::Header(Header {
                 view_number: number(words.next())?,
                 last_normal_view: number(words.next())?,
                 commit_number: number(words.next())?,
                 log_start: number(words.next())?,
+                entries_from: number(words.next())?,
                 op_number: number(words.next())?,
                 recovering: number(words.next())? != 0,
             }),
@@ -189,72 +176,35 @@ impl<Op: Clone> Journal<Op> {
         })
     }
 
-    /// Writes what the last steps changed as one batch, with one fsync,
-    /// then deletes the files that hold nothing a replay needs any more.
-    /// The first call always writes, so that a journal that exists holds
-    /// the replica's counters. Returns whether anything had to be written.
-    pub fn persist<SM: StateMachine<Input = Op>>(
-        &mut self,
-        replica: &mut Replica<SM>,
-    ) -> Result<bool, String> {
-        let written = self.header.unwrap_or_default();
-        let mut batch = String::new();
-        let log_start = replica.log_start();
-        if log_start > written.log_start {
-            let _ = writeln!(batch, "C {log_start}");
-        }
-        let mut first_written = None;
-        if let Some(from) = replica.take_log_changes() {
-            if from <= written.op_number {
-                let _ = writeln!(batch, "T {from}");
-            }
-            let first = from.max(log_start + 1);
-            for (i, entry) in replica.log_from(first).iter().enumerate() {
-                let op_number = first + i;
-                let _ = writeln!(batch, "E {op_number} {}", (self.codec.encode)(entry));
-                first_written.get_or_insert(op_number);
-            }
-        }
-        let header = Header {
-            view_number: replica.view_number(),
-            last_normal_view: replica.last_normal_view(),
-            commit_number: replica.commit_number(),
-            log_start,
-            op_number: replica.op_number(),
-            recovering: replica.is_recovering(),
-        };
-        let commit_only = Header {
-            commit_number: written.commit_number,
-            ..header
-        } == written;
-        if self.header.is_some() && batch.is_empty() && commit_only {
-            // Only the commit number moved, which needs no write before
-            // anything the step produced is delivered.
-            self.header = Some(header);
-            return Ok(false);
+    /// Appends `write` as one record, with one fsync, then deletes the
+    /// files that hold nothing a replay needs any more.
+    pub fn append(&mut self, write: &LogWrite<Op>) -> Result<(), String> {
+        let mut record = String::new();
+        for (i, entry) in write.entries.iter().enumerate() {
+            let op_number = write.entries_from + i;
+            let _ = writeln!(record, "E {op_number} {}", (self.codec.encode)(entry));
         }
         let _ = write!(
-            batch,
-            "H {} {} {} {} {} {}",
-            header.view_number,
-            header.last_normal_view,
-            header.commit_number,
-            header.log_start,
-            header.op_number,
-            u8::from(header.recovering)
+            record,
+            "H {} {} {} {} {} {} {}",
+            write.view_number,
+            write.last_normal_view,
+            write.commit_number,
+            write.log_start,
+            write.entries_from,
+            write.op_number(),
+            u8::from(write.recovering)
         );
-        let ids = block_on(self.writer.write_batch(vec![batch.into_bytes()]))
+        let ids = block_on(self.writer.write_batch(vec![record.into_bytes()]))
             .map_err(|err| format!("cannot write journal: {err}"))?;
         self.last_file = ids.last().map(|id| id.file_id).unwrap_or(self.last_file);
-        // Entries truncated away no longer pin their files, and neither do
-        // those the new ones replace; compacted ones leave the first run.
-        self.runs
-            .split_off(&(first_written.unwrap_or(header.op_number + 1)));
-        if let Some(first) = first_written {
-            self.runs.insert(first, self.last_file);
+        // The replaced entries no longer pin their files; the new ones pin
+        // this one, and the compacted ones leave the first run.
+        self.runs.split_off(&write.entries_from);
+        if !write.entries.is_empty() {
+            self.runs.insert(write.entries_from, self.last_file);
         }
-        // The run that holds the first retained entry starts there now.
-        let first_retained = log_start + 1;
+        let first_retained = write.log_start + 1;
         let covering = self
             .runs
             .range(..=first_retained)
@@ -262,11 +212,10 @@ impl<Op: Clone> Journal<Op> {
             .map(|(_, file)| *file);
         self.runs = self.runs.split_off(&first_retained);
         if let Some(file) = covering {
-            if header.op_number >= first_retained {
+            if write.op_number() >= first_retained {
                 self.runs.entry(first_retained).or_insert(file);
             }
         }
-        self.header = Some(header);
         // A replay needs the files from the oldest retained entry's on, and
         // the one just written, which holds the counters.
         let oldest = self
@@ -286,6 +235,6 @@ impl<Op: Clone> Journal<Op> {
             }
             self.trimmed_before = oldest;
         }
-        Ok(true)
+        Ok(())
     }
 }

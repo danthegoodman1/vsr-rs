@@ -2,15 +2,15 @@
 //! tick function that decides which messages get delivered.
 //!
 //! Every replica has a disk: a copy of its persistent state that the
-//! cluster maintains the way an owner would, from the log change marker
+//! cluster maintains the way an owner would, from the replica's write
 //! after every step, and checks against the replica. Restarts rebuild a
 //! replica from its disk.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use vsr_rs::{
-    Checkpoint, Client, Config, LogEntry, Message, MessageFor, OpNumber, PersistentState, Replica,
-    ReplicaID, Reply, RequestNumber, StateMachine, Status,
+    Checkpoint, Client, ClientRecord, Config, LogBase, LogEntry, LogSegment, Message, MessageFor,
+    OpNumber, PersistentState, Replica, ReplicaID, Reply, RequestNumber, StateMachine, Status,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,35 +46,23 @@ impl StateMachine for Accumulator {
 }
 
 type Msg = MessageFor<Accumulator>;
-type Disk = PersistentState<Op, ()>;
+type Disk = PersistentState<Op>;
 
-/// Applies what a step changed to a persisted copy of the replica's state,
-/// the way an owner persists after every step, and checks the copy.
+/// Applies the replica's write to a persisted copy of its state, the way
+/// an owner persists after every step, checks the copy, and hands the
+/// write back. The copy takes every write, those that need no sync too.
+/// The check sits between the write and its hand-back, which may commit,
+/// so this owner takes and hands back the write itself.
 fn persist(disk: &mut Disk, replica: &mut Replica<Accumulator>) {
-    // Compaction first, so that the entries kept below the change marker
-    // are contiguous with the ones written from it.
-    let log_start = replica.log_start();
-    if log_start > disk.log_start {
-        let dropped = (log_start - disk.log_start).min(disk.log.len());
-        disk.log.drain(..dropped);
-        disk.log_start = log_start;
-    }
-    if let Some(from) = replica.take_log_changes() {
-        let keep = from.saturating_sub(disk.log_start + 1).min(disk.log.len());
-        disk.log.truncate(keep);
-        disk.log.extend_from_slice(replica.log_from(from));
-    }
-    disk.view_number = replica.view_number();
-    disk.last_normal_view = replica.last_normal_view();
-    disk.commit_number = replica.commit_number();
-    disk.client_table = replica.client_table();
-    disk.recovering = replica.is_recovering();
+    let write = replica.take_write();
+    disk.apply(&write);
     assert_eq!(
         *disk,
         replica.persistent_state(),
         "disk of replica {}",
         replica.id()
     );
+    replica.persisted(write);
 }
 
 fn empty_disk() -> Disk {
@@ -121,6 +109,11 @@ impl Cluster {
 
     fn request(&mut self, op: Op) -> RequestNumber {
         self.client.on_request(op)
+    }
+
+    /// Persists replica `id`'s steps, which releases what waited for them.
+    fn persist(&mut self, id: ReplicaID) {
+        persist(&mut self.disks[id], &mut self.replicas[id]);
     }
 
     /// Persists every replica, then moves everything the replicas and the
@@ -202,6 +195,29 @@ impl Cluster {
         std::mem::take(&mut self.replies)
     }
 
+    /// The client table after the first `applied` ops, from the log of a
+    /// replica that holds them all.
+    fn client_table_as_of(&self, applied: OpNumber) -> Vec<ClientRecord<()>> {
+        let log = self
+            .replicas
+            .iter()
+            .find(|replica| replica.log_start() == 0 && replica.commit_number() >= applied)
+            .expect("a replica with the first ops in its log")
+            .log();
+        let mut table = BTreeMap::new();
+        for entry in &log[..applied] {
+            table.insert(entry.client_id, entry.request_number);
+        }
+        table
+            .into_iter()
+            .map(|(client_id, request_number)| ClientRecord {
+                client_id,
+                request_number,
+                reply: (),
+            })
+            .collect()
+    }
+
     fn value(&self, replica_id: ReplicaID) -> i32 {
         self.replicas[replica_id].state_machine().value
     }
@@ -220,7 +236,8 @@ impl Cluster {
         self.restart_with_state(replica_id, applied, sm, disk);
     }
 
-    /// Like `restart`, from the given persisted state.
+    /// Like `restart`, from the given persisted state. The client table
+    /// comes back with the state machine, as of `applied`.
     fn restart_with_state(
         &mut self,
         replica_id: ReplicaID,
@@ -228,13 +245,17 @@ impl Cluster {
         sm: Accumulator,
         state: Disk,
     ) {
-        self.replicas[replica_id].drain_messages().for_each(drop);
-        self.replicas[replica_id].drain_replies().for_each(drop);
-        self.replicas[replica_id] =
-            Replica::restart(replica_id, self.config.clone(), sm, applied, state, 7);
-        // The disk is what the restarted replica now persists.
-        self.disks[replica_id] = self.replicas[replica_id].persistent_state();
-        self.replicas[replica_id].take_log_changes();
+        let client_table = self.client_table_as_of(applied);
+        self.disks[replica_id] = state.clone();
+        self.replicas[replica_id] = Replica::restart(
+            replica_id,
+            self.config.clone(),
+            sm,
+            applied,
+            client_table,
+            state,
+            7,
+        );
     }
 }
 
@@ -633,6 +654,7 @@ fn test_view_change_timeout_backs_off() {
     let mut first_asked_at: Vec<usize> = Vec::new();
     for idle_period in 1..=200 {
         cluster.replicas[1].on_idle();
+        cluster.persist(1);
         for (_, message) in cluster.replicas[1].drain_messages() {
             if let Message::StartViewChange { view_number, .. } = message {
                 if view_number > first_asked_at.len() {
@@ -876,12 +898,13 @@ fn test_prepare_sent_before_persist_survives_primary_crash() {
     assert_eq!(1, cluster.disks[0].log.len());
     // The primary restarts from that disk. The backups' acknowledgements
     // reach nobody.
-    cluster.replicas[0].drain_messages().for_each(drop);
     cluster.restart(0);
     assert_eq!(1, cluster.replicas[0].op_number());
     assert_eq!(Status::ViewChange, cluster.replicas[0].status());
-    cluster.replicas[1].drain_messages().for_each(drop);
-    cluster.replicas[2].drain_messages().for_each(drop);
+    for id in [1, 2] {
+        cluster.persist(id);
+        cluster.replicas[id].drain_messages().for_each(drop);
+    }
     assert_eq!(2, cluster.replicas[1].op_number());
 
     for _ in 0..10 {
@@ -901,7 +924,7 @@ fn test_prepare_sent_before_persist_survives_primary_crash() {
 
 /// A backup that is down leaves the primary with itself and one backup,
 /// which is a quorum of three only if the primary counts its own
-/// acknowledgement, which it does once the step is persisted.
+/// acknowledgement, which it does once its write is persisted.
 #[test]
 fn test_primary_counts_own_acknowledgement_after_persist() {
     let mut cluster = Cluster::new(3);
@@ -920,14 +943,140 @@ fn test_primary_counts_own_acknowledgement_after_persist() {
             cluster.replicas[replica_id].on_message(message);
         }
     }
+    cluster.persist(1);
     let acks: Vec<_> = cluster.replicas[1].drain_messages().collect();
     for (_, message) in acks {
         cluster.replicas[0].on_message(message);
     }
     assert_eq!(0, cluster.replicas[0].commit_number());
-    // The persist, marked by draining, adds the primary's own.
+    // Draining releases only the messages that need not wait; the commit
+    // waits for the write.
     cluster.replicas[0].drain_messages().for_each(drop);
+    assert_eq!(0, cluster.replicas[0].commit_number());
+    cluster.persist(0);
     assert_eq!(1, cluster.replicas[0].commit_number());
+}
+
+/// The primary counts its own acknowledgement for the op number its write
+/// holds, not for entries appended after the write was taken.
+#[test]
+fn test_primary_acknowledges_what_it_wrote() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.collect();
+    for (replica_id, message) in std::mem::take(&mut cluster.queue) {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    let write = cluster.replicas[0].take_write();
+    assert_eq!(1, write.op_number());
+    // Op 2 arrives, and a backup acknowledges both ops, before the write
+    // of op 1 is persisted.
+    cluster.replicas[0].on_message(Message::Request {
+        client_id: 5,
+        request_number: 0,
+        op: Op::Add(20),
+    });
+    assert_eq!(2, cluster.replicas[0].op_number());
+    cluster.replicas[0].on_message(Message::PrepareOk {
+        view_number: 0,
+        op_number: 2,
+        replica_id: 1,
+    });
+    assert_eq!(0, cluster.replicas[0].commit_number());
+    cluster.disks[0].apply(&write);
+    cluster.replicas[0].persisted(write);
+    assert_eq!(1, cluster.replicas[0].commit_number());
+    assert_eq!(10, cluster.value(0));
+    cluster.persist(0);
+    assert_eq!(2, cluster.replicas[0].commit_number());
+    assert_eq!(30, cluster.value(0));
+}
+
+/// A backup's write is out when a `StartView` replaces the entries it
+/// holds and commits them. Handing it back executes none of them: memory
+/// holds entries the disk lacks, and they wait for the next write.
+#[test]
+fn test_persisted_executes_only_what_the_write_holds() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.request(Op::Add(20));
+    cluster.tick_with(&|_, message| !matches!(message, Message::PrepareOk { .. }));
+    assert_eq!(2, cluster.replicas[2].op_number());
+    assert_eq!(0, cluster.replicas[2].commit_number());
+    let write = cluster.replicas[2].take_write();
+    let replaced = |op| LogEntry {
+        client_id: 9,
+        request_number: 0,
+        op,
+    };
+    cluster.replicas[2].on_message(Message::StartView {
+        view_number: 1,
+        segment: LogSegment {
+            base: LogBase::Op(0),
+            entries: vec![replaced(Op::Add(1)), replaced(Op::Add(2))],
+        },
+        commit_number: 2,
+    });
+    assert_eq!(2, cluster.replicas[2].commit_number());
+    cluster.disks[2].apply(&write);
+    cluster.replicas[2].persisted(write);
+    assert_eq!(0, cluster.replicas[2].applied());
+    assert_eq!(0, cluster.value(2));
+    cluster.persist(2);
+    assert_eq!(2, cluster.replicas[2].applied());
+    assert_eq!(3, cluster.value(2));
+}
+
+/// One write is out at a time.
+#[test]
+#[should_panic(expected = "a write is out")]
+fn test_one_write_out_at_a_time() {
+    let mut cluster = Cluster::new(3);
+    let _write = cluster.replicas[0].take_write();
+    let _next = cluster.replicas[0].take_write();
+}
+
+/// Until its write is persisted, a replica releases only the messages
+/// that promise nothing about its disk, and executes nothing.
+#[test]
+fn test_drain_before_persisted_releases_only_early_messages() {
+    let mut cluster = Cluster::new(3);
+    cluster.request(Op::Add(10));
+    cluster.tick();
+    assert_eq!(0, cluster.replicas[1].commit_number());
+    // Backup 1 hears that op 1 committed, times out on the primary and
+    // starts a view change, then hears of a later view and asks for its
+    // state.
+    cluster.replicas[1].on_message(Message::Commit {
+        view_number: 0,
+        commit_number: 1,
+    });
+    assert_eq!(1, cluster.replicas[1].commit_number());
+    for _ in 0..=Config::new().primary_timeout() {
+        cluster.replicas[1].on_idle();
+    }
+    cluster.replicas[1].on_message(Message::Commit {
+        view_number: 5,
+        commit_number: 1,
+    });
+    let released: Vec<Msg> = cluster.replicas[1]
+        .drain_messages()
+        .map(|(_, message)| message)
+        .collect();
+    assert!(!released.is_empty());
+    assert!(
+        released
+            .iter()
+            .all(|message| matches!(message, Message::GetState { .. })),
+        "{released:?}"
+    );
+    assert_eq!(0, cluster.replicas[1].applied());
+    assert_eq!(0, cluster.value(1));
+    cluster.persist(1);
+    assert_eq!(10, cluster.value(1));
+    assert!(cluster.replicas[1]
+        .drain_messages()
+        .any(|(_, message)| matches!(message, Message::StartViewChange { .. })));
 }
 
 /// A replica restarts in the middle of a view change. Its last normal
@@ -1197,6 +1346,7 @@ fn test_prepare_ok_coalesced() {
     for (_, message) in prepares {
         cluster.replicas[1].on_message(message);
     }
+    cluster.persist(1);
     let acks: Vec<_> = cluster.replicas[1]
         .drain_messages()
         .filter_map(|(_, message)| match message {
@@ -1215,17 +1365,18 @@ fn test_prepare_ok_coalesced() {
 fn test_restart_with_state_machine_ahead_of_log() {
     let mut cluster = Cluster::new(3);
     cluster.request(Op::Add(10));
+    cluster.tick();
     cluster.request(Op::Add(20));
+    cluster.tick_with(&|_, message| !matches!(message, Message::PrepareOk { .. }));
+    // What replica 1 had persisted before the checkpoint: op 1 committed,
+    // op 2 still uncommitted.
+    let stale = cluster.disks[1].clone();
+    assert_eq!((1, 2), (stale.commit_number, stale.log.len()));
     cluster.request(Op::Add(30));
     cluster.tick();
     cluster.idle();
     cluster.tick();
-    // What replica 1 had persisted before the checkpoint: op 1 committed,
-    // op 2 still uncommitted.
-    let mut stale = cluster.disks[1].clone();
-    stale.commit_number = 1;
-    stale.log.truncate(2);
-    stale.client_table = cluster.disks[1].client_table.clone();
+    assert_eq!(3, cluster.replicas[1].commit_number());
     cluster.restart_with_state(1, 3, Accumulator { value: 60 }, stale);
     assert_eq!(3, cluster.replicas[1].commit_number());
     assert_eq!(3, cluster.replicas[1].log_start());
@@ -1328,11 +1479,11 @@ fn test_restart_recovering_with_checkpoint() {
     assert_eq!(60, cluster.value(1));
 }
 
-/// Committed ops are executed when the replies are drained, after the
-/// owner has persisted the step, so a state machine that persists what it
-/// executes never gets ahead of the log.
+/// Committed ops are executed once the write that holds them is
+/// persisted, so a state machine that persists what it executes never
+/// gets ahead of the log.
 #[test]
-fn test_state_machine_applies_on_drain() {
+fn test_state_machine_applies_once_persisted() {
     let mut cluster = Cluster::new(3);
     cluster.request(Op::Add(10));
     cluster.collect();
@@ -1352,6 +1503,9 @@ fn test_state_machine_applies_on_drain() {
     assert_eq!(1, cluster.replicas[0].commit_number());
     assert_eq!(0, cluster.replicas[0].applied());
     assert_eq!(0, cluster.value(0));
+    assert_eq!(0, cluster.replicas[0].drain_replies().count());
+    assert_eq!(0, cluster.replicas[0].applied());
+    cluster.persist(0);
     let replies: Vec<_> = cluster.replicas[0].drain_replies().collect();
     assert_eq!(1, replies.len());
     assert_eq!(1, cluster.replicas[0].applied());

@@ -901,41 +901,6 @@ fn deliver_reply(connections: &mut HashMap<u64, Connection>, reply: KvReply) {
     }
 }
 
-/// Sends out the messages that need not wait for the journal, so that
-/// the other nodes' writes overlap this one's.
-fn flush_early(replica: &mut Replica<Store>, frames: &Sender<(ReplicaID, Frame)>) {
-    for (dst, message) in replica.drain_messages_before_persist() {
-        let _ = frames.send((dst, Frame::Message(message)));
-    }
-}
-
-/// Sends out everything else the replica and the clients produced:
-/// protocol messages to the sender thread, and replies to the node that
-/// owns the client connection, which may be this one.
-fn flush(
-    node_id: ReplicaID,
-    replica: &mut Replica<Store>,
-    connections: &mut HashMap<u64, Connection>,
-    frames: &Sender<(ReplicaID, Frame)>,
-) {
-    for (dst, message) in replica.drain_messages() {
-        let _ = frames.send((dst, Frame::Message(message)));
-    }
-    for reply in replica.drain_replies() {
-        let owner = node_of(reply.client_id);
-        if owner == node_id {
-            deliver_reply(connections, reply);
-        } else {
-            let _ = frames.send((owner, Frame::Reply(reply)));
-        }
-    }
-    for connection in connections.values_mut() {
-        for (dst, message) in connection.client.drain() {
-            let _ = frames.send((dst, Frame::Message(message)));
-        }
-    }
-}
-
 fn format_reply(command: &Command, result: Option<String>) -> String {
     match (command, result) {
         (Command::Set(..), _) => "+OK\r\n".to_string(),
@@ -1039,8 +1004,8 @@ impl Node {
         // since the incarnation does.
         let nonce = incarnation;
         let replica = match (state, start) {
-            (Some(mut state), Start::Restart) => {
-                state.client_table = store.client_table()?;
+            (Some(state), Start::Restart) => {
+                let client_table = store.client_table()?;
                 let applied = store.applied;
                 println!(
                     "restarting from view {} with {} ops, {} committed, {applied} applied by the store",
@@ -1048,7 +1013,15 @@ impl Node {
                     state.log_start + state.log.len(),
                     state.commit_number
                 );
-                Replica::restart(id, config.clone(), store, applied, state, nonce)
+                Replica::restart(
+                    id,
+                    config.clone(),
+                    store,
+                    applied,
+                    client_table,
+                    state,
+                    nonce,
+                )
             }
             (None, Start::Recover { view }) => {
                 println!("recovering with an empty disk, in view {view} or later");
@@ -1068,8 +1041,70 @@ impl Node {
             ticks: 0,
             log_retention: LOG_RETENTION,
         };
-        node.journal.persist(&mut node.replica)?;
+        node.write()?;
         Ok(node)
+    }
+
+    /// Writes what the last steps changed to the journal, if the write
+    /// needs a sync, and hands it back to the replica, which releases what
+    /// waited for it. Returns whether the journal was written.
+    fn write(&mut self) -> Result<bool, String> {
+        let mut synced = false;
+        let journal = &mut self.journal;
+        self.replica.persist(|write| {
+            synced = write.sync;
+            if write.sync {
+                journal.append(write)?;
+            }
+            Ok::<(), String>(())
+        })?;
+        Ok(synced)
+    }
+
+    /// Ends a batch of steps the way the library requires: the messages
+    /// that need not wait go to `send` first, so that the other nodes'
+    /// writes overlap this one's, then the journal is written, then the
+    /// rest goes to `send`, and the replies to `replies`. Returns whether
+    /// the journal was written.
+    fn step(
+        &mut self,
+        mut send: impl FnMut(ReplicaID, KvMessage),
+        replies: &mut Vec<KvReply>,
+    ) -> Result<bool, String> {
+        for (dst, message) in self.replica.drain_messages_before_persist() {
+            send(dst, message);
+        }
+        let written = self.write()?;
+        for (dst, message) in self.replica.drain_messages() {
+            send(dst, message);
+        }
+        replies.extend(self.replica.drain_replies());
+        Ok(written)
+    }
+
+    /// Steps the node, and sends what it and its clients produced:
+    /// protocol messages to the sender thread, and replies to the node
+    /// that owns the client connection, which may be this one.
+    fn deliver(&mut self, frames: &Sender<(ReplicaID, Frame)>) {
+        let mut replies = Vec::new();
+        let send = |dst, message| {
+            let _ = frames.send((dst, Frame::Message(message)));
+        };
+        self.step(send, &mut replies)
+            .unwrap_or_else(|err| fatal(&err));
+        for reply in replies {
+            let owner = node_of(reply.client_id);
+            if owner == self.id {
+                deliver_reply(&mut self.connections, reply);
+            } else {
+                let _ = frames.send((owner, Frame::Reply(reply)));
+            }
+        }
+        for connection in self.connections.values_mut() {
+            for (dst, message) in connection.client.drain() {
+                let _ = frames.send((dst, Frame::Message(message)));
+            }
+        }
     }
 
     /// Steps the replica or a client with one event. Returns whether the
@@ -1124,20 +1159,14 @@ impl Node {
     }
 
     /// Runs the event loop: every batch of events already queued is
-    /// stepped, the messages that need not wait go out, the journal is
-    /// written once, and only then is the rest of what the batch produced
-    /// sent.
+    /// stepped, and then delivered, see [`Node::step`].
     fn run(&mut self, events: Receiver<Event>, frames: Sender<(ReplicaID, Frame)>) {
         while let Ok(event) = events.recv() {
             let mut flush_store = self.handle(event);
             while let Ok(event) = events.try_recv() {
                 flush_store |= self.handle(event);
             }
-            flush_early(&mut self.replica, &frames);
-            self.journal
-                .persist(&mut self.replica)
-                .unwrap_or_else(|err| fatal(&err));
-            flush(self.id, &mut self.replica, &mut self.connections, &frames);
+            self.deliver(&frames);
             if flush_store {
                 self.flush_store().unwrap_or_else(|err| fatal(&err));
             }
@@ -1279,12 +1308,7 @@ fn main() {
         node.replica.primary_id()
     );
     // Whatever the replica produced on the way up goes out now.
-    flush(
-        args.id,
-        &mut node.replica,
-        &mut node.connections,
-        &frames_tx,
-    );
+    node.deliver(&frames_tx);
     node.run(events_rx, frames_tx);
 }
 
@@ -1326,14 +1350,10 @@ mod tests {
         loop {
             let mut frames: Vec<(ReplicaID, String)> = Vec::new();
             for node in nodes.iter_mut() {
-                for (dst, message) in node.replica.drain_messages_before_persist() {
-                    frames.push((dst, encode(&Frame::Message(message))));
-                }
-                node.journal.persist(&mut node.replica).unwrap();
-                for (dst, message) in node.replica.drain_messages() {
-                    frames.push((dst, encode(&Frame::Message(message))));
-                }
-                for reply in node.replica.drain_replies() {
+                let mut node_replies = Vec::new();
+                let send = |dst, message| frames.push((dst, encode(&Frame::Message(message))));
+                node.step(send, &mut node_replies).unwrap();
+                for reply in node_replies {
                     client.on_reply(reply.request_number, reply.view_number);
                     replies.push(reply);
                 }
@@ -1428,6 +1448,7 @@ mod tests {
         nodes[1].flush_store().unwrap();
         assert_eq!(3, nodes[1].replica.state_machine().applied);
         let before = nodes[1].replica.persistent_state();
+        let client_table = nodes[1].replica.client_table();
 
         let node = nodes.remove(1);
         drop(node);
@@ -1440,7 +1461,7 @@ mod tests {
         assert_eq!(before.commit_number, after.commit_number);
         assert_eq!(before.commit_number, after.log_start);
         assert_eq!(before.log.len(), after.log_start + after.log.len());
-        assert_eq!(before.client_table, after.client_table);
+        assert_eq!(client_table, nodes[1].replica.client_table());
         assert_eq!(
             Some("1".to_string()),
             nodes[1].replica.state_machine().get("a")
@@ -1676,8 +1697,7 @@ mod tests {
         }
         assert_eq!(Status::ViewChange, nodes[2].replica.status());
         assert_eq!(2, nodes[2].replica.view_number());
-        let node = &mut nodes[2];
-        node.journal.persist(&mut node.replica).unwrap();
+        nodes[2].write().unwrap();
         reopen(&mut nodes, &dirs, 2, true);
         assert_eq!(Status::ViewChange, nodes[2].replica.status());
         assert_eq!(2, nodes[2].replica.view_number());
@@ -1886,10 +1906,10 @@ mod disk_tests {
         step(node);
     }
 
-    fn step(node: &mut Node) {
-        node.journal.persist(&mut node.replica).unwrap();
-        node.replica.drain_messages().for_each(drop);
-        node.replica.drain_replies().for_each(drop);
+    /// Ends the node's step, dropping what it sends. Returns whether the
+    /// journal was written.
+    fn step(node: &mut Node) -> bool {
+        node.step(|_, _| {}, &mut Vec::new()).unwrap()
     }
 
     /// Journal files small enough to rotate every few entries.
@@ -1920,7 +1940,7 @@ mod disk_tests {
             prepare(&mut node, op_number);
             if op_number % 20 == 0 {
                 node.flush_store().unwrap();
-                node.journal.persist(&mut node.replica).unwrap();
+                node.write().unwrap();
             }
         }
         // Files rotated every few entries, and every file behind the
@@ -1983,9 +2003,7 @@ mod disk_tests {
             view_number: 0,
             commit_number: 3,
         });
-        assert!(!node.journal.persist(&mut node.replica).unwrap());
-        node.replica.drain_messages().for_each(drop);
-        node.replica.drain_replies().for_each(drop);
+        assert!(!step(&mut node));
         assert_eq!(3, node.replica.applied());
         drop(node);
 
@@ -2049,11 +2067,11 @@ mod disk_tests {
             let before = node.replica.persistent_state();
             drop(node);
 
-            let mut batch = "T 4\n".to_string();
+            let mut batch = String::new();
             for op_number in replaced.clone() {
                 batch.push_str(&format!("E {op_number} 8 {op_number} PUT other value\n"));
             }
-            batch.push_str(&format!("H 0 0 3 0 {} 0", replaced.end()));
+            batch.push_str(&format!("H 0 0 3 0 4 {} 0", replaced.end()));
             write_torn_batch(&dir, &batch);
 
             let mut node = Node::open(1, config(), &dir, Start::Restart).unwrap();

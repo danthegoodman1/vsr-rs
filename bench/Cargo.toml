@@ -2,8 +2,9 @@
 name = "vsr-bench"
 version = "0.1.0"
 edition = "2021"
-description = "Benchmark of the durable log against the original in-memory library"
+description = "Benchmarks of the library alone and of the kvstore's event loop"
 publish = false
+default-run = "vsr-bench"
 
 [[bin]]
 name = "vsr-bench"

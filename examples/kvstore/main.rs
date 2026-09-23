@@ -26,389 +26,29 @@
 //! restart the node replays the write-ahead log, opens the store, persists
 //! whatever the store recovered, and applies the committed entries the
 //! store had not made durable. See README.md next to this file.
+//!
+//! The node itself, with its store and event loop, is in `node.rs`, which
+//! the benchmark shares; this file puts it on the network.
 
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
-use journal::{EntryCodec, Journal};
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use vsr_rs::{
-    Checkpoint, Client, ClientID, ClientRecord, Config, LogBase, LogEntry, LogSegment, Message,
-    MessageFor, OpNumber, RecoveryState, Replica, ReplicaID, Reply, RequestNumber, StateMachine,
-    ViewNumber,
+    Checkpoint, ClientRecord, LogBase, LogSegment, Message, RecoveryState, ReplicaID, Reply,
 };
 
 mod journal;
+mod node;
 
-/// How often the replica and the clients run their idle logic.
-const TICK: Duration = Duration::from_millis(100);
-/// Ticks between two re-sends of a request that got no reply.
-const CLIENT_RESEND_TICKS: u64 = 5;
-/// Idle periods without hearing from the primary before a view change.
-const PRIMARY_TIMEOUT: usize = 5;
-/// Ticks between two persists of the store, each of which lets the
-/// replica compact its log.
-const FLUSH_TICKS: u64 = 10;
-/// Log entries kept behind what the store has persisted, so that a replica
-/// a little behind catches up from the log rather than from a checkpoint.
-const LOG_RETENTION: usize = 1_000;
-/// Size of a write-ahead log file. Small, so that compaction reclaims
-/// space in a short run.
-const WAL_FILE_SIZE: u64 = 4 * 1024 * 1024;
-
-// ---------------------------------------------------------------------------
-// Operations
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Op {
-    Put(String, String),
-    Get(String),
-}
-
-fn encode_op(op: &Op) -> String {
-    match op {
-        Op::Put(key, value) => format!("PUT {key} {value}"),
-        Op::Get(key) => format!("GET {key}"),
-    }
-}
-
-fn encode_entry(entry: &LogEntry<Op>) -> String {
-    format!(
-        "{} {} {}",
-        entry.client_id,
-        entry.request_number,
-        encode_op(&entry.op)
-    )
-}
-
-fn decode_entry(text: &str) -> Result<LogEntry<Op>, String> {
-    let mut t = Tokens::new(text);
-    let entry = t.entry()?;
-    t.done()?;
-    Ok(entry)
-}
-
-const ENTRY_CODEC: EntryCodec<Op> = EntryCodec {
-    encode: encode_entry,
-    decode: decode_entry,
-};
-
-fn encode_entries(log: &[LogEntry<Op>]) -> String {
-    let mut out = log.len().to_string();
-    for entry in log {
-        out.push(' ');
-        out.push_str(&encode_entry(entry));
-    }
-    out
-}
-
-fn encode_result(result: &Option<String>) -> String {
-    match result {
-        Some(value) => format!("+{value}"),
-        None => "-".to_string(),
-    }
-}
-
-/// A cursor over the tokens of one encoded line.
-struct Tokens<'a> {
-    iter: std::str::SplitWhitespace<'a>,
-}
-
-impl<'a> Tokens<'a> {
-    fn new(line: &'a str) -> Tokens<'a> {
-        Tokens {
-            iter: line.split_whitespace(),
-        }
-    }
-
-    fn word(&mut self) -> Result<&'a str, String> {
-        self.iter
-            .next()
-            .ok_or_else(|| "truncated message".to_string())
-    }
-
-    fn num(&mut self) -> Result<usize, String> {
-        let word = self.word()?;
-        word.parse().map_err(|_| format!("bad number {word:?}"))
-    }
-
-    fn op(&mut self) -> Result<Op, String> {
-        match self.word()? {
-            "PUT" => Ok(Op::Put(self.word()?.to_string(), self.word()?.to_string())),
-            "GET" => Ok(Op::Get(self.word()?.to_string())),
-            kind => Err(format!("bad op {kind:?}")),
-        }
-    }
-
-    fn entry(&mut self) -> Result<LogEntry<Op>, String> {
-        Ok(LogEntry {
-            client_id: self.num()?,
-            request_number: self.num()?,
-            op: self.op()?,
-        })
-    }
-
-    fn entries(&mut self) -> Result<Vec<LogEntry<Op>>, String> {
-        let count = self.num()?;
-        let mut log = Vec::with_capacity(count);
-        for _ in 0..count {
-            log.push(self.entry()?);
-        }
-        Ok(log)
-    }
-
-    fn result(&mut self) -> Result<Option<String>, String> {
-        Ok(match self.word()? {
-            "-" => None,
-            value => Some(value[1..].to_string()),
-        })
-    }
-
-    fn done(&mut self) -> Result<(), String> {
-        match self.iter.next() {
-            None => Ok(()),
-            Some(word) => Err(format!("trailing {word:?}")),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The store: a fjall database that never fsyncs on its own
-
-/// Key prefixes in the store's one keyspace.
-const KEY_PREFIX: &str = "k/";
-const CLIENT_PREFIX: &str = "c/";
-/// The number of operations applied to the store, written in the same
-/// batch as each operation.
-const APPLIED_KEY: &str = "m/applied";
-/// The number of times the node has started, which keeps the client ids
-/// of one run apart from those of the others.
-const INCARNATION_KEY: &str = "m/incarnation";
-
-/// The key-value store. The output of an op is the value read by a GET.
-struct Store {
-    path: PathBuf,
-    db: Database,
-    keyspace: Keyspace,
-    /// The number of operations applied, as recorded in the store.
-    applied: OpNumber,
-}
-
-/// Every key and value in the store, for a replica that fell behind a
-/// compacted log.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct StoreSnapshot {
-    pairs: Vec<(String, String)>,
-}
-
-fn utf8(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-impl Store {
-    fn open(path: &Path) -> Result<Store, String> {
-        let db = Database::builder(path)
-            .manual_journal_persist(true)
-            .open()
-            .map_err(|err| format!("cannot open store at {}: {err}", path.display()))?;
-        let keyspace = db
-            .keyspace("kv", KeyspaceCreateOptions::default)
-            .map_err(|err| format!("cannot open keyspace: {err}"))?;
-        let mut store = Store {
-            path: path.to_path_buf(),
-            db,
-            keyspace,
-            applied: 0,
-        };
-        store.applied = store.read_counter(APPLIED_KEY)?;
-        Ok(store)
-    }
-
-    /// The number the store keeps under `key`, or 0 if it keeps none.
-    fn read_counter<T: std::str::FromStr + Default>(&self, key: &str) -> Result<T, String> {
-        match self.keyspace.get(key).map_err(|err| err.to_string())? {
-            Some(value) => utf8(&value)
-                .parse()
-                .map_err(|_| format!("bad {key} in store")),
-            None => Ok(T::default()),
-        }
-    }
-
-    /// Counts one more start of the node, and returns its incarnation: the
-    /// time in seconds, or one more than the last incarnation if that is
-    /// later. It increases across quick restarts, and a node that lost its
-    /// data, its count with it, starts past its earlier runs unless they
-    /// followed each other faster than once a second right before. The
-    /// count is durable once the store is persisted.
-    fn next_incarnation(&mut self) -> Result<u64, String> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_secs())
-            .unwrap_or(0);
-        let incarnation = (self.read_counter::<u64>(INCARNATION_KEY)? + 1).max(now);
-        self.keyspace
-            .insert(INCARNATION_KEY, incarnation.to_string())
-            .map_err(|err| format!("cannot write store: {err}"))?;
-        Ok(incarnation)
-    }
-
-    /// The client table as the store recorded it, for `Replica::restart`.
-    fn client_table(&self) -> Result<Vec<ClientRecord<Option<String>>>, String> {
-        let mut table = Vec::new();
-        for guard in self.keyspace.prefix(CLIENT_PREFIX) {
-            let (key, value) = guard.into_inner().map_err(|err| err.to_string())?;
-            let client_id = utf8(&key[CLIENT_PREFIX.len()..])
-                .parse()
-                .map_err(|_| "bad client id in store".to_string())?;
-            let value = utf8(&value);
-            let mut t = Tokens::new(&value);
-            table.push(ClientRecord {
-                client_id,
-                request_number: t.num()?,
-                reply: t.result()?,
-            });
-        }
-        Ok(table)
-    }
-
-    /// Makes everything applied so far durable.
-    fn persist(&self) -> Result<(), String> {
-        self.db
-            .persist(PersistMode::SyncData)
-            .map_err(|err| format!("cannot persist store at {}: {err}", self.path.display()))?;
-        #[cfg(test)]
-        power::record_durable(&self.path);
-        Ok(())
-    }
-
-    fn get(&self, key: &str) -> Option<String> {
-        self.keyspace
-            .get(format!("{KEY_PREFIX}{key}"))
-            .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")))
-            .map(|value| utf8(&value))
-    }
-}
-
-fn fatal(message: &str) -> ! {
-    eprintln!("{message}");
-    std::process::exit(1);
-}
-
-impl StateMachine for Store {
-    type Input = Op;
-    type Output = Option<String>;
-    type Snapshot = StoreSnapshot;
-
-    fn apply(&mut self, op_number: OpNumber, entry: &LogEntry<Op>) -> Option<String> {
-        let mut batch = self.db.batch();
-        let result = match &entry.op {
-            Op::Put(key, value) => {
-                batch.insert(&self.keyspace, format!("{KEY_PREFIX}{key}"), value.as_str());
-                None
-            }
-            Op::Get(key) => self.get(key),
-        };
-        batch.insert(
-            &self.keyspace,
-            format!("{CLIENT_PREFIX}{}", entry.client_id),
-            format!("{} {}", entry.request_number, encode_result(&result)),
-        );
-        batch.insert(&self.keyspace, APPLIED_KEY, op_number.to_string());
-        batch
-            .commit()
-            .unwrap_or_else(|err| fatal(&format!("cannot write store: {err}")));
-        self.applied = op_number;
-        result
-    }
-
-    fn snapshot(&self) -> StoreSnapshot {
-        let snapshot = self.db.snapshot();
-        let mut pairs = Vec::new();
-        for guard in snapshot.prefix(&self.keyspace, KEY_PREFIX) {
-            let (key, value) = guard
-                .into_inner()
-                .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")));
-            pairs.push((utf8(&key[KEY_PREFIX.len()..]), utf8(&value)));
-        }
-        StoreSnapshot { pairs }
-    }
-
-    /// Replaces the keys, values, and client table with the checkpoint's,
-    /// in one batch that removes only the keys the checkpoint lacks, and
-    /// makes it durable before returning, as the library requires.
-    fn restore(&mut self, checkpoint: Checkpoint<Option<String>, StoreSnapshot>) {
-        let mut pairs = checkpoint.state.pairs;
-        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let mut table = checkpoint.client_table;
-        table.sort_unstable_by_key(|record| record.client_id);
-        let mut batch = self.db.batch();
-        for guard in self.keyspace.prefix(KEY_PREFIX) {
-            let key = guard
-                .key()
-                .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")));
-            let name = &key[KEY_PREFIX.len()..];
-            if pairs
-                .binary_search_by(|(kept, _)| kept.as_bytes().cmp(name))
-                .is_err()
-            {
-                batch.remove(&self.keyspace, key);
-            }
-        }
-        for guard in self.keyspace.prefix(CLIENT_PREFIX) {
-            let key = guard
-                .key()
-                .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")));
-            let kept = utf8(&key[CLIENT_PREFIX.len()..]).parse().is_ok_and(|id| {
-                table
-                    .binary_search_by_key(&id, |record| record.client_id)
-                    .is_ok()
-            });
-            if !kept {
-                batch.remove(&self.keyspace, key);
-            }
-        }
-        for (key, value) in pairs {
-            batch.insert(&self.keyspace, format!("{KEY_PREFIX}{key}"), value);
-        }
-        for record in table {
-            batch.insert(
-                &self.keyspace,
-                format!("{CLIENT_PREFIX}{}", record.client_id),
-                format!("{} {}", record.request_number, encode_result(&record.reply)),
-            );
-        }
-        batch.insert(
-            &self.keyspace,
-            APPLIED_KEY,
-            checkpoint.op_number.to_string(),
-        );
-        batch
-            .commit()
-            .unwrap_or_else(|err| fatal(&format!("cannot write store: {err}")));
-        self.persist().unwrap_or_else(|err| fatal(&err));
-        self.applied = checkpoint.op_number;
-    }
-}
+use node::*;
 
 // ---------------------------------------------------------------------------
 // Wire encoding between nodes: one message per line, whitespace separated.
-
-type KvReply = Reply<Option<String>>;
-type KvMessage = MessageFor<Store>;
-type KvCheckpoint = Checkpoint<Option<String>, StoreSnapshot>;
-type KvSegment = LogSegment<Op, Option<String>, StoreSnapshot>;
-
-/// What travels between nodes: protocol messages, and replies routed back
-/// to the node that owns the client connection.
-enum Frame {
-    Message(KvMessage),
-    Reply(KvReply),
-}
 
 fn encode_checkpoint(checkpoint: &KvCheckpoint) -> String {
     let mut out = format!("{} {}", checkpoint.op_number, checkpoint.client_table.len());
@@ -668,13 +308,8 @@ fn run_sender(
     let mut last_failure: HashMap<ReplicaID, Instant> = HashMap::new();
     for (dst, frame) in frames {
         if dst == self_id {
-            // Our own messages, for example a client request when we are
-            // the primary, go straight to our event loop.
-            let event = match frame {
-                Frame::Message(message) => Event::Message(message),
-                Frame::Reply(reply) => Event::Reply(reply),
-            };
-            let _ = events.send(event);
+            // A frame for this node goes straight to its event loop.
+            let _ = events.send(frame.into());
             continue;
         }
         let stream = match streams.entry(dst) {
@@ -721,11 +356,8 @@ fn run_peer_acceptor(listener: TcpListener, events: Sender<Event>) {
         thread::spawn(move || {
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
                 match decode(&line) {
-                    Ok(Frame::Message(message)) => {
-                        let _ = events.send(Event::Message(message));
-                    }
-                    Ok(Frame::Reply(reply)) => {
-                        let _ = events.send(Event::Reply(reply));
+                    Ok(frame) => {
+                        let _ = events.send(frame.into());
                     }
                     Err(err) => warn!("bad message from peer: {err}"),
                 }
@@ -736,11 +368,6 @@ fn run_peer_acceptor(listener: TcpListener, events: Sender<Event>) {
 
 // ---------------------------------------------------------------------------
 // Client connections
-
-enum Command {
-    Set(String, String),
-    Get(String),
-}
 
 fn parse_command(line: &str) -> Result<Option<Command>, String> {
     let words: Vec<&str> = line.split_whitespace().collect();
@@ -831,18 +458,6 @@ fn run_client_command(
     Ok(true)
 }
 
-/// The client id of a node's `next` connection in its `incarnation`.
-///
-/// Client ids must never repeat, or the primary's client table mistakes a
-/// new connection's first request for a re-send of an old one and answers
-/// it from the cache (section 4.5 of the paper). The node id in the top
-/// byte tells the primary which node to route the reply to, the node's
-/// incarnation in the next 32 bits separates its runs, and the low 24 bits
-/// count its connections.
-fn client_id(node_id: ReplicaID, incarnation: u64, next: u64) -> u64 {
-    ((node_id as u64) << 56) | ((incarnation & 0xFFFF_FFFF) << 24) | (next & 0xFF_FFFF)
-}
-
 fn run_client_acceptor(
     listener: TcpListener,
     node_id: ReplicaID,
@@ -857,333 +472,6 @@ fn run_client_acceptor(
                 debug!("client connection {connection} closed: {err}");
             }
         });
-    }
-}
-
-fn node_of(client_id: ClientID) -> ReplicaID {
-    (client_id >> 56) as ReplicaID
-}
-
-// ---------------------------------------------------------------------------
-// The node: one thread owning the replica and the proxied clients
-
-enum Event {
-    Message(KvMessage),
-    Reply(KvReply),
-    Command {
-        connection: u64,
-        command: Command,
-        respond: Sender<String>,
-    },
-    Disconnect(u64),
-    Tick,
-}
-
-/// A client connection's VSR client and the command it is waiting on.
-struct Connection {
-    client: Client<Op>,
-    pending: Option<(RequestNumber, Command, Sender<String>)>,
-}
-
-/// Hands a reply to the connection waiting for it, if it is still there
-/// and still waiting for that request.
-fn deliver_reply(connections: &mut HashMap<u64, Connection>, reply: KvReply) {
-    let Some(connection) = connections.get_mut(&(reply.client_id as u64)) else {
-        return;
-    };
-    let answers_pending = connection
-        .client
-        .on_reply(reply.request_number, reply.view_number);
-    if answers_pending {
-        if let Some((_, command, respond)) = connection.pending.take() {
-            let _ = respond.send(format_reply(&command, reply.result));
-        }
-    }
-}
-
-fn format_reply(command: &Command, result: Option<String>) -> String {
-    match (command, result) {
-        (Command::Set(..), _) => "+OK\r\n".to_string(),
-        (Command::Get(_), Some(value)) => format!("${}\r\n{value}\r\n", value.len()),
-        (Command::Get(_), None) => "$-1\r\n".to_string(),
-    }
-}
-
-/// How a node starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Start {
-    /// As a new node of a new cluster, on an empty data directory.
-    Init,
-    /// From what its data directory holds, which it wrote before.
-    Restart,
-    /// As a node that lost its data, on an empty data directory: it
-    /// recovers the state from the others. `view` must be at least every
-    /// view the lost node could have taken part in; the highest view any
-    /// other node reports bounds them all.
-    Recover { view: ViewNumber },
-}
-
-/// The node's state: the replica, its journal, and the client connections.
-struct Node {
-    id: ReplicaID,
-    config: Config,
-    replica: Replica<Store>,
-    journal: Journal<Op>,
-    /// The number of times this node has started, which its client ids
-    /// carry.
-    incarnation: u64,
-    connections: HashMap<u64, Connection>,
-    ticks: u64,
-    view: usize,
-    /// Log entries kept behind what the store has persisted.
-    log_retention: usize,
-}
-
-impl Node {
-    /// Opens the store and the journal in `data_dir`, and builds the
-    /// replica as `start` says. The journal holds the replica's counters
-    /// once this returns, so a node that started can only restart.
-    fn open(id: ReplicaID, config: Config, data_dir: &Path, start: Start) -> Result<Node, String> {
-        Node::open_with(id, config, data_dir, start, WAL_FILE_SIZE)
-    }
-
-    /// `open`, with journal files of `wal_file_size` bytes.
-    fn open_with(
-        id: ReplicaID,
-        config: Config,
-        data_dir: &Path,
-        start: Start,
-        wal_file_size: u64,
-    ) -> Result<Node, String> {
-        let dir = data_dir.display();
-        let journal_dir = data_dir.join("journal");
-        if start == Start::Restart && !journal_dir.exists() {
-            return Err(format!(
-                "{dir} holds no journal: start a node of a new cluster with --init, or a node that lost its data with --recover --view N"
-            ));
-        }
-        let mut store = Store::open(&data_dir.join("store"))?;
-        let (journal, state) = Journal::open(&journal_dir, wal_file_size, ENTRY_CODEC)?;
-        let inconsistent = |what: &str| {
-            format!(
-                "{what} in {dir}; restore the store and the journal from the same backup, or remove both and start with --recover"
-            )
-        };
-        match (&state, start) {
-            (Some(_), Start::Init | Start::Recover { .. }) => {
-                return Err(format!(
-                    "--init and --recover need an empty data directory, and {dir} has a journal"
-                ));
-            }
-            (Some(state), Start::Restart) if store.applied < state.log_start => {
-                return Err(inconsistent(&format!(
-                    "the store has applied {} ops but the journal has compacted up to {}",
-                    store.applied, state.log_start
-                )));
-            }
-            (None, _) if store.applied > 0 => {
-                return Err(inconsistent(&format!(
-                    "the store has applied {} ops but the journal is empty",
-                    store.applied
-                )));
-            }
-            (None, Start::Restart) => {
-                return Err(format!(
-                    "{dir} holds no journal: start a node of a new cluster with --init, or a node that lost its data with --recover --view N"
-                ));
-            }
-            _ => {}
-        }
-        let incarnation = store.next_incarnation()?;
-        // What the store recovered can include operations it applied only
-        // in the page cache before the process died. `Replica::restart`
-        // needs a state machine that is durable as of what it applied, and
-        // may compact the log up to there.
-        store.persist()?;
-        // Differs from the nonce of every earlier recovery of this node,
-        // since the incarnation does.
-        let nonce = incarnation;
-        let replica = match (state, start) {
-            (Some(state), Start::Restart) => {
-                let client_table = store.client_table()?;
-                let applied = store.applied;
-                println!(
-                    "restarting from view {} with {} ops, {} committed, {applied} applied by the store",
-                    state.view_number,
-                    state.log_start + state.log.len(),
-                    state.commit_number
-                );
-                Replica::restart(
-                    id,
-                    config.clone(),
-                    store,
-                    applied,
-                    client_table,
-                    state,
-                    nonce,
-                )
-            }
-            (None, Start::Recover { view }) => {
-                println!("recovering with an empty disk, in view {view} or later");
-                Replica::recover(id, config.clone(), store, view, nonce)
-            }
-            (None, Start::Init) => Replica::new(id, config.clone(), store),
-            _ => unreachable!("checked above"),
-        };
-        let mut node = Node {
-            id,
-            view: replica.view_number(),
-            replica,
-            journal,
-            incarnation,
-            config,
-            connections: HashMap::new(),
-            ticks: 0,
-            log_retention: LOG_RETENTION,
-        };
-        node.write()?;
-        Ok(node)
-    }
-
-    /// Writes what the last steps changed to the journal, if the write
-    /// needs a sync, and hands it back to the replica, which releases what
-    /// waited for it. Returns whether the journal was written.
-    fn write(&mut self) -> Result<bool, String> {
-        let mut synced = false;
-        let journal = &mut self.journal;
-        self.replica.persist(|write| {
-            synced = write.sync;
-            if write.sync {
-                journal.append(write)?;
-            }
-            Ok::<(), String>(())
-        })?;
-        Ok(synced)
-    }
-
-    /// Ends a batch of steps the way the library requires: the messages
-    /// that need not wait go to `send` first, so that the other nodes'
-    /// writes overlap this one's, then the journal is written, then the
-    /// rest goes to `send`, and the replies to `replies`. Returns whether
-    /// the journal was written.
-    fn step(
-        &mut self,
-        mut send: impl FnMut(ReplicaID, KvMessage),
-        replies: &mut Vec<KvReply>,
-    ) -> Result<bool, String> {
-        for (dst, message) in self.replica.drain_messages_before_persist() {
-            send(dst, message);
-        }
-        let written = self.write()?;
-        for (dst, message) in self.replica.drain_messages() {
-            send(dst, message);
-        }
-        replies.extend(self.replica.drain_replies());
-        Ok(written)
-    }
-
-    /// Steps the node, and sends what it and its clients produced:
-    /// protocol messages to the sender thread, and replies to the node
-    /// that owns the client connection, which may be this one.
-    fn deliver(&mut self, frames: &Sender<(ReplicaID, Frame)>) {
-        let mut replies = Vec::new();
-        let send = |dst, message| {
-            let _ = frames.send((dst, Frame::Message(message)));
-        };
-        self.step(send, &mut replies)
-            .unwrap_or_else(|err| fatal(&err));
-        for reply in replies {
-            let owner = node_of(reply.client_id);
-            if owner == self.id {
-                deliver_reply(&mut self.connections, reply);
-            } else {
-                let _ = frames.send((owner, Frame::Reply(reply)));
-            }
-        }
-        for connection in self.connections.values_mut() {
-            for (dst, message) in connection.client.drain() {
-                let _ = frames.send((dst, Frame::Message(message)));
-            }
-        }
-    }
-
-    /// Steps the replica or a client with one event. Returns whether the
-    /// store is due for a persist.
-    fn handle(&mut self, event: Event) -> bool {
-        match event {
-            Event::Message(message) => self.replica.on_message(message),
-            Event::Reply(reply) => deliver_reply(&mut self.connections, reply),
-            Event::Command {
-                connection: id,
-                command,
-                respond,
-            } => {
-                let config = &self.config;
-                let connection = self.connections.entry(id).or_insert_with(|| Connection {
-                    client: Client::new(id as ClientID, config.clone()),
-                    pending: None,
-                });
-                let op = match &command {
-                    Command::Set(key, value) => Op::Put(key.clone(), value.clone()),
-                    Command::Get(key) => Op::Get(key.clone()),
-                };
-                let request_number = connection.client.on_request(op);
-                connection.pending = Some((request_number, command, respond));
-            }
-            Event::Disconnect(id) => {
-                self.connections.remove(&id);
-            }
-            Event::Tick => {
-                self.ticks += 1;
-                self.replica.on_idle();
-                if self.ticks.is_multiple_of(CLIENT_RESEND_TICKS) {
-                    for connection in self.connections.values_mut() {
-                        connection.client.on_idle();
-                    }
-                }
-                return self.ticks.is_multiple_of(FLUSH_TICKS);
-            }
-        }
-        false
-    }
-
-    /// Persists the store, which makes everything it has applied durable,
-    /// and compacts the log up to there, less the retention window. The
-    /// compaction reaches the journal with the next batch.
-    fn flush_store(&mut self) -> Result<(), String> {
-        let applied = self.replica.applied();
-        self.replica.state_machine().persist()?;
-        self.replica
-            .compact(applied.saturating_sub(self.log_retention));
-        Ok(())
-    }
-
-    /// Runs the event loop: every batch of events already queued is
-    /// stepped, and then delivered, see [`Node::step`].
-    fn run(&mut self, events: Receiver<Event>, frames: Sender<(ReplicaID, Frame)>) {
-        while let Ok(event) = events.recv() {
-            let mut flush_store = self.handle(event);
-            while let Ok(event) = events.try_recv() {
-                flush_store |= self.handle(event);
-            }
-            self.deliver(&frames);
-            if flush_store {
-                self.flush_store().unwrap_or_else(|err| fatal(&err));
-            }
-            if self.replica.view_number() != self.view {
-                self.view = self.replica.view_number();
-                println!(
-                    "view {}: primary is node {}{}",
-                    self.view,
-                    self.replica.primary_id(),
-                    if self.replica.is_primary() {
-                        " (this node)"
-                    } else {
-                        ""
-                    }
-                );
-            }
-        }
     }
 }
 
@@ -1255,11 +543,7 @@ fn main() {
         }
     };
 
-    let mut config = Config::new();
-    for _ in &args.replicas {
-        config.add_replica();
-    }
-    config.set_primary_timeout(PRIMARY_TIMEOUT);
+    let config = config(args.replicas.len());
 
     let mut node =
         Node::open(args.id, config, &args.data_dir, args.start).unwrap_or_else(|err| fatal(&err));
@@ -1289,12 +573,7 @@ fn main() {
     }
     {
         let events = events_tx.clone();
-        thread::spawn(move || loop {
-            thread::sleep(TICK);
-            if events.send(Event::Tick).is_err() {
-                break;
-            }
-        });
+        thread::spawn(move || run_timer(events, || false));
     }
     drop(events_tx);
 
@@ -1315,7 +594,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vsr_rs::Status;
+    use vsr_rs::{Client, Config, LogEntry, Status};
 
     /// A fresh directory for one node of one test.
     fn temp_dir(test: &str, id: ReplicaID) -> PathBuf {
@@ -1340,6 +619,36 @@ mod tests {
             .enumerate()
             .map(|(id, dir)| Node::open(id, config.clone(), dir, Start::Init).unwrap())
             .collect()
+    }
+
+    /// A command from a client of the primary's own node goes into the log
+    /// in the batch that took it: the step appends it, writes it, and sends
+    /// its `Prepare`s, and sends the node itself nothing.
+    #[test]
+    fn own_client_request_joins_the_batch() {
+        let dir = temp_dir("own-client", 0);
+        let mut node = Node::open(0, config(3), &dir, Start::Init).unwrap();
+        let (respond, _responses) = channel();
+        node.handle(Event::Command {
+            connection: client_id(0, node.incarnation, 0),
+            command: Command::Set("a".into(), "1".into()),
+            respond,
+        });
+        let mut sent = Vec::new();
+        let written = node
+            .step(|dst, message| sent.push((dst, message)), &mut Vec::new())
+            .unwrap();
+        assert!(written);
+        assert_eq!(1, node.replica.op_number());
+        let prepared: Vec<ReplicaID> = sent
+            .iter()
+            .filter(|(_, message)| matches!(message, Message::Prepare { op_number: 1, .. }))
+            .map(|(dst, _)| *dst)
+            .collect();
+        assert_eq!(vec![1, 2], prepared);
+        assert!(sent.iter().all(|(dst, _)| *dst != 0), "{sent:?}");
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Persists every node, then moves what the nodes and the client want
@@ -1860,8 +1169,11 @@ mod tests {
 #[cfg(test)]
 mod disk_tests {
     use super::*;
+    use fjall::PersistMode;
     use std::collections::HashSet;
+    use std::path::Path;
     use std::process::Command;
+    use vsr_rs::{Config, LogEntry, OpNumber, StateMachine};
 
     fn temp_dir(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("vsr-kvstore-{}-{test}", std::process::id()));
@@ -2379,68 +1691,5 @@ mod disk_tests {
         }
         drop(node);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-/// Power losses for the tests. A node's journal keeps every write, since
-/// it fsyncs each one; its store goes back to what it last persisted, a
-/// copy of which every `Store::persist` keeps. fjall 3.1.10 also fsyncs
-/// its journal when it recovers on open, which this model leaves out: it
-/// holds the kvstore to its own contract with the library rather than to
-/// what one version of fjall happens to do.
-#[cfg(test)]
-mod power {
-    use std::path::{Path, PathBuf};
-
-    fn durable(store: &Path) -> PathBuf {
-        store.with_extension("durable")
-    }
-
-    /// Copies a directory the store may be changing: a file or directory
-    /// it removes along the way is left out.
-    fn copy_dir(from: &Path, to: &Path) {
-        let _ = std::fs::remove_dir_all(to);
-        std::fs::create_dir_all(to).unwrap();
-        let gone = |err: std::io::Error| {
-            assert_eq!(std::io::ErrorKind::NotFound, err.kind(), "{err}");
-        };
-        let entries = match std::fs::read_dir(from) {
-            Ok(entries) => entries,
-            Err(err) => return gone(err),
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    gone(err);
-                    continue;
-                }
-            };
-            let target = to.join(entry.file_name());
-            match entry.file_type() {
-                Ok(kind) if kind.is_dir() => copy_dir(&entry.path(), &target),
-                Ok(_) => {
-                    if let Err(err) = std::fs::copy(entry.path(), target) {
-                        gone(err);
-                    }
-                }
-                Err(err) => gone(err),
-            }
-        }
-    }
-
-    /// Keeps a copy of the store at `path` as it is right after a persist.
-    pub fn record_durable(path: &Path) {
-        copy_dir(path, &durable(path));
-    }
-
-    /// Cuts the power of the node whose data is in `data_dir`, which must
-    /// be closed: its store goes back to its last persist.
-    pub fn lose_power(data_dir: &Path) {
-        let store = data_dir.join("store");
-        let _ = std::fs::remove_dir_all(&store);
-        if durable(&store).exists() {
-            copy_dir(&durable(&store), &store);
-        }
     }
 }

@@ -275,17 +275,37 @@ scripts/mutants
 
 ### Benchmark
 
-[`bench/`](bench) measures what the durable log costs. Three replicas run
-on their own threads with the event loop of the kvstore example and a
-fjall store, and a set of closed-loop clients drives them over channels.
-It compares the library as it was before the durable log, embedded from
-the commit that preceded it, with the current library with the journal
-off and on, so the cost of the new bookkeeping and the cost of the fsync
-per batch can be read apart.
+[`bench/`](bench) holds two benchmarks.
+
+`vsr-micro` measures the library alone: three replicas and a set of
+closed-loop clients in one thread, with no I/O, reporting the time the
+replicas take and the messages between them per operation, by the number
+of operations in flight. On the development machine, the library before
+the durable log (commit `0b64760`) and now, through the same loop:
+
+| ops in flight | 1 | 16 | 64 | 256 | 1,024 | 4,096 | 16,384 |
+|---|---|---|---|---|---|---|---|
+| before, ns/op | 314 | 166 | 189 | 273 | 627 | 2,152 | 9,493 |
+| now, ns/op | 463 | 155 | 143 | 147 | 169 | 186 | 214 |
+
+With one operation in flight the library now spends more on each, on the
+write it builds and on holding back what waits for it; with more, it
+spends less, and the cost no longer grows with the operations in flight.
+Messages per operation fell from four to two once several are in flight:
+a backup acknowledges a batch of `Prepare`s with one `PrepareOk`.
+
+`vsr-bench` measures what durability costs in the kvstore's event loop.
+Three kvstore nodes run in one process, each on its own thread with the
+kvstore's event loop, store, journal, and timer, with channels between
+them in place of TCP, and closed-loop clients send commands to node 0.
+It runs the nodes with the journal on and off, several times each, and
+reports the median and the spread of throughput, latency percentiles, and
+fsyncs per node per second, journal writes and store persists alike.
 
 ```console
+cargo run --release -p vsr-bench --bin vsr-micro
 cargo run --release -p vsr-bench
-CLIENTS=1,16,256 cargo run --release -p vsr-bench
+CLIENTS=1,16,256 REPEAT=5 cargo run --release -p vsr-bench
 ```
 
 ### Coverage

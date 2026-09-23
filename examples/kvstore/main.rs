@@ -16,7 +16,7 @@
 //! linearizable.
 //!
 //! Each node keeps two things on disk. The replica's log and counters go to
-//! a write-ahead log through the `writeahead` crate: a thread of its own
+//! a write-ahead log through the `writeahead` crate, whose writer thread
 //! writes what the replica changed and fsyncs once, while the event loop
 //! steps on and sends only what need not wait for the write. The store
 //! itself is a `fjall` database that never fsyncs on its own: every
@@ -642,7 +642,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vsr_rs::{Client, Config, LogEntry, LogWrite, OpNumber, Status};
+    use vsr_rs::{Client, Config, LogEntry, OpNumber, Status};
 
     /// A fresh directory for one node of one test.
     fn temp_dir(test: &str, id: ReplicaID) -> PathBuf {
@@ -699,32 +699,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The event loop's step hands a write that needs a sync to the journal
-    /// thread and steps on while it is out: the next request's `Prepare`
-    /// leaves at once, and the replies and the next write wait for the
-    /// write that holds their op to come back. A crash with that next write
-    /// out restarts from the journal without it.
+    /// Waits for the node's journal to wake it, through the channel whose
+    /// sender the test gave the node as its event loop's, and hands the
+    /// node the event. Returns what the node's batch returns.
+    fn land(
+        node: &mut Node,
+        woken: &Receiver<Event>,
+        frames: &Sender<(ReplicaID, Frame)>,
+        wake: &Sender<Event>,
+    ) -> bool {
+        let event = woken
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the write lands");
+        assert!(matches!(event, Event::Written));
+        node.batch([event], frames, wake)
+    }
+
+    /// The op numbers the node's write that is out covers.
+    fn out(node: &Node) -> Option<(OpNumber, OpNumber)> {
+        let writing = node.writing.as_ref()?;
+        Some((writing.write.entries_from, writing.write.op_number()))
+    }
+
+    /// The event loop's step sends a write that needs a sync to the journal
+    /// and steps on while it is out: the next request's `Prepare` leaves at
+    /// once, and the replies and the next write wait until the event loop
+    /// hears that the write landed.
     #[test]
     fn deliver_steps_on_while_a_write_is_out() {
         let dir = temp_dir("pipelined", 0);
         let mut node = Node::open(0, config(3), &dir, Start::Init).unwrap();
+        let (wake, woken) = channel();
         let (frames, frames_rx) = channel();
-        let (writes, writes_rx) = channel();
         let request = |node: &mut Node, connection: u64, key: &str| {
             let (respond, responses) = channel();
-            node.handle(Event::Command {
+            let command = Event::Command {
                 connection: client_id(0, node.incarnation, connection),
                 command: Command::Set(key.into(), "1".into()),
                 respond,
-            });
-            node.deliver(&frames, &writes);
+            };
+            assert!(node.batch([command], &frames, &wake));
             responses
         };
         let first_responses = request(&mut node, 0, "a");
-        let first = writes_rx.try_recv().unwrap();
-        assert_eq!(1, first.op_number());
+        assert_eq!(Some((1, 1)), out(&node));
         let second_responses = request(&mut node, 1, "b");
-        assert!(writes_rx.try_recv().is_err());
+        assert_eq!(Some((1, 1)), out(&node));
         let prepared: Vec<OpNumber> = frames_rx
             .try_iter()
             .filter_map(|(_, frame)| match frame {
@@ -735,93 +755,89 @@ mod tests {
         assert_eq!(vec![1, 1, 2, 2], prepared);
         // A backup's acknowledgement of both ops is no quorum while the
         // primary's own write is out.
-        node.handle(Event::Message(Message::PrepareOk {
+        let ack = Event::Message(Message::PrepareOk {
             view_number: 0,
             op_number: 2,
             replica_id: 1,
-        }));
-        node.deliver(&frames, &writes);
+        });
+        assert!(node.batch([ack], &frames, &wake));
         assert_eq!(0, node.replica.commit_number());
         assert!(first_responses.try_recv().is_err());
-        node.journal.as_mut().unwrap().append(&first).unwrap();
-        node.handle(Event::Written(first));
-        node.deliver(&frames, &writes);
+        assert!(land(&mut node, &woken, &frames, &wake));
         assert_eq!(1, node.replica.commit_number());
-        assert_eq!("+OK\r\n", first_responses.try_recv().unwrap());
+        assert_eq!(Ok("+OK\r\n".to_string()), first_responses.try_recv());
         assert!(second_responses.try_recv().is_err());
-        let second = writes_rx.try_recv().unwrap();
-        assert_eq!((2, 2), (second.entries_from, second.op_number()));
-        drop(node);
-        let node = Node::open(0, config(3), &dir, Start::Restart).unwrap();
-        assert_eq!(1, node.replica.op_number());
+        assert_eq!(Some((2, 2)), out(&node));
         drop(node);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The event loop stops only once the write that is out comes back.
+    /// The event loop stops only once the write that is out has landed.
     #[test]
     fn stop_waits_for_the_write_that_is_out() {
         let dir = temp_dir("stop", 0);
         let mut node = Node::open(0, config(3), &dir, Start::Init).unwrap();
+        let (wake, woken) = channel();
         let (frames, _frames_rx) = channel();
-        let (writes, writes_rx) = channel();
         let (respond, _responses) = channel();
         let command = Event::Command {
             connection: client_id(0, node.incarnation, 0),
             command: Command::Set("a".into(), "1".into()),
             respond,
         };
-        assert!(node.batch([command], &frames, &writes));
-        let write = writes_rx.try_recv().unwrap();
-        assert!(node.batch([Event::Stop], &frames, &writes));
-        node.journal.as_mut().unwrap().append(&write).unwrap();
-        assert!(!node.batch([Event::Written(write)], &frames, &writes));
-        assert!(!node.writing);
+        assert!(node.batch([command], &frames, &wake));
+        assert!(node.writing.is_some());
+        assert!(node.batch([Event::Stop], &frames, &wake));
+        assert!(!land(&mut node, &woken, &frames, &wake));
+        assert!(node.writing.is_none());
+        // One wake per write, and one that finds no write out changes
+        // nothing.
+        assert!(woken.try_recv().is_err());
+        assert!(!node.batch([Event::Written], &frames, &wake));
         drop(node);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A write out for `STALLED_WRITE_TICKS` ticks silences the node, so
     /// that the backups stop hearing from a primary whose disk stalled and
-    /// elect another. It speaks again once the write comes back.
+    /// elect another. It speaks again once the write lands.
     #[test]
     fn stalled_write_silences_the_node() {
         let dir = temp_dir("stalled", 0);
         let mut node = Node::open(0, config(3), &dir, Start::Init).unwrap();
+        let (wake, woken) = channel();
         let (frames, frames_rx) = channel();
-        let (writes, writes_rx) = channel();
         let (respond, _responses) = channel();
         let command = Event::Command {
             connection: client_id(0, node.incarnation, 0),
             command: Command::Set("a".into(), "1".into()),
             respond,
         };
-        assert!(node.batch([command], &frames, &writes));
-        let write = writes_rx.try_recv().unwrap();
+        assert!(node.batch([command], &frames, &wake));
+        assert!(node.writing.is_some());
         assert!(frames_rx.try_iter().count() > 0);
         for _ in 1..STALLED_WRITE_TICKS {
-            assert!(node.batch([Event::Tick], &frames, &writes));
+            assert!(node.batch([Event::Tick], &frames, &wake));
             assert!(frames_rx.try_iter().count() > 0);
         }
         for _ in 0..PRIMARY_TIMEOUT {
-            assert!(node.batch([Event::Tick], &frames, &writes));
+            assert!(node.batch([Event::Tick], &frames, &wake));
             assert_eq!(0, frames_rx.try_iter().count());
         }
-        node.journal.as_mut().unwrap().append(&write).unwrap();
-        assert!(node.batch([Event::Written(write)], &frames, &writes));
+        assert!(land(&mut node, &woken, &frames, &wake));
         assert!(frames_rx.try_iter().count() > 0);
         drop(node);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Three nodes stepped in batches as their event loops step them, with
-    /// the journal threads' work done in place: a node's write lands when
-    /// the test says, and stays out until then.
+    /// Three nodes stepped in batches as their event loops step them. A
+    /// node hears that its write landed when the test hands it the event
+    /// that says so, and its write stays out until then.
     struct Pipelined {
         dirs: Vec<PathBuf>,
         nodes: Vec<Node>,
         frames: Vec<(Sender<(ReplicaID, Frame)>, Receiver<(ReplicaID, Frame)>)>,
-        writes: Vec<(Sender<LogWrite<Op>>, Receiver<LogWrite<Op>>)>,
+        wakes: Vec<(Sender<Event>, Receiver<Event>)>,
         connections: u64,
     }
 
@@ -836,14 +852,14 @@ mod tests {
                 dirs,
                 nodes,
                 frames: (0..3).map(|_| channel()).collect(),
-                writes: (0..3).map(|_| channel()).collect(),
+                wakes: (0..3).map(|_| channel()).collect(),
                 connections: 0,
             }
         }
 
         fn batch(&mut self, id: ReplicaID, events: impl IntoIterator<Item = Event>) {
-            let (frames, writes) = (&self.frames[id].0, &self.writes[id].0);
-            assert!(self.nodes[id].batch(events, frames, writes));
+            let (frames, wake) = (&self.frames[id].0, &self.wakes[id].0);
+            assert!(self.nodes[id].batch(events, frames, wake));
         }
 
         /// A new client of node 0 sets `key`. Returns where its response
@@ -864,16 +880,16 @@ mod tests {
             responses
         }
 
-        /// Lands the writes of the nodes in `landing` and delivers what
-        /// every node sends, until nothing moves.
+        /// Lets the nodes in `landing` hear that their writes landed, and
+        /// delivers what every node sends, until nothing moves.
         fn settle(&mut self, landing: &[ReplicaID]) {
             loop {
                 let mut moved = false;
                 for &id in landing {
-                    if let Ok(write) = self.writes[id].1.try_recv() {
-                        let journal = self.nodes[id].journal.as_mut().unwrap();
-                        journal.append(&write).unwrap();
-                        self.batch(id, [Event::Written(write)]);
+                    if self.nodes[id].writing.is_some() {
+                        let (wake, woken) = &self.wakes[id];
+                        let node = &mut self.nodes[id];
+                        assert!(land(node, woken, &self.frames[id].0, wake));
                         moved = true;
                     }
                 }
@@ -896,25 +912,24 @@ mod tests {
             }
         }
 
-        /// Node `id` loses power: the write it has out never lands, its
-        /// store goes back to its last persist, and it restarts from its
-        /// disk.
+        /// Node `id` loses power: its store goes back to its last persist,
+        /// and it restarts from its disk.
         fn lose_power(&mut self, id: ReplicaID) {
             drop(self.nodes.remove(id));
-            self.writes[id].1.try_iter().for_each(drop);
             power::lose_power(&self.dirs[id]);
             let mut node = Node::open(id, config(3), &self.dirs[id], Start::Restart).unwrap();
             node.announce_views = false;
+            self.wakes[id] = channel();
             self.nodes.insert(id, node);
             self.batch(id, []);
         }
     }
 
-    /// Node 2's writes stay out while nodes 0 and 1 commit an op, then it
-    /// loses power with a write out: it restarts without what that write
-    /// held, and catches up.
+    /// Node 2's write lands while nodes 0 and 1 commit an op, but node 2
+    /// loses power before it hears so: it restarts with the op it never
+    /// acknowledged, and catches up.
     #[test]
-    fn pipelined_power_loss_with_a_write_out() {
+    fn pipelined_power_loss_with_a_write_unacknowledged() {
         let mut cluster = Pipelined::new("pipelined-power-loss");
         let a = cluster.set("a");
         cluster.settle(&[0, 1, 2]);
@@ -922,10 +937,11 @@ mod tests {
         let b = cluster.set("b");
         cluster.settle(&[0, 1]);
         assert_eq!(Ok("+OK\r\n".to_string()), b.try_recv());
-        assert!(cluster.nodes[2].writing);
-        assert_eq!(2, cluster.nodes[2].replica.op_number());
+        assert_eq!(Some((2, 2)), out(&cluster.nodes[2]));
+        let landed = cluster.wakes[2].1.recv_timeout(Duration::from_secs(10));
+        assert!(matches!(landed, Ok(Event::Written)));
         cluster.lose_power(2);
-        assert_eq!(1, cluster.nodes[2].replica.op_number());
+        assert_eq!(2, cluster.nodes[2].replica.op_number());
         let c = cluster.set("c");
         for _ in 0..3 {
             cluster.tick();
@@ -938,9 +954,8 @@ mod tests {
         remove_dirs(cluster.nodes, &cluster.dirs);
     }
 
-    /// The event loop, with its journal thread, answers a client of a
-    /// one-node cluster and stops on `Event::Stop`, with its journal back;
-    /// a restart finds the op in it.
+    /// The event loop answers a client of a one-node cluster and stops on
+    /// `Event::Stop`; a restart finds the op in the journal.
     #[test]
     fn run_answers_and_stops() {
         let dir = temp_dir("run", 0);
@@ -965,9 +980,7 @@ mod tests {
         let response = responses.recv_timeout(Duration::from_secs(10));
         assert_eq!(Ok("+OK\r\n".to_string()), response);
         events.send(Event::Stop).unwrap();
-        let node = running.join().unwrap();
-        assert!(node.journal.is_some());
-        drop(node);
+        drop(running.join().unwrap());
         let node = Node::open(0, config(1), &dir, Start::Restart).unwrap();
         assert_eq!(1, node.replica.op_number());
         drop(node);

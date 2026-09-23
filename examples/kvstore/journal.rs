@@ -13,10 +13,14 @@ use futures::executor::block_on;
 use futures::StreamExt;
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::path::{Path, PathBuf};
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Waker};
 use std::time::{Duration, Instant};
 use vsr_rs::{LogEntry, LogWrite, OpNumber, PersistentState};
-use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions, WriteHandle};
+use writeahead::{FileIo, RecordID, SimpleFile, WriteAhead, WriteAheadOptions, WriteHandle};
 
 /// The counters of one write.
 #[derive(Clone, Copy, Debug)]
@@ -43,7 +47,6 @@ pub struct EntryCodec<Op> {
 }
 
 pub struct Journal<Op> {
-    dir: PathBuf,
     writer: WriteHandle,
     codec: EntryCodec<Op>,
     /// The files holding the retained entries: each maps the first op
@@ -54,11 +57,65 @@ pub struct Journal<Op> {
     /// The file holding the latest write.
     last_file: u64,
     trimmed_before: u64,
-    /// Time each write spends after its fsync, as on a slower disk. The
-    /// benchmark sets it to emulate a disk with its data on a tmpfs, where
-    /// fsync costs nothing.
-    pub sync_delay: Duration,
-    _wal: WriteAhead<SimpleFile>,
+    _wal: WriteAhead<JournalFile>,
+}
+
+/// A write on its way to the journal, see [`Journal::submit`].
+pub type Landing = Pin<Box<dyn Future<Output = Result<Vec<RecordID>, String>> + Send>>;
+
+/// Nanoseconds every journal fsync in this process takes beyond the
+/// disk's, see [`set_sync_delay`].
+static SYNC_DELAY_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Makes every journal fsync in this process take `delay` longer, as on a
+/// slower disk. The benchmark sets it to emulate a disk with its data on a
+/// tmpfs, where fsync costs nothing; the kvstore leaves it at zero.
+#[allow(dead_code)]
+pub fn set_sync_delay(delay: Duration) {
+    SYNC_DELAY_NANOS.store(delay.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// The journal's files: writeahead's own, with each fsync lengthened by
+/// the delay [`set_sync_delay`] sets. The delay is spent on the thread that
+/// fsyncs, and is a spin, since a sleep this short overshoots by more than
+/// it waits.
+#[derive(Debug)]
+pub struct JournalFile(SimpleFile);
+
+impl FileIo for JournalFile {
+    fn open(path: &Path) -> anyhow::Result<Self> {
+        SimpleFile::open(path).map(JournalFile)
+    }
+
+    fn open_existing(path: &Path) -> anyhow::Result<Self> {
+        SimpleFile::open_existing(path).map(JournalFile)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.0.read_at(offset, buf)
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+        self.0.write_at(offset, data)
+    }
+
+    fn sync(&mut self) -> anyhow::Result<()> {
+        self.0.sync()?;
+        let delay = Duration::from_nanos(SYNC_DELAY_NANOS.load(Ordering::Relaxed));
+        let synced = Instant::now();
+        while synced.elapsed() < delay {
+            std::hint::spin_loop();
+        }
+        Ok(())
+    }
+
+    fn len(&self) -> anyhow::Result<u64> {
+        self.0.len()
+    }
+
+    fn set_len(&mut self, len: u64) -> anyhow::Result<()> {
+        self.0.set_len(len)
+    }
 }
 
 /// A journal and the state it replayed, if it had run before.
@@ -78,7 +135,7 @@ impl<Op: Clone> Journal<Op> {
         max_file_size: u64,
         codec: EntryCodec<Op>,
     ) -> Result<Opened<Op>, String> {
-        let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
+        let mut wal = WriteAhead::<JournalFile>::with_options(WriteAheadOptions {
             log_dir: dir.to_path_buf(),
             max_file_size,
             ..Default::default()
@@ -123,13 +180,11 @@ impl<Op: Clone> Journal<Op> {
         })?;
         drop(stream);
         let mut journal = Journal {
-            dir: dir.to_path_buf(),
             writer,
             codec,
             runs: BTreeMap::new(),
             last_file: 0,
             trimmed_before: 0,
-            sync_delay: Duration::ZERO,
             _wal: wal,
         };
         let Some((header, last_file)) = header else {
@@ -185,6 +240,16 @@ impl<Op: Clone> Journal<Op> {
     /// Appends `write` as one record, with one fsync, then deletes the
     /// files that hold nothing a replay needs any more.
     pub fn append(&mut self, write: &LogWrite<Op>) -> Result<(), String> {
+        let ids = block_on(self.submit(write))?;
+        self.finish(write, ids)
+    }
+
+    /// Starts appending `write` as one record, with one fsync, on
+    /// writeahead's writer thread, and returns the future of its landing.
+    /// The first poll sends the record, and the future wakes its waker
+    /// from that thread once the record is durable. Hand what it yields to
+    /// `finish` before the next `submit`.
+    pub fn submit(&self, write: &LogWrite<Op>) -> Landing {
         let mut record = String::new();
         for (i, entry) in write.entries.iter().enumerate() {
             let op_number = write.entries_from + i;
@@ -201,13 +266,18 @@ impl<Op: Clone> Journal<Op> {
             write.op_number(),
             u8::from(write.recovering)
         );
-        let ids = block_on(self.writer.write_batch(vec![record.into_bytes()]))
-            .map_err(|err| format!("cannot write journal: {err}"))?;
-        // A spin, since a sleep this short overshoots by more than it waits.
-        let synced = Instant::now();
-        while synced.elapsed() < self.sync_delay {
-            std::hint::spin_loop();
-        }
+        let writer = self.writer.clone();
+        Box::pin(async move {
+            writer
+                .write_batch(vec![record.into_bytes()])
+                .await
+                .map_err(|err| format!("cannot write journal: {err}"))
+        })
+    }
+
+    /// Records where `write`, which `submit` started, landed, then deletes
+    /// the files that hold nothing a replay needs any more.
+    pub fn finish(&mut self, write: &LogWrite<Op>, ids: Vec<RecordID>) -> Result<(), String> {
         self.last_file = ids.last().map(|id| id.file_id).unwrap_or(self.last_file);
         // The replaced entries no longer pin their files; the new ones pin
         // this one, and the compacted ones leave the first run.
@@ -234,16 +304,12 @@ impl<Op: Clone> Journal<Op> {
             .first_key_value()
             .map_or(self.last_file, |(_, file)| (*file).min(self.last_file));
         if oldest > self.trimmed_before {
-            let stats = block_on(self.writer.trim_before(oldest))
-                .map_err(|err| format!("cannot trim journal: {err}"))?;
-            if stats.files_deleted > 0 {
-                log::debug!(
-                    "journal {}: deleted {} files, {} bytes",
-                    self.dir.display(),
-                    stats.files_deleted,
-                    stats.bytes_reclaimed
-                );
-            }
+            // Sent, not awaited: the writer deletes the files once the
+            // writes queued ahead of it are done, and logs what fails,
+            // while the caller goes on. A crash before then leaves files a
+            // later trim deletes.
+            let mut trim = std::pin::pin!(self.writer.trim_before(oldest));
+            let _ = trim.as_mut().poll(&mut Context::from_waker(Waker::noop()));
             self.trimmed_before = oldest;
         }
         Ok(())

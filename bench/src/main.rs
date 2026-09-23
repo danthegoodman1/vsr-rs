@@ -8,10 +8,9 @@
 //! to node 0 the way the kvstore's client connections do, each waiting for
 //! its reply before it sends the next. Two configurations:
 //!
-//! - `journal`: the kvstore as it runs: a journal thread that writes and
-//!   fsyncs what the replica changed more than the commit number, one
-//!   write at a time while the event loop steps on, and a store persist
-//!   every second.
+//! - `journal`: the kvstore as it runs: a journal write and fsync of what
+//!   the replica changed more than the commit number, one write at a time
+//!   while the event loop steps on, and a store persist every second.
 //! - `no-journal`: the same with the journal off. The difference is what
 //!   the journal costs.
 //!
@@ -147,9 +146,6 @@ impl Cluster {
             };
             node.journaled = journaled;
             node.announce_views = false;
-            if let Some(journal) = node.journal.as_mut() {
-                journal.sync_delay = emulation.fsync;
-            }
             cluster.stats.push(node.stats.clone());
             let (events, events_rx) = channel();
             let (timer_events, stop) = (events.clone(), stop.clone());
@@ -463,6 +459,7 @@ fn main() {
         network: micros("NET_US"),
         fsync: micros("FSYNC_US"),
     };
+    journal::set_sync_delay(emulation.fsync);
     std::fs::create_dir_all(&data).expect("data directory");
     println!(
         "{REPLICAS} kvstore nodes on their own threads, channels between them, data in {}; median of {repeat} runs of {}s",

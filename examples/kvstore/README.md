@@ -57,20 +57,20 @@ Each node keeps its data in `kvstore-node-N`, or the directory given with
 `--data`:
 
 - `journal/` holds the replica's log and counters, in a write-ahead log
-  from the `writeahead` crate, see [`journal.rs`](journal.rs). A thread of
-  its own appends each of the replica's writes and fsyncs once, while the
-  event loop steps on. After every batch of events the loop sends the
-  messages that need not wait for a write, the `Prepare`s above all, and
-  the replies ready so far; what a write held back goes out once it comes
-  back, and the next write, with everything the batches since changed,
-  goes out then. A write that stays out for two ticks means a stalled
-  disk: the node sends nothing until it comes back, so that the others
-  elect a new primary instead of waiting on this one. A write is one
-  checksummed record: the log entries that changed, and the counters,
-  which say how far the log is compacted and from which op number the
-  entries replace what came before. A torn write fails the checksum, and
-  recovery drops it whole. A write that changed only the commit number is
-  not written.
+  from the `writeahead` crate, see [`journal.rs`](journal.rs). The crate's
+  writer thread appends each of the replica's writes and fsyncs once, and
+  wakes the event loop when it is done; the loop steps on meanwhile. After
+  every batch of events the loop sends the messages that need not wait for
+  a write, the `Prepare`s above all, and the replies ready so far; what a
+  write held back goes out once it comes back, and the next write, with
+  everything the batches since changed, goes out then. A write that stays
+  out for two ticks means a stalled disk: the node sends nothing until it
+  comes back, so that the others elect a new primary instead of waiting on
+  this one. A write is one checksummed record: the log entries that
+  changed, and the counters, which say how far the log is compacted and
+  from which op number the entries replace what came before. A torn write
+  fails the checksum, and recovery drops it whole. A write that changed
+  only the commit number is not written.
 - `store/` is a `fjall` database with the keys and values, the client
   table, and the number of operations applied, all written in the same
   batch as each operation, and the number of times the node has started,

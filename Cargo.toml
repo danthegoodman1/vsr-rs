@@ -13,6 +13,7 @@ members = ["bench", "simulator"]
 log = "0.4.17"
 
 [dev-dependencies]
+anyhow = "1"
 env_logger = "0.9.1"
 # The kvstore example persists the replica's log with writeahead and its
 # state with fjall.

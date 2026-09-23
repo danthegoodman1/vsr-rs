@@ -71,8 +71,9 @@ You provide the rest:
 - **Persistence.** After each step, before delivering what the step
   produced, write what `PersistentState` describes: a few counters, the
   client table, and the log entries from the change marker on. Pass it to
-  `Replica::restart` when the replica restarts, with the number of ops the
-  state machine had made durable; the replica applies the rest again. That
+  `Replica::restart` when the replica restarts, with a state machine made
+  durable as of the ops it had applied; the replica applies the rest
+  again. That
   ordering is the whole durability argument: an acknowledgement leaves only
   after the entry it covers is on disk, and the replica executes committed
   operations only when its replies are drained, after the step is
@@ -169,14 +170,14 @@ For a complete program, [`examples/kvstore`](examples/kvstore) is a
 replicated key-value store over TCP that speaks a Redis-like protocol. It
 persists the replica's log with the `writeahead` crate, one fsync per batch
 of events, and keeps the store in a `fjall` database that is persisted once
-a second, after which the log is compacted. Start three nodes, each in its
-own terminal:
+a second, after which the log is compacted. Start three nodes of a new
+cluster, each in its own terminal:
 
 ```console
 cargo build --example kvstore
-./target/debug/examples/kvstore --id 0 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6379
-./target/debug/examples/kvstore --id 1 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6380
-./target/debug/examples/kvstore --id 2 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6381
+./target/debug/examples/kvstore --init --id 0 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6379
+./target/debug/examples/kvstore --init --id 1 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6380
+./target/debug/examples/kvstore --init --id 2 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6381
 ```
 
 Talk to any of them:
@@ -191,17 +192,17 @@ bar
 ```
 
 Stop node 0 with Ctrl-C, or kill it. The others pick a new primary within
-a second and keep serving. Start node 0 again and it comes back from its
-disk and rejoins as a backup. Kill all three and start them again, and
-they come back with everything they had committed.
+a second and keep serving. Start node 0 again, without `--init`, and it
+comes back from its disk and rejoins as a backup. Kill all three and start
+them again, and they come back with everything they had committed.
 
 ## Verification
 
-To run the integration tests, type:
-
+To run the integration tests, the simulator's tests, and the kvstore
+example's, type:
 
 ```console
-cargo test --workspace
+cargo test --workspace --all-targets
 ```
 
 ### Simulator
@@ -210,19 +211,26 @@ cargo test --workspace
 TigerBeetle's VOPR. It runs a cluster and its clients in one thread, passes
 every message through a network that loses, replays, and delays them,
 crashes and restarts replicas, sometimes from what they persisted after a
-power loss, sometimes with their disk wiped, cuts the power of every
-replica at once, or of a replica between sending what need not wait and
-persisting the step, makes state machines flush and replicas compact
-their logs, and checks a set of safety properties after every tick:
+power loss, sometimes after their process died with a state machine
+ahead of its last flush, sometimes with their disk wiped, cuts the power
+of every replica at once, or of a replica between sending what need not
+wait and persisting the step, makes state machines flush and replicas
+compact their logs, and checks a set of safety properties after every
+tick:
 
 - committed prefixes agree on every replica,
-- committed operations survive on enough replicas,
+- committed operations survive on enough disks,
 - every reply matches a committed request,
 - no request runs twice.
 
+It also checks every message as it leaves: a replica acknowledges an op,
+takes part in a view change, or answers a recovery only with state its
+disk holds.
+
 Each replica has a disk that the simulator writes the way an owner would,
-from the change marker after every step, and a replica that lost power
-is rebuilt from it.
+from the change marker after every step. A replica that loses power loses
+its memory at once, with any step it had not yet written, and is rebuilt
+from its disk.
 
 The seed determines the whole configuration, from cluster size to fault
 rates. Once the requests are done, faults stop and a random majority of
@@ -248,6 +256,15 @@ to reproduce whatever failed:
 scripts/simulate --budget 1h
 scripts/simulate --report          # the runs of the current commit
 scripts/simulate --report --all    # every commit ever run
+```
+
+To check that the simulator catches persistence bugs, `scripts/mutants`
+plants each of a few known ones in a scratch copy, such as an
+acknowledgement sent before its write, and reports how many of 400 seeds
+catch it:
+
+```console
+scripts/mutants
 ```
 
 ### Benchmark

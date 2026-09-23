@@ -18,6 +18,7 @@
 //!    replica must end up with the same fully committed log, within
 //!    `ticks_max_convergence` ticks.
 
+pub mod disk;
 pub mod network;
 pub mod properties;
 pub mod state_machine;
@@ -28,11 +29,9 @@ use log::{debug, info, trace};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::fmt;
-use vsr_rs::{
-    Client, ClientRecord, Config, LogEntry, OpNumber, PersistentState, Replica, Reply,
-    RequestNumber,
-};
+use vsr_rs::{Client, Config, LogEntry, Replica, Reply, RequestNumber};
 
+use disk::{Disk, PowerLossOdds, Step};
 use network::Network;
 pub use network::{message_kind, Envelope, MessageSummary, NetworkOptions, Origin};
 use std::collections::BTreeSet;
@@ -46,6 +45,13 @@ pub enum Fault {
     Crash(usize),
     /// Cut a replica's power: it loses its memory and keeps its disk.
     PowerLoss(usize),
+    /// Kill a replica's process: it loses its memory, its disk keeps
+    /// every write, and its state machine keeps some of what it applied
+    /// since its last flush, which the owner makes durable.
+    ProcessCrash(usize),
+    /// Cut a replica's power in its next step, after it sent what need not
+    /// wait and before it persisted the step.
+    LoseStep(usize),
     /// Cut the power of every replica at once.
     Blackout,
     /// Bring a crashed replica back: with its memory after a crash, from
@@ -69,6 +75,8 @@ impl fmt::Display for Fault {
         match self {
             Fault::Crash(id) => write!(f, "crash {id}"),
             Fault::PowerLoss(id) => write!(f, "power-loss {id}"),
+            Fault::ProcessCrash(id) => write!(f, "process-crash {id}"),
+            Fault::LoseStep(id) => write!(f, "lose-step {id}"),
             Fault::Blackout => write!(f, "blackout"),
             Fault::Restart(id) => write!(f, "restart {id}"),
             Fault::Flush(id) => write!(f, "flush {id}"),
@@ -96,6 +104,8 @@ impl FromStr for Fault {
         match name {
             "crash" => Ok(Fault::Crash(id(&mut words)?)),
             "power-loss" => Ok(Fault::PowerLoss(id(&mut words)?)),
+            "process-crash" => Ok(Fault::ProcessCrash(id(&mut words)?)),
+            "lose-step" => Ok(Fault::LoseStep(id(&mut words)?)),
             "blackout" => Ok(Fault::Blackout),
             "restart" => Ok(Fault::Restart(id(&mut words)?)),
             "flush" => Ok(Fault::Flush(id(&mut words)?)),
@@ -182,6 +192,9 @@ pub struct Snapshot {
     pub restarts: usize,
     pub reboots: usize,
     pub power_losses: usize,
+    pub process_crashes: usize,
+    pub lost_steps: usize,
+    pub lost_writes: usize,
     pub flushes: usize,
     pub network: MessageSummary,
 }
@@ -226,6 +239,12 @@ pub struct Options {
     /// Probability per crash that it is a power loss: the replica comes
     /// back from what it persisted, having lost its memory.
     pub replica_power_loss_probability: f64,
+    /// Probability that a crash that leaves the power on kills the process
+    /// rather than pausing it: the replica comes back from what it
+    /// persisted, having lost its memory, with its state machine somewhere
+    /// between its last flush and what it had applied, made durable by the
+    /// owner.
+    pub replica_process_crash_probability: f64,
     /// Probability per tick that every replica loses power at once.
     pub blackout_probability: f64,
     /// Probability per tick that a running replica's state machine flushes
@@ -239,7 +258,9 @@ pub struct Options {
     /// Probability per step that a replica loses power after sending the
     /// messages that need not wait for the step to be persisted, and
     /// before persisting it: what it sent is out, and its disk holds the
-    /// state before the step.
+    /// state before the step. A replica takes up to two steps a tick: what
+    /// it did before the deliveries, a restart, a compaction, or its idle
+    /// logic, and the deliveries.
     pub step_power_loss_probability: f64,
     /// Log entries a replica keeps behind what its state machine has
     /// flushed, so that replicas a little behind catch up from the log
@@ -294,6 +315,7 @@ impl Options {
             log_retention: prng.gen_range(0..=50),
             full_core: false,
             primary_timeout,
+            replica_process_crash_probability: f64::from(prng.gen_range(0..=100)) / 100.0,
         }
     }
 
@@ -339,6 +361,10 @@ impl Options {
             (
                 "replica_power_loss_probability",
                 self.replica_power_loss_probability,
+            ),
+            (
+                "replica_process_crash_probability",
+                self.replica_process_crash_probability,
             ),
             ("blackout_probability", self.blackout_probability),
             ("replica_flush_probability", self.replica_flush_probability),
@@ -455,6 +481,11 @@ impl fmt::Display for Options {
         )?;
         writeln!(
             f,
+            "          replica_process_crash_probability={}",
+            self.replica_process_crash_probability
+        )?;
+        writeln!(
+            f,
             "          blackout_probability={}",
             self.blackout_probability
         )?;
@@ -525,17 +556,31 @@ pub struct Simulator {
     pub restarts: usize,
     /// Number of restarts that lost the replica's memory.
     pub reboots: usize,
-    /// Number of crashes that were power losses, and of state machine
-    /// flushes.
+    /// Number of crashes that were power losses, process crashes, and of
+    /// state machine flushes.
     pub power_losses: usize,
+    pub process_crashes: usize,
+    /// Number of process crashes that left the state machine ahead of the
+    /// commit number on disk, so that the restart compacted the log.
+    pub process_crashes_ahead: usize,
     pub flushes: usize,
+    /// Number of steps a power loss cut off before they were persisted,
+    /// and of those that left the disk behind the replica's memory in more
+    /// than the commit number.
+    pub lost_steps: usize,
+    pub lost_writes: usize,
     config: Config,
-    /// Each replica's disk, written before its messages are sent, as the
-    /// library requires.
+    /// Each replica's disk, which it writes the way an owner does, see
+    /// [`Disk::step`].
     disks: Vec<Disk>,
-    /// How each crashed replica went down, which decides what it comes
-    /// back with.
+    /// How each crashed replica went down. One that lost power was rebuilt
+    /// from its disk at once, and a later power loss changes nothing.
     crash_kind: Vec<CrashKind>,
+    /// Whether each replica has stepped since its last write: its memory
+    /// may be ahead of its disk, and a power loss loses the step.
+    stepped: Vec<bool>,
+    /// Replicas that lose power in their next step, by script.
+    lose_step: BTreeSet<usize>,
     /// Every op committed so far, see `SimContext::committed`.
     committed: Vec<LogEntry<Op>>,
     /// Whether each replica is up.
@@ -598,10 +643,16 @@ impl Simulator {
             restarts: 0,
             reboots: 0,
             power_losses: 0,
+            process_crashes: 0,
+            process_crashes_ahead: 0,
             flushes: 0,
+            lost_steps: 0,
+            lost_writes: 0,
             config,
-            disks: (0..replica_count).map(|_| Disk::new()).collect(),
+            disks: vec![Disk::default(); replica_count],
             crash_kind: vec![CrashKind::Pause; replica_count],
+            stepped: vec![false; replica_count],
+            lose_step: BTreeSet::new(),
             committed: Vec::new(),
             replicas,
             clients,
@@ -712,6 +763,10 @@ impl Simulator {
         match fault {
             Fault::Crash(id) => self.crash_replica(id, CrashKind::Pause),
             Fault::PowerLoss(id) => self.crash_replica(id, CrashKind::PowerLoss),
+            Fault::ProcessCrash(id) => self.crash_replica(id, CrashKind::ProcessCrash),
+            Fault::LoseStep(id) => {
+                self.lose_step.insert(id);
+            }
             Fault::Blackout => {
                 for id in 0..self.replicas.len() {
                     self.crash_replica(id, CrashKind::PowerLoss);
@@ -720,17 +775,12 @@ impl Simulator {
             }
             Fault::Restart(id) => {
                 if !self.replica_up[id] {
-                    if self.crash_kind[id] == CrashKind::PowerLoss {
-                        self.restart_replica_from_disk(id);
-                    }
-                    self.replica_up[id] = true;
-                    self.restarts += 1;
+                    self.bring_up(id);
                 }
             }
             Fault::Reboot(id) => {
                 self.reboot_replica(id);
-                self.replica_up[id] = true;
-                self.restarts += 1;
+                self.bring_up(id);
             }
             Fault::Flush(id) => self.flush_replica(id),
             Fault::Partition(id) => {
@@ -742,8 +792,11 @@ impl Simulator {
             Fault::HealAll => self.partitioned.clear(),
         }
         // The replica's own crash timer starts over.
-        if let Fault::Crash(id) | Fault::PowerLoss(id) | Fault::Restart(id) | Fault::Reboot(id) =
-            fault
+        if let Fault::Crash(id)
+        | Fault::PowerLoss(id)
+        | Fault::ProcessCrash(id)
+        | Fault::Restart(id)
+        | Fault::Reboot(id) = fault
         {
             self.replica_stable_until[id] = self.ticks;
         }
@@ -764,24 +817,8 @@ impl Simulator {
         Snapshot {
             tick: self.ticks,
             phase: self.phase,
-            replicas: self
-                .replicas
-                .iter()
-                .enumerate()
-                .map(|(id, replica)| ReplicaSnapshot {
-                    id,
-                    up: self.replica_up[id],
-                    partitioned: self.partitioned.contains(&id),
-                    in_core: self.core.contains(&id),
-                    status: replica.status(),
-                    is_primary: replica.is_primary(),
-                    view_number: replica.view_number(),
-                    op_number: replica.op_number(),
-                    commit_number: replica.commit_number(),
-                    applied: replica.applied(),
-                    log_start: replica.log_start(),
-                    value: replica.state_machine().value,
-                })
+            replicas: (0..self.replicas.len())
+                .map(|id| self.replica_snapshot(id))
                 .collect(),
             clients: self
                 .clients
@@ -801,18 +838,60 @@ impl Simulator {
             restarts: self.restarts,
             reboots: self.reboots,
             power_losses: self.power_losses,
+            process_crashes: self.process_crashes,
+            lost_steps: self.lost_steps,
+            lost_writes: self.lost_writes,
             flushes: self.flushes,
             network: self.network.summary.clone(),
         }
     }
 
+    /// Replica `id` as seen from outside: its memory, or its disk while it
+    /// is down after a power loss, which is all it has then.
+    fn replica_snapshot(&self, id: usize) -> ReplicaSnapshot {
+        let replica = &self.replicas[id];
+        let mut snapshot = ReplicaSnapshot {
+            id,
+            up: self.replica_up[id],
+            partitioned: self.partitioned.contains(&id),
+            in_core: self.core.contains(&id),
+            status: replica.status(),
+            is_primary: replica.is_primary(),
+            view_number: replica.view_number(),
+            op_number: replica.op_number(),
+            commit_number: replica.commit_number(),
+            applied: replica.applied(),
+            log_start: replica.log_start(),
+            value: replica.state_machine().value,
+        };
+        if !self.replica_up[id] && self.crash_kind[id] != CrashKind::Pause {
+            let disk = &self.disks[id];
+            let state = &disk.state;
+            snapshot.status = if state.recovering {
+                Status::Recovering
+            } else if state.last_normal_view < state.view_number {
+                Status::ViewChange
+            } else {
+                Status::Normal
+            };
+            snapshot.is_primary = self.config.primary_id(state.view_number) == id;
+            snapshot.view_number = state.view_number;
+            snapshot.op_number = state.log_start + state.log.len();
+            snapshot.commit_number = state.commit_number;
+            snapshot.applied = disk.applied;
+            snapshot.log_start = state.log_start;
+            snapshot.value = disk.state_machine.value;
+        }
+        snapshot
+    }
+
     /// Replaces a replica with one that lost its memory and its disk, all
-    /// but the view number, and is recovering.
+    /// but the view number, and is recovering. It comes up at once.
     fn reboot_replica(&mut self, id: usize) {
         debug!("tick {}: replica {id} reboots with no memory", self.ticks);
         let nonce = self.prng.gen::<u64>();
         let view_number = self.disks[id].state.view_number;
-        self.disks[id] = Disk::new();
+        self.disks[id] = Disk::for_recovery(view_number);
         self.replicas[id] = Replica::recover(
             id,
             self.config.clone(),
@@ -820,72 +899,84 @@ impl Simulator {
             view_number,
             nonce,
         );
+        self.crash_kind[id] = CrashKind::PowerLoss;
         for property in &mut self.properties {
             property.on_restart(id);
         }
         self.reboots += 1;
     }
 
-    /// Replaces a replica with one rebuilt from its disk, as after a power
-    /// loss. The disk holds exactly what the replica would have persisted,
-    /// which checks the change marker the disk was kept from, unless the
-    /// power went out after a checkpoint and before the step was written.
-    fn restart_replica_from_disk(&mut self, id: usize) {
-        debug!("tick {}: replica {id} restarts from its disk", self.ticks);
-        let disk = &self.disks[id];
-        let before = self.replicas[id].persistent_state();
-        // The disk holds what the replica persisted, with the commit
-        // number possibly behind, unless the last step was lost.
-        let lost_last_step = disk.state.view_number != before.view_number
-            || disk.state.log != before.log
-            || disk.state.log_start != before.log_start;
-        if !lost_last_step {
-            assert_eq!(
-                PersistentState {
-                    commit_number: before.commit_number,
-                    client_table: before.client_table.clone(),
-                    ..disk.state.clone()
-                },
-                before,
-                "tick {}: disk of replica {id} differs from its state",
+    /// Brings a crashed replica back up, with what it kept: its memory
+    /// after a pause, what its owner rebuilt from its disk after a power
+    /// loss. The rebuilt replica's restart is a step, which it persists
+    /// before it sends anything.
+    fn bring_up(&mut self, id: usize) {
+        debug!("tick {}: replica {id} restarts", self.ticks);
+        self.replica_up[id] = true;
+        self.stepped[id] |= self.crash_kind[id] != CrashKind::Pause;
+        self.restarts += 1;
+    }
+
+    /// Takes a replica down. A running replica stops; one that loses power
+    /// or whose process dies loses its memory too, running or paused, and
+    /// its owner rebuilds it from its disk. A process crash leaves the
+    /// state machine anywhere between its last flush and what it had
+    /// applied, which the owner makes durable before the rebuild.
+    fn crash_replica(&mut self, id: usize, kind: CrashKind) {
+        if self.replica_up[id] {
+            debug!("tick {}: replica {id} crashes ({kind:?})", self.ticks);
+            self.replica_up[id] = false;
+            self.crash_kind[id] = CrashKind::Pause;
+            self.crashes += 1;
+        } else if self.crash_kind[id] != CrashKind::Pause {
+            return;
+        }
+        match kind {
+            CrashKind::Pause => return,
+            CrashKind::PowerLoss => self.power_losses += 1,
+            CrashKind::ProcessCrash => {
+                self.process_crashes += 1;
+                let op_number = self
+                    .prng
+                    .gen_range(self.disks[id].applied..=self.replicas[id].applied());
+                self.disks[id].flush_up_to(&self.replicas[id], op_number);
+                if op_number > self.disks[id].state.commit_number {
+                    self.process_crashes_ahead += 1;
+                }
+            }
+        }
+        self.lose_power(id);
+        self.crash_kind[id] = kind;
+    }
+
+    /// Replaces a replica's memory with what its owner rebuilds from its
+    /// disk, after a power loss or a process crash. The disk holds what the replica does, but for the commit
+    /// number, unless the replica has stepped since its last write, and
+    /// the power loss loses that step.
+    fn lose_power(&mut self, id: usize) {
+        let behind = !self.disks[id].matches(&self.replicas[id]);
+        if std::mem::take(&mut self.stepped[id]) {
+            self.lost_steps += 1;
+            if behind {
+                self.lost_writes += 1;
+            }
+        } else {
+            assert!(
+                !behind,
+                "tick {}: disk of replica {id} differs from its memory",
                 self.ticks
             );
         }
+        let commit_number = self.replicas[id].commit_number();
         let nonce = self.prng.gen::<u64>();
-        // The client table comes back from the state machine's flush, as
-        // of what it had applied then; the replica fills in the rest.
-        let state = PersistentState {
-            client_table: disk.client_table.clone(),
-            ..disk.state.clone()
-        };
-        self.replicas[id] = Replica::restart(
-            id,
-            self.config.clone(),
-            disk.state_machine.clone(),
-            disk.applied,
-            state,
-            nonce,
-        );
+        self.replicas[id] = self.disks[id].restart(id, self.config.clone(), nonce);
+        self.crash_kind[id] = CrashKind::PowerLoss;
         // What the properties tracked about the replica in memory may be
         // ahead of what it came back with.
-        if self.replicas[id].commit_number() < before.commit_number {
+        if self.replicas[id].commit_number() < commit_number {
             for property in &mut self.properties {
                 property.on_restart(id);
             }
-        }
-    }
-
-    /// Takes a running replica down.
-    fn crash_replica(&mut self, id: usize, kind: CrashKind) {
-        if !self.replica_up[id] {
-            return;
-        }
-        debug!("tick {}: replica {id} crashes ({kind:?})", self.ticks);
-        self.replica_up[id] = false;
-        self.crash_kind[id] = kind;
-        self.crashes += 1;
-        if kind == CrashKind::PowerLoss {
-            self.power_losses += 1;
         }
     }
 
@@ -900,6 +991,7 @@ impl Simulator {
         self.disks[id].flush(replica);
         let durable = self.disks[id].applied;
         replica.compact(durable.saturating_sub(self.options.log_retention));
+        self.stepped[id] = true;
         trace!(
             "tick {}: replica {id} flushed {durable} ops, log starts after {}",
             self.ticks,
@@ -940,7 +1032,7 @@ impl Simulator {
         self.tick_crash();
         self.tick_flush();
         self.tick_heartbeat();
-        self.tick_network();
+        self.tick_network()?;
         self.record_committed()?;
         self.check_properties()?;
         self.ticks += 1;
@@ -968,21 +1060,15 @@ impl Simulator {
         // itself, and it needs a quorum of answers for that. The protocol
         // tolerates f failures and a recovering replica is one, so the core
         // must hold a quorum of replicas that are not recovering: draw
-        // those first, then fill up at random. A replica that lost power
-        // is what its disk says it is, which is what it restarts as.
+        // those first, then fill up at random.
         let mut candidates: Vec<usize> = (0..replica_count).collect();
         for i in (1..replica_count).rev() {
             let j = self.prng.gen_range(0..=i);
             candidates.swap(i, j);
         }
-        let (mut core, recovering): (Vec<usize>, Vec<usize>) =
-            candidates.into_iter().partition(|&id| {
-                if !self.replica_up[id] && self.crash_kind[id] == CrashKind::PowerLoss {
-                    !self.disks[id].state.recovering
-                } else {
-                    !self.replicas[id].is_recovering()
-                }
-            });
+        let (mut core, recovering): (Vec<usize>, Vec<usize>) = candidates
+            .into_iter()
+            .partition(|&id| !self.replicas[id].is_recovering());
         assert!(core.len() >= quorum);
         // The first quorum of healthy replicas is in. The remaining slots
         // are filled from the other healthy ones and the recovering ones
@@ -999,14 +1085,9 @@ impl Simulator {
         for id in 0..replica_count {
             let in_core = core.contains(&id);
             if in_core && !self.replica_up[id] {
-                if self.crash_kind[id] == CrashKind::PowerLoss {
-                    self.restart_replica_from_disk(id);
-                }
-                self.replica_up[id] = true;
-                self.restarts += 1;
-            } else if !in_core && self.replica_up[id] {
-                self.replica_up[id] = false;
-                self.crashes += 1;
+                self.bring_up(id);
+            } else if !in_core {
+                self.crash_replica(id, CrashKind::Pause);
             }
         }
         debug!(
@@ -1039,6 +1120,7 @@ impl Simulator {
         let ctx = Self::context(
             self.ticks,
             &self.replicas,
+            &self.disks,
             &self.committed,
             &self.replies,
             &self.core,
@@ -1107,6 +1189,11 @@ impl Simulator {
                         .gen_bool(self.options.replica_power_loss_probability)
                     {
                         CrashKind::PowerLoss
+                    } else if self
+                        .prng
+                        .gen_bool(self.options.replica_process_crash_probability)
+                    {
+                        CrashKind::ProcessCrash
                     } else {
                         CrashKind::Pause
                     };
@@ -1126,14 +1213,9 @@ impl Simulator {
                 let f = (self.replicas.len() - 1) / 2;
                 if recovering < f && self.prng.gen_bool(self.options.replica_reboot_probability) {
                     self.reboot_replica(id);
-                } else if self.crash_kind[id] == CrashKind::PowerLoss {
-                    self.restart_replica_from_disk(id);
-                } else {
-                    debug!("tick {}: replica {id} restarts", self.ticks);
                 }
-                self.replica_up[id] = true;
+                self.bring_up(id);
                 self.replica_stable_until[id] = self.ticks + self.options.replica_restart_stability;
-                self.restarts += 1;
             }
         }
         if self.options.blackout_probability > 0.0
@@ -1164,6 +1246,7 @@ impl Simulator {
             for (id, replica) in self.replicas.iter_mut().enumerate() {
                 if self.replica_up[id] {
                     replica.on_idle();
+                    self.stepped[id] = true;
                 }
             }
             for client in &mut self.clients {
@@ -1175,8 +1258,8 @@ impl Simulator {
     /// Hands everything the replicas and clients want sent to the network,
     /// delivers what is due this tick, and hands over what those deliveries
     /// produced, which the network delivers from the next tick on.
-    fn tick_network(&mut self) {
-        self.flush();
+    fn tick_network(&mut self) -> Result<()> {
+        self.flush()?;
         for envelope in self.network.take_due(self.ticks) {
             let Envelope {
                 from, to, message, ..
@@ -1193,89 +1276,95 @@ impl Simulator {
             }
             debug!("tick {}: deliver {message:?} to {to}", self.ticks);
             self.replicas[to].on_message(message);
+            self.stepped[to] = true;
         }
-        self.flush();
+        self.flush()
     }
 
-    /// Moves the replicas' and clients' outgoing messages into the network
-    /// and delivers the replicas' replies to the clients.
-    fn flush(&mut self) {
-        let Simulator {
-            replicas,
-            clients,
-            client_inflight,
-            replies,
-            requests_replied,
-            network,
-            prng,
-            ticks,
-            disks,
-            replica_up,
-            crash_kind,
-            replica_stable_until,
-            crashes,
-            power_losses,
-            options,
-            liveness_mode,
-            ..
-        } = self;
-        for (id, replica) in replicas.iter_mut().enumerate() {
-            // The messages that promise nothing about the replica's durable
-            // state go out first, then the step is persisted, then the
-            // rest. A replica may lose power in between: after a
-            // checkpoint it restored is durable, or in any step at all.
-            // What the step produced besides the early messages is then
-            // lost with it.
-            for (dst, msg) in replica.drain_messages_before_persist() {
-                network.send(*ticks, Origin::Replica(id), dst, msg, prng);
-            }
-            let (checkpoint_power_loss, step_power_loss) = if *liveness_mode {
-                (0.0, 0.0)
-            } else {
-                (
-                    options.checkpoint_power_loss_probability,
-                    options.step_power_loss_probability,
-                )
-            };
-            if disks[id].persist(replica, prng, checkpoint_power_loss, step_power_loss) {
-                debug!("tick {ticks}: replica {id} loses power before persisting the step");
-                replica_up[id] = false;
-                crash_kind[id] = CrashKind::PowerLoss;
-                replica_stable_until[id] = *ticks + options.replica_crash_stability;
-                *crashes += 1;
-                *power_losses += 1;
-                replica.drain_messages().for_each(drop);
-                replica.drain_replies().for_each(drop);
+    /// Ends the step of every running replica the way its owner does, see
+    /// [`Disk::step`]: moves its outgoing messages into the network and
+    /// delivers its replies to the clients. A replica that stepped may
+    /// lose power before its write. Then moves the clients' messages into
+    /// the network.
+    fn flush(&mut self) -> Result<()> {
+        let mut sent = Vec::new();
+        let mut replies = Vec::new();
+        for id in 0..self.replicas.len() {
+            if !self.replica_up[id] {
                 continue;
             }
-            for (dst, msg) in replica.drain_messages() {
-                network.send(*ticks, Origin::Replica(id), dst, msg, prng);
+            let stepped = self.stepped[id];
+            let odds = if stepped && self.lose_step.remove(&id) {
+                PowerLossOdds::certain()
+            } else if stepped && !self.liveness_mode {
+                PowerLossOdds {
+                    after_checkpoint: self.options.checkpoint_power_loss_probability,
+                    otherwise: self.options.step_power_loss_probability,
+                }
+            } else {
+                PowerLossOdds::default()
+            };
+            let properties = &mut self.properties;
+            let send = |disk: &_, replica: &_, to, message| {
+                for property in properties.iter_mut() {
+                    property
+                        .on_send(id, replica, disk, &message)
+                        .with_context(|| format!("property '{}' failed", property.name()))?;
+                }
+                sent.push((to, message));
+                Ok(())
+            };
+            let step = self.disks[id]
+                .step(
+                    &mut self.replicas[id],
+                    &mut self.prng,
+                    odds,
+                    send,
+                    &mut replies,
+                )
+                .with_context(|| format!("tick {}", self.ticks))?;
+            for (to, message) in sent.drain(..) {
+                self.network
+                    .send(self.ticks, Origin::Replica(id), to, message, &mut self.prng);
             }
-            for reply in replica.drain_replies() {
-                debug!("tick {ticks}: reply {reply:?}");
+            if step == Step::PowerLost {
+                debug!(
+                    "tick {}: replica {id} loses power before persisting the step",
+                    self.ticks
+                );
+                self.crash_replica(id, CrashKind::PowerLoss);
+                self.replica_stable_until[id] = self.ticks + self.options.replica_crash_stability;
+                continue;
+            }
+            self.stepped[id] = false;
+            for reply in replies.drain(..) {
+                debug!("tick {}: reply {reply:?}", self.ticks);
                 // A reply completes the request its client is waiting for.
                 // Any other reply is a duplicate, which the properties still
                 // check.
-                clients[reply.client_id].on_reply(reply.request_number, reply.view_number);
-                let inflight = &mut client_inflight[reply.client_id];
+                self.clients[reply.client_id].on_reply(reply.request_number, reply.view_number);
+                let inflight = &mut self.client_inflight[reply.client_id];
                 if *inflight == Some(reply.request_number) {
                     *inflight = None;
-                    *requests_replied += 1;
+                    self.requests_replied += 1;
                 }
-                replies.push(reply);
+                self.replies.push(reply);
             }
         }
-        for (id, client) in clients.iter_mut().enumerate() {
+        for (id, client) in self.clients.iter_mut().enumerate() {
             for (dst, msg) in client.drain() {
-                network.send(*ticks, Origin::Client(id), dst, msg, prng);
+                self.network
+                    .send(self.ticks, Origin::Client(id), dst, msg, &mut self.prng);
             }
         }
+        Ok(())
     }
 
     fn check_properties(&mut self) -> Result<()> {
         let ctx = Self::context(
             self.ticks,
             &self.replicas,
+            &self.disks,
             &self.committed,
             &self.replies,
             &self.core,
@@ -1291,6 +1380,7 @@ impl Simulator {
     fn context<'a>(
         tick: u64,
         replicas: &'a [Replica<Accumulator>],
+        disks: &'a [Disk],
         committed: &'a [LogEntry<Op>],
         replies: &'a [Reply<i64>],
         core: &'a [usize],
@@ -1298,6 +1388,7 @@ impl Simulator {
         SimContext {
             tick,
             replicas,
+            disks,
             committed,
             replies,
             core,
@@ -1312,70 +1403,7 @@ enum CrashKind {
     Pause,
     /// Its memory is gone; its disk remains.
     PowerLoss,
-}
-
-/// A replica's disk: what its owner persisted, kept the way an owner keeps
-/// it, from the log change marker after every step, and what its state
-/// machine has flushed.
-#[derive(Clone, Debug)]
-struct Disk {
-    state: PersistentState<Op, i64>,
-    /// The state machine as of its last flush, the number of ops it had
-    /// applied then, and the client table as of then, which a durable
-    /// state machine keeps alongside what it applies.
-    state_machine: Accumulator,
-    applied: OpNumber,
-    client_table: Vec<ClientRecord<i64>>,
-}
-
-impl Disk {
-    fn new() -> Disk {
-        Disk {
-            state: PersistentState::empty(),
-            state_machine: Accumulator::default(),
-            applied: 0,
-            client_table: Vec::new(),
-        }
-    }
-
-    /// Writes what a step changed, the way an owner does after every step
-    /// and before delivering what the step produced. A checkpoint the
-    /// replica installed moved its log start past what the state machine
-    /// had flushed: the state machine makes a restored checkpoint durable
-    /// at once, as the library requires. The replica may then lose power
-    /// before the rest of the step is written, with
-    /// `checkpoint_power_loss` after a checkpoint and `step_power_loss`
-    /// otherwise, and the disk keeps the state before the step; returns
-    /// whether that happened. A step that changed nothing but the commit
-    /// number is not written, as the library allows: the disk's commit
-    /// number lags until the next step that is.
-    fn persist(
-        &mut self,
-        replica: &mut Replica<Accumulator>,
-        prng: &mut ChaCha8Rng,
-        checkpoint_power_loss: f64,
-        step_power_loss: f64,
-    ) -> bool {
-        let power_loss = if replica.log_start() > self.applied {
-            self.flush(replica);
-            checkpoint_power_loss
-        } else {
-            step_power_loss
-        };
-        if power_loss > 0.0 && prng.gen_bool(power_loss) {
-            return true;
-        }
-        let commit_number = self.state.commit_number;
-        if !self.state.update_from(replica) {
-            self.state.commit_number = commit_number;
-        }
-        false
-    }
-
-    /// The state machine writes its state to disk.
-    fn flush(&mut self, replica: &Replica<Accumulator>) {
-        self.applied = replica.applied();
-        self.state_machine = replica.state_machine().clone();
-        self.client_table = replica.client_table();
-    }
+    /// Its memory is gone; its disk remains, and its state machine kept
+    /// some of what it had not flushed.
+    ProcessCrash,
 }

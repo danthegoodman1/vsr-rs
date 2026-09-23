@@ -86,9 +86,10 @@ pub type ViewNumber = usize;
 /// order, when [`Replica::drain_messages`] or [`Replica::drain_replies`]
 /// is called: after the owner has persisted the step. A state machine
 /// that persists its state writes the op number it got with each
-/// operation alongside, and gives that number back to
-/// [`Replica::restart`], which executes what the state machine had not yet
-/// made durable once more.
+/// operation alongside. After a crash its owner makes whatever state it
+/// came back with durable, and hands [`Replica::restart`] that state with
+/// its op number; the replica executes the committed operations after it
+/// once more.
 pub trait StateMachine {
     type Input: Clone + Debug;
     /// The result of applying an input. Replicas keep the latest result per
@@ -776,11 +777,19 @@ impl<SM: StateMachine> Replica<SM> {
     /// replica applies the committed ones after that once more, so
     /// `applied` must be at least `log_start`.
     ///
-    /// A state machine ahead of the log's commit number holds a checkpoint
-    /// it made durable before the log was persisted after it, as
-    /// [`StateMachine::restore`] requires: the log's entries up to there
-    /// give way to the checkpoint, and the ones after it, which this
-    /// replica acknowledged, stay.
+    /// The state machine must be durable as of `applied`, since the replica
+    /// may compact its log up to there and a later crash must not take the
+    /// state machine back behind it. A state machine that writes through
+    /// the page cache can come back from a process crash with operations
+    /// it applied but never made durable; its owner makes them durable
+    /// before calling this.
+    ///
+    /// A state machine ahead of the log's commit number applied operations
+    /// in steps that changed nothing else, which the owner need not write,
+    /// or holds a checkpoint it made durable before the log was persisted
+    /// after it, as [`StateMachine::restore`] requires. Either way the
+    /// log's entries up to `applied` give way to the state machine, and the
+    /// ones after it, which this replica acknowledged, stay.
     ///
     /// A backup that was normal in its view resumes there: its log is the
     /// one it acknowledged. A primary starts the next view instead: it may

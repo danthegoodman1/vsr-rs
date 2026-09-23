@@ -45,6 +45,11 @@ struct Args {
     /// the replica restarts from its disk.
     #[arg(long)]
     replica_power_loss_probability: Option<f64>,
+    /// Override the probability that a crash that leaves the power on
+    /// kills the process, which loses the replica's memory, rather than
+    /// pausing it.
+    #[arg(long)]
+    replica_process_crash_probability: Option<f64>,
     /// Override the per-tick probability that every replica loses power.
     #[arg(long)]
     blackout_probability: Option<f64>,
@@ -114,6 +119,9 @@ fn main() -> anyhow::Result<()> {
     if let Some(p) = args.replica_power_loss_probability {
         options.replica_power_loss_probability = p;
     }
+    if let Some(p) = args.replica_process_crash_probability {
+        options.replica_process_crash_probability = p;
+    }
     if let Some(p) = args.blackout_probability {
         options.blackout_probability = p;
     }
@@ -161,9 +169,13 @@ fn main() -> anyhow::Result<()> {
         simulator.requests_sent, simulator.requests_replied
     );
     println!(
-        "          replicas: crashes={} power_losses={} restarts={} reboots={} flushes={} core={:?} up={:?}",
+        "          replicas: crashes={} power_losses={} process_crashes={} ahead={} lost_steps={} lost_writes={} restarts={} reboots={} flushes={} core={:?} up={:?}",
         simulator.crashes,
         simulator.power_losses,
+        simulator.process_crashes,
+        simulator.process_crashes_ahead,
+        simulator.lost_steps,
+        simulator.lost_writes,
         simulator.restarts,
         simulator.reboots,
         simulator.flushes,

@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Checks that the simulator catches known persistence bugs.
+
+Each mutation plants one bug in a scratch copy of the working tree. The
+script builds the simulator from the copy and runs a fixed set of seeds in
+the full swarm configuration, since a --lite run is often too short to see
+a view change; a run that fails or times out has caught the bug. The
+unmutated copy runs the same seeds first, and must pass them all.
+
+    scripts/mutants [--seeds N] [--min-rate R] [--timeout SECONDS]
+                    [--concurrency N] [MUTATION...]
+
+Prints the catch rate of each mutation, with the reasons runs failed, and
+exits non-zero if the baseline failed or any rate is below --min-rate.
+"""
+
+import argparse
+import collections
+import concurrent.futures
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# Each mutation replaces `old` with `new` in `path`; `old` must occur once.
+MUTATIONS = {
+    "M1": (
+        "PrepareOk leaves before the step is persisted",
+        "lib.rs",
+        "            Message::Prepare { .. }\n                | Message::Commit { .. }",
+        "            Message::Prepare { .. }\n                | Message::PrepareOk { .. }\n"
+        "                | Message::Commit { .. }",
+    ),
+    "M2": (
+        "view change messages leave before the step is persisted",
+        "lib.rs",
+        "            Message::Prepare { .. }\n                | Message::Commit { .. }",
+        "            Message::Prepare { .. }\n                | Message::StartViewChange { .. }\n"
+        "                | Message::DoViewChange { .. }\n                | Message::StartView { .. }\n"
+        "                | Message::Commit { .. }",
+    ),
+    "M4": (
+        "the log change marker skips the first entry a merge replaced",
+        "lib.rs",
+        "        self.mark_log_changed(keep_up_to + 1);\n        self.rebuild_pending();",
+        "        self.mark_log_changed(keep_up_to + 2);\n        self.rebuild_pending();",
+    ),
+    "M7": (
+        "a view change alone is not written",
+        "lib.rs",
+        "        changed |= self.view_number != replica.view_number()\n"
+        "            || self.last_normal_view != replica.last_normal_view()",
+        "        changed |= self.last_normal_view != replica.last_normal_view()",
+    ),
+}
+
+
+def git(*args):
+    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+
+
+def copy_tree(src, dst):
+    """Copies the working tree's tracked and untracked, unignored files,
+    with fresh modification times, so that cargo rebuilds what changed."""
+    if dst.exists():
+        shutil.rmtree(dst)
+    names = git("ls-files", "-co", "--exclude-standard", "-z").split("\0")
+    # The lock file is ignored, and pins the dependencies the tree was
+    # tested with.
+    for name in names + ["Cargo.lock"]:
+        if name and (src / name).is_file():
+            (dst / name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(src / name, dst / name)
+
+
+def build(root, src, target, name, mutation):
+    """Builds the simulator from `src` with `mutation` applied, and returns
+    the binary's path."""
+    copy_tree(root, src)
+    if mutation is not None:
+        _, path, old, new = mutation
+        text = (src / path).read_text()
+        count = text.count(old)
+        if count != 1:
+            sys.exit(f"{name}: the text to replace occurs {count} times in {path}")
+        (src / path).write_text(text.replace(old, new))
+    subprocess.run(
+        ["cargo", "build", "--quiet", "--release", "-p", "vsr-simulator"],
+        cwd=src,
+        env={**os.environ, "CARGO_TARGET_DIR": str(target)},
+        check=True,
+    )
+    binary = target.parent / "bin" / name
+    binary.parent.mkdir(exist_ok=True)
+    shutil.copy2(target / "release" / "vsr-simulator", binary)
+    return binary
+
+
+def run(binary, seed, timeout):
+    """Runs one seed. Returns None if it passed, or why it failed."""
+    args = [str(binary), str(seed)]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    if result.returncode == 0:
+        return None
+    output = result.stdout + result.stderr
+    match = re.search(r"sent (\w+) for view \d+ that its disk does not back", output)
+    if match:
+        return f"undurable {match.group(1)}"
+    match = re.search(r"property '([^']+)'", output)
+    if match:
+        return f"property {match.group(1)}"
+    match = re.search(r"panicked at ([^\n]+)", output)
+    if match:
+        return f"panic at {match.group(1)}"
+    return f"exit {result.returncode}"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("mutations", nargs="*", help=f"mutations to check (default: all of {', '.join(MUTATIONS)})")
+    parser.add_argument("--seeds", type=int, default=400, help="run seeds 1 to N (default 400)")
+    parser.add_argument("--min-rate", type=float, default=0.9, help="catch rate each mutation needs (default 0.9)")
+    parser.add_argument("--timeout", type=int, default=120, help="seconds one run may take (default 120)")
+    parser.add_argument("--concurrency", type=int, default=os.cpu_count(), help="parallel runs (default: cores)")
+    args = parser.parse_args()
+    for name in args.mutations:
+        if name not in MUTATIONS:
+            sys.exit(f"unknown mutation {name}; known: {', '.join(MUTATIONS)}")
+    names = args.mutations or list(MUTATIONS)
+
+    root = Path(git("rev-parse", "--show-toplevel").strip())
+    os.chdir(root)
+    work = root / "target" / "mutants"
+    seeds = range(1, args.seeds + 1)
+
+    def check(name, mutation):
+        binary = build(root, work / "src", work / "target", name, mutation)
+        with concurrent.futures.ThreadPoolExecutor(args.concurrency) as pool:
+            failures = [f for f in pool.map(lambda seed: run(binary, seed, args.timeout), seeds) if f]
+        return failures
+
+    ok = True
+    failures = check("baseline", None)
+    print(f"baseline: {len(failures)} of {len(seeds)} seeds failed")
+    if failures:
+        for reason, count in collections.Counter(failures).most_common():
+            print(f"  {count:5}  {reason}")
+        ok = False
+    for name in names:
+        description = MUTATIONS[name][0]
+        failures = check(name, MUTATIONS[name])
+        rate = len(failures) / len(seeds)
+        verdict = "caught" if rate >= args.min_rate else "MISSED"
+        print(f"{name}: {description}: {verdict} by {len(failures)} of {len(seeds)} seeds ({rate:.0%})")
+        for reason, count in collections.Counter(failures).most_common():
+            print(f"  {count:5}  {reason}")
+        ok = ok and rate >= args.min_rate
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

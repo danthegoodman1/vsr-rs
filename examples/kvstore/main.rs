@@ -1699,8 +1699,8 @@ mod disk_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The journal grows its files with zeros ahead of the records, so
-    /// that each write lands in blocks already allocated.
+    /// writeahead grows the journal's files with zeros ahead of the
+    /// records, so that each write lands in blocks already allocated.
     #[cfg(unix)]
     #[test]
     fn journal_grows_its_files_with_zeros() {
@@ -1732,6 +1732,40 @@ mod disk_tests {
             file.blocks() * 512,
             file.len()
         );
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write lands as one record whatever its size: here a backup
+    /// installs a new view's log of about 6.5 MB, past writeahead's default
+    /// limit on a batch, and a restart replays it.
+    #[test]
+    fn journal_takes_a_write_of_a_long_log() {
+        let dir = temp_dir("long-log");
+        let mut node = Node::open(1, config(), &dir, Start::Init).unwrap();
+        let value = "v".repeat(100);
+        let entries: Vec<_> = (1..=50_000)
+            .map(|i| LogEntry {
+                client_id: 7,
+                request_number: i,
+                op: Op::Put(format!("k{i}"), value.clone()),
+            })
+            .collect();
+        node.replica.on_message(Message::StartView {
+            view_number: 2,
+            segment: LogSegment {
+                base: LogBase::Op(0),
+                entries,
+            },
+            commit_number: 0,
+        });
+        assert!(step(&mut node));
+        assert_eq!(50_000, node.replica.op_number());
+        let before = node.replica.persistent_state();
+        drop(node);
+
+        let node = Node::open(1, config(), &dir, Start::Restart).unwrap();
+        assert_eq!(before, node.replica.persistent_state());
         drop(node);
         let _ = std::fs::remove_dir_all(&dir);
     }

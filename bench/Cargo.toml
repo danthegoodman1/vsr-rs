@@ -18,8 +18,11 @@ futures = "0.3"
 log = "0.4.17"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
+# writeahead logs through tracing, whose `log` feature hands its records to
+# env_logger.
+tracing = { version = "0.1", features = ["log"] }
 vsr-rs = { path = ".." }
-writeahead = "0.3.0"
+writeahead = "0.4.1"
 
 [[bin]]
 name = "vsr-micro"

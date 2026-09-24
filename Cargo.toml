@@ -19,4 +19,7 @@ env_logger = "0.9.1"
 # state with fjall.
 fjall = "3.1.10"
 futures = "0.3"
-writeahead = "0.3.0"
+# writeahead logs through tracing, whose `log` feature hands its records to
+# env_logger.
+tracing = { version = "0.1", features = ["log"] }
+writeahead = "0.4.1"

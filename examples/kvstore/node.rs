@@ -405,6 +405,17 @@ impl From<Frame> for Event {
     }
 }
 
+/// Where a node sends its frames for other nodes.
+pub(crate) trait Outbox {
+    fn send_to(&self, dst: ReplicaID, frame: Frame);
+}
+
+impl Outbox for Sender<(ReplicaID, Frame)> {
+    fn send_to(&self, dst: ReplicaID, frame: Frame) {
+        let _ = self.send((dst, frame));
+    }
+}
+
 /// The configuration of a cluster of `replicas` nodes.
 pub(crate) fn config(replicas: usize) -> Config {
     let mut config = Config::new();
@@ -772,21 +783,21 @@ impl Node {
 
     /// Ends a batch of steps the way `step` does, stepping on while the
     /// journal writes, and sends what the node and its clients produced as
-    /// soon as it may: protocol messages to the sender thread, and replies
+    /// soon as it may: protocol messages to `outbox`, and replies
     /// to the node that owns the client connection, which may be this one.
     /// What the last write released goes out first. Then, unless a write
     /// is out already, it takes the replica's write: one that needs a sync
     /// goes out to the journal, which wakes the event loop through `wake`
     /// with an [`Event::Written`]; any other goes straight back to the
     /// replica, and what that released goes out too.
-    pub(crate) fn deliver(&mut self, frames: &Sender<(ReplicaID, Frame)>, wake: &Sender<Event>) {
+    pub(crate) fn deliver(&mut self, outbox: &impl Outbox, wake: &Sender<Event>) {
         let mut send = |dst, message| {
-            let _ = frames.send((dst, Frame::Message(message)));
+            outbox.send_to(dst, Frame::Message(message));
         };
         let mut replies = Vec::new();
         self.before_write(&mut send, &mut replies);
         self.after_write(&mut send, &mut replies);
-        self.answer(&mut replies, frames);
+        self.answer(&mut replies, outbox);
         if self.writing.is_none() {
             let write = self.replica.take_write();
             if write.sync && self.journaled {
@@ -796,7 +807,7 @@ impl Node {
             }
         }
         self.after_write(&mut send, &mut replies);
-        self.answer(&mut replies, frames);
+        self.answer(&mut replies, outbox);
     }
 
     /// Sends `write` to the journal: the first poll hands it to
@@ -838,13 +849,13 @@ impl Node {
 
     /// Hands each of `replies` to the node that owns its client
     /// connection, which may be this one.
-    fn answer(&mut self, replies: &mut Vec<KvReply>, frames: &Sender<(ReplicaID, Frame)>) {
+    fn answer(&mut self, replies: &mut Vec<KvReply>, outbox: &impl Outbox) {
         for reply in replies.drain(..) {
             let owner = node_of(reply.client_id);
             if owner == self.id {
                 deliver_reply(&mut self.connections, reply);
             } else {
-                let _ = frames.send((owner, Frame::Reply(reply)));
+                outbox.send_to(owner, Frame::Reply(reply));
             }
         }
     }
@@ -918,15 +929,15 @@ impl Node {
         &mut self,
         events: Receiver<Event>,
         wake: Sender<Event>,
-        frames: Sender<(ReplicaID, Frame)>,
+        outbox: impl Outbox,
     ) {
         // Whatever the replica produced on the way up goes out now.
-        self.deliver(&frames, &wake);
+        self.deliver(&outbox, &wake);
         while let Ok(event) = events.recv() {
             let batch = std::iter::once(event)
                 .chain(events.try_iter())
                 .take(MAX_BATCH_EVENTS);
-            if !self.batch(batch, &frames, &wake) {
+            if !self.batch(batch, &outbox, &wake) {
                 break;
             }
         }
@@ -944,7 +955,7 @@ impl Node {
     pub(crate) fn batch(
         &mut self,
         events: impl IntoIterator<Item = Event>,
-        frames: &Sender<(ReplicaID, Frame)>,
+        outbox: &impl Outbox,
         wake: &Sender<Event>,
     ) -> bool {
         let mut flush_store = false;
@@ -960,7 +971,7 @@ impl Node {
         if self.writing.is_some() && self.write_ticks >= STALLED_WRITE_TICKS {
             return true;
         }
-        self.deliver(frames, wake);
+        self.deliver(outbox, wake);
         if flush_store {
             self.flush_store().unwrap_or_else(|err| fatal(&err));
         }

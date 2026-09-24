@@ -1693,3 +1693,17 @@ fn test_restart_recovering_with_checkpoint() {
     assert_eq!(3, cluster.replicas[1].commit_number());
     assert_eq!(60, cluster.value(1));
 }
+
+/// Regression test case for https://github.com/penberg/vsr-rs/issues/14
+#[test]
+#[should_panic(expected = "at least three replicas")]
+fn test_one_replica_is_rejected() {
+    Cluster::new(1);
+}
+
+/// Regression test case for https://github.com/penberg/vsr-rs/issues/14
+#[test]
+#[should_panic(expected = "at least three replicas")]
+fn test_two_replicas_are_rejected() {
+    Cluster::new(2);
+}

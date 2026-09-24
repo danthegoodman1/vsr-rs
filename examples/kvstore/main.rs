@@ -32,11 +32,11 @@
 //! the benchmark shares; this file puts it on the network.
 
 use log::{debug, info, warn};
-use std::collections::HashMap;
+use std::cell::Cell;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 use vsr_rs::{
@@ -297,14 +297,113 @@ fn decode(line: &str) -> Result<Frame, String> {
 // ---------------------------------------------------------------------------
 // Networking between nodes
 
-/// The most frames the sender takes into one write per node, so that a
-/// steady stream of them still goes out.
+/// Frames queued for one node before further ones are dropped: a few
+/// batches of the event loop, which a node that keeps reading drains.
+const OUTBOX_FRAMES: usize = 4 * MAX_BATCH_EVENTS;
+/// The most frames a sender takes into one write, so that a steady stream
+/// of them still goes out.
 const MAX_FRAMES_PER_FLUSH: usize = 1024;
-/// The most memory the sender keeps for a node's next write between
-/// batches; a larger batch, of a checkpoint say, gives back the rest.
+/// The most memory a sender keeps for its next write between batches; a
+/// larger batch, of a checkpoint say, gives back the rest.
 const MAX_KEPT_BATCH: usize = 1024 * 1024;
 
-/// Connects to a node.
+/// One queue and sender thread per other node, so that a node that stops
+/// reading holds up only its own frames.
+struct Outboxes {
+    events: Sender<Event>,
+    /// None for this node, whose frames go to its own event loop.
+    peers: Vec<Option<Peer>>,
+}
+
+struct Peer {
+    queue: SyncSender<Frame>,
+    full: Cell<bool>,
+}
+
+impl Outboxes {
+    fn new(self_id: ReplicaID, addresses: &[SocketAddr], events: Sender<Event>) -> Outboxes {
+        let peers = addresses
+            .iter()
+            .enumerate()
+            .map(|(dst, &address)| {
+                (dst != self_id).then(|| {
+                    let (queue, frames) = sync_channel(OUTBOX_FRAMES);
+                    thread::spawn(move || run_sender(dst, address, frames));
+                    Peer {
+                        queue,
+                        full: Cell::new(false),
+                    }
+                })
+            })
+            .collect();
+        Outboxes { events, peers }
+    }
+}
+
+impl Outbox for Outboxes {
+    /// A full queue drops the frame; the protocol re-sends what matters.
+    fn send_to(&self, dst: ReplicaID, frame: Frame) {
+        let Some(peer) = &self.peers[dst] else {
+            let _ = self.events.send(frame.into());
+            return;
+        };
+        match peer.queue.try_send(frame) {
+            Ok(()) => {
+                if peer.full.replace(false) {
+                    info!("node {dst} is taking frames again");
+                }
+            }
+            Err(TrySendError::Full(_)) => {
+                if !peer.full.replace(true) {
+                    warn!("node {dst} is not keeping up, dropping its frames");
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+/// Sends the frames queued for node `dst`, those queued at once in one
+/// write, connecting on demand. A node that cannot be reached loses them.
+fn run_sender(dst: ReplicaID, address: SocketAddr, frames: Receiver<Frame>) {
+    let mut stream: Option<TcpStream> = None;
+    let mut last_failure: Option<Instant> = None;
+    let mut batch = Vec::new();
+    while let Ok(first) = frames.recv() {
+        let queued = std::iter::once(first)
+            .chain(frames.try_iter())
+            .take(MAX_FRAMES_PER_FLUSH);
+        let backing_off = last_failure.is_some_and(|at| at.elapsed() < Duration::from_millis(500));
+        if stream.is_none() && !backing_off {
+            match connect(address) {
+                Ok(connected) => {
+                    info!("connected to node {dst} at {address}");
+                    stream = Some(connected);
+                }
+                Err(err) => {
+                    debug!("node {dst} unreachable: {err}");
+                    last_failure = Some(Instant::now());
+                }
+            }
+        }
+        let Some(connected) = &mut stream else {
+            queued.for_each(drop);
+            continue;
+        };
+        for frame in queued {
+            batch.extend_from_slice(encode(&frame).as_bytes());
+            batch.push(b'\n');
+        }
+        if let Err(err) = connected.write_all(&batch) {
+            // The node was reachable a moment ago: reconnect at once.
+            warn!("lost connection to node {dst}: {err}");
+            stream = None;
+        }
+        batch.clear();
+        batch.shrink_to(MAX_KEPT_BATCH);
+    }
+}
+
 fn connect(address: SocketAddr) -> std::io::Result<TcpStream> {
     let stream = TcpStream::connect_timeout(&address, Duration::from_millis(200))?;
     no_delay(&stream);
@@ -320,91 +419,13 @@ fn no_delay(stream: &TcpStream) {
     }
 }
 
-/// Sends frames to other nodes, connecting on demand. The frames queued at
-/// once go out in one write per node: first to the nodes already
-/// connected, then to the others, whose connect may take until its
-/// timeout. A node that cannot be reached just loses the message; the
-/// protocol re-sends what matters.
-fn run_sender(
-    self_id: ReplicaID,
-    addresses: Vec<SocketAddr>,
-    frames: Receiver<(ReplicaID, Frame)>,
-    events: Sender<Event>,
-) {
-    let mut streams: HashMap<ReplicaID, TcpStream> = HashMap::new();
-    let mut last_failure: HashMap<ReplicaID, Instant> = HashMap::new();
-    let mut batches: Vec<Vec<u8>> = vec![Vec::new(); addresses.len()];
-    while let Ok(first) = frames.recv() {
-        let queued = std::iter::once(first).chain(frames.try_iter());
-        for (dst, frame) in queued.take(MAX_FRAMES_PER_FLUSH) {
-            if dst == self_id {
-                // A frame for this node goes straight to its event loop.
-                let _ = events.send(frame.into());
-                continue;
-            }
-            batches[dst].extend_from_slice(encode(&frame).as_bytes());
-            batches[dst].push(b'\n');
-        }
-        let (connected, others): (Vec<ReplicaID>, Vec<ReplicaID>) = (0..addresses.len())
-            .filter(|&dst| !batches[dst].is_empty())
-            .partition(|dst| streams.contains_key(dst));
-        for dst in connected.into_iter().chain(others) {
-            let batch = &mut batches[dst];
-            if let Some(stream) = stream_to(&mut streams, &mut last_failure, dst, addresses[dst]) {
-                if let Err(err) = stream.write_all(batch) {
-                    // Drop the stream but do not start the backoff: the peer
-                    // was reachable a moment ago, so the next frame retries
-                    // the connect right away. If that connect fails, the
-                    // backoff starts then.
-                    warn!("lost connection to node {dst}: {err}");
-                    streams.remove(&dst);
-                }
-            }
-            batch.clear();
-            batch.shrink_to(MAX_KEPT_BATCH);
-        }
-    }
-}
-
-/// The stream to node `dst`, connected if need be. None while the node is
-/// unreachable: for half a second after a connect to it failed.
-fn stream_to<'a>(
-    streams: &'a mut HashMap<ReplicaID, TcpStream>,
-    last_failure: &mut HashMap<ReplicaID, Instant>,
-    dst: ReplicaID,
-    address: SocketAddr,
-) -> Option<&'a mut TcpStream> {
-    match streams.entry(dst) {
-        std::collections::hash_map::Entry::Occupied(entry) => Some(entry.into_mut()),
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            if last_failure
-                .get(&dst)
-                .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
-            {
-                return None;
-            }
-            match connect(address) {
-                Ok(stream) => {
-                    info!("connected to node {dst} at {address}");
-                    Some(entry.insert(stream))
-                }
-                Err(err) => {
-                    debug!("node {dst} unreachable: {err}");
-                    last_failure.insert(dst, Instant::now());
-                    None
-                }
-            }
-        }
-    }
-}
-
 /// Accepts connections from other nodes and feeds their frames to the event
 /// loop.
 fn run_peer_acceptor(listener: TcpListener, events: Sender<Event>) {
     for stream in listener.incoming().flatten() {
         let events = events.clone();
         thread::spawn(move || {
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            for line in read_lines(BufReader::new(stream)).map_while(Result::ok) {
                 match decode(&line) {
                     Ok(frame) => {
                         let _ = events.send(frame.into());
@@ -414,6 +435,26 @@ fn run_peer_acceptor(listener: TcpListener, events: Sender<Event>) {
             }
         });
     }
+}
+
+/// The lines of `reader` that end in a newline, without it. A line the
+/// stream cut off is dropped: a cut-off `PUT` or `SET` still parses, with
+/// a shorter value.
+fn read_lines(mut reader: impl BufRead) -> impl Iterator<Item = std::io::Result<String>> {
+    std::iter::from_fn(move || {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(_) if line.ends_with('\n') => {
+                line.pop();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+                Some(Ok(line))
+            }
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +496,7 @@ fn run_client_connection(
     // it would carry us past the Event::Disconnect below and the event loop
     // would keep this connection's client for the life of the process.
     let mut outcome = Ok(());
-    for line in reader.lines() {
+    for line in read_lines(reader) {
         let step = line.and_then(|line| {
             run_client_command(
                 &line,
@@ -578,6 +619,9 @@ fn parse_args() -> Result<Args, String> {
         data_dir: data_dir.unwrap_or_else(|| PathBuf::from(format!("kvstore-node-{id}"))),
         start,
     };
+    if args.replicas.len() < 3 {
+        return Err("--replicas needs at least three addresses".to_string());
+    }
     if args.id >= args.replicas.len() {
         return Err("--id must index into --replicas".to_string());
     }
@@ -600,12 +644,7 @@ fn main() {
         Node::open(args.id, config, &args.data_dir, args.start).unwrap_or_else(|err| fatal(&err));
 
     let (events_tx, events_rx) = channel::<Event>();
-    let (frames_tx, frames_rx) = channel::<(ReplicaID, Frame)>();
-
-    {
-        let (self_id, addresses, events) = (args.id, args.replicas.clone(), events_tx.clone());
-        thread::spawn(move || run_sender(self_id, addresses, frames_rx, events));
-    }
+    let outboxes = Outboxes::new(args.id, &args.replicas, events_tx.clone());
     {
         let listener = TcpListener::bind(args.replicas[args.id]).unwrap_or_else(|err| {
             eprintln!("cannot listen on {}: {err}", args.replicas[args.id]);
@@ -636,12 +675,14 @@ fn main() {
         args.data_dir.display(),
         node.replica.primary_id()
     );
-    node.run(events_rx, events_tx, frames_tx);
+    node.run(events_rx, events_tx, outboxes);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Shutdown;
+    use std::sync::mpsc::RecvTimeoutError;
     use vsr_rs::{Client, Config, LogEntry, OpNumber, Status};
 
     /// A fresh directory for one node of one test.
@@ -830,13 +871,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    type Addressed = (ReplicaID, Frame);
+
     /// Three nodes stepped in batches as their event loops step them. A
     /// node hears that its write landed when the test hands it the event
     /// that says so, and its write stays out until then.
     struct Pipelined {
         dirs: Vec<PathBuf>,
         nodes: Vec<Node>,
-        frames: Vec<(Sender<(ReplicaID, Frame)>, Receiver<(ReplicaID, Frame)>)>,
+        frames: Vec<(Sender<Addressed>, Receiver<Addressed>)>,
         wakes: Vec<(Sender<Event>, Receiver<Event>)>,
         connections: u64,
     }
@@ -954,23 +997,36 @@ mod tests {
         remove_dirs(cluster.nodes, &cluster.dirs);
     }
 
-    /// The event loop answers a client of a one-node cluster and stops on
+    /// The event loops of a cluster answer a client and stop on
     /// `Event::Stop`; a restart finds the op in the journal.
     #[test]
     fn run_answers_and_stops() {
-        let dir = temp_dir("run", 0);
-        let mut node = Node::open(0, config(1), &dir, Start::Init).unwrap();
-        node.announce_views = false;
-        let incarnation = node.incarnation;
-        let (events, events_rx) = channel();
-        let (frames, _frames_rx) = channel();
-        let wake = events.clone();
-        let running = thread::spawn(move || {
-            node.run(events_rx, wake, frames);
-            node
-        });
+        let dirs: Vec<PathBuf> = (0..3).map(|id| temp_dir("run", id)).collect();
+        let nodes = open_nodes(&dirs);
+        let incarnation = nodes[0].incarnation;
+        let (events, receivers): (Vec<Sender<Event>>, Vec<Receiver<Event>>) =
+            (0..nodes.len()).map(|_| channel()).unzip();
+        let running: Vec<_> = nodes
+            .into_iter()
+            .zip(receivers)
+            .map(|(mut node, events_rx)| {
+                node.announce_views = false;
+                let (frames, frames_rx) = channel::<(ReplicaID, Frame)>();
+                let peers = events.clone();
+                thread::spawn(move || {
+                    for (dst, frame) in frames_rx {
+                        let _ = peers[dst].send(frame.into());
+                    }
+                });
+                let wake = events[node.id].clone();
+                thread::spawn(move || {
+                    node.run(events_rx, wake, frames);
+                    node
+                })
+            })
+            .collect();
         let (respond, responses) = channel();
-        events
+        events[0]
             .send(Event::Command {
                 connection: client_id(0, incarnation, 0),
                 command: Command::Set("a".into(), "1".into()),
@@ -979,12 +1035,17 @@ mod tests {
             .unwrap();
         let response = responses.recv_timeout(Duration::from_secs(10));
         assert_eq!(Ok("+OK\r\n".to_string()), response);
-        events.send(Event::Stop).unwrap();
-        drop(running.join().unwrap());
-        let node = Node::open(0, config(1), &dir, Start::Restart).unwrap();
+        for events in &events {
+            events.send(Event::Stop).unwrap();
+        }
+        let nodes: Vec<Node> = running
+            .into_iter()
+            .map(|node| node.join().unwrap())
+            .collect();
+        drop(nodes);
+        let node = Node::open(0, config(3), &dirs[0], Start::Restart).unwrap();
         assert_eq!(1, node.replica.op_number());
-        drop(node);
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_dirs(vec![node], &dirs);
     }
 
     /// Persists every node, then moves what the nodes and the client want
@@ -1404,8 +1465,7 @@ mod tests {
             flushed[id] = nodes[id].replica.applied();
         }
         assert_eq!(flushed[0], nodes[0].replica.log_start());
-        let nodes_down: Vec<Node> = nodes.drain(..).collect();
-        drop(nodes_down);
+        drop(nodes);
         for (id, dir) in dirs.iter().enumerate() {
             power::lose_power(dir);
             let store = Store::open(&dir.join("store")).unwrap();
@@ -1506,16 +1566,14 @@ mod tests {
         }
     }
 
-    /// The sender's connections to other nodes have Nagle's algorithm
-    /// off. It writes more frames than one flush takes whole and in order,
-    /// and hands a frame for its own node to its event loop.
+    /// A sender connects with Nagle's algorithm off and writes more frames
+    /// than one flush takes whole and in order; a frame for the node itself
+    /// goes to its event loop.
     #[test]
     fn sender_writes_queued_frames_in_order() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let mut streams = HashMap::new();
-        let stream = stream_to(&mut streams, &mut HashMap::new(), 1, address).unwrap();
-        assert!(stream.nodelay().unwrap());
+        assert!(connect(address).unwrap().nodelay().unwrap());
         let _ = listener.accept().unwrap();
         let commit = |commit_number| {
             Frame::Message(Message::Commit {
@@ -1526,12 +1584,10 @@ mod tests {
         let (frames, frames_rx) = channel();
         let count = 3 * MAX_FRAMES_PER_FLUSH + 1;
         for commit_number in 0..count {
-            frames.send((1, commit(commit_number))).unwrap();
+            frames.send(commit(commit_number)).unwrap();
         }
-        frames.send((0, commit(0))).unwrap();
         drop(frames);
-        let (events, events_rx) = channel();
-        let sender = thread::spawn(move || run_sender(0, vec![address; 2], frames_rx, events));
+        let sender = thread::spawn(move || run_sender(1, address, frames_rx));
         let (stream, _) = listener.accept().unwrap();
         let received: Vec<usize> = BufReader::new(stream)
             .lines()
@@ -1542,10 +1598,145 @@ mod tests {
             .collect();
         sender.join().unwrap();
         assert_eq!(received, (0..count).collect::<Vec<_>>());
+
+        let (events, events_rx) = channel();
+        Outboxes::new(0, &[address; 3], events).send_to(0, commit(0));
         assert!(matches!(
             events_rx.try_recv(),
             Ok(Event::Message(Message::Commit { .. }))
         ));
+    }
+
+    /// Regression test case for https://github.com/penberg/vsr-rs/issues/12
+    #[test]
+    fn peer_eof_does_not_complete_an_unterminated_prepare() {
+        let (address, received) = peer_acceptor();
+        let frame = encode(&prepare_put("ABCDEFGHIJ"));
+        let prefix = frame.strip_suffix("DEFGHIJ").unwrap();
+
+        let mut peer = TcpStream::connect(address).unwrap();
+        peer.write_all(prefix.as_bytes()).unwrap();
+        peer.shutdown(Shutdown::Write).unwrap();
+
+        match received.recv_timeout(Duration::from_secs(1)) {
+            Ok(Event::Message(Message::Prepare { op, .. })) => {
+                panic!("incomplete frame was dispatched as {op:?}")
+            }
+            Ok(_) => panic!("incomplete frame dispatched an unexpected event"),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(err) => panic!("event channel failed: {err}"),
+        }
+    }
+
+    fn prepare_put(value: &str) -> Frame {
+        Frame::Message(Message::Prepare {
+            view_number: 0,
+            op_number: 1,
+            commit_number: 0,
+            client_id: 7,
+            request_number: 0,
+            op: Op::Put("key".into(), value.into()),
+        })
+    }
+
+    fn peer_acceptor() -> (std::net::SocketAddr, Receiver<Event>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (events, received) = channel();
+        thread::spawn(move || run_peer_acceptor(listener, events));
+        (address, received)
+    }
+
+    #[test]
+    fn peer_eof_keeps_the_terminated_frames_before_it() {
+        let (address, received) = peer_acceptor();
+        let complete = encode(&prepare_put("ABCDEFGHIJ"));
+        let frame = encode(&prepare_put("KLMNOPQRST"));
+        let prefix = frame.strip_suffix("NOPQRST").unwrap();
+
+        let mut peer = TcpStream::connect(address).unwrap();
+        peer.write_all(format!("{complete}\n{prefix}").as_bytes())
+            .unwrap();
+        peer.shutdown(Shutdown::Write).unwrap();
+
+        match received.recv_timeout(Duration::from_secs(1)) {
+            Ok(Event::Message(Message::Prepare { op, .. })) => {
+                assert_eq!(op, Op::Put("key".into(), "ABCDEFGHIJ".into()))
+            }
+            Ok(_) => panic!("expected the complete PREPARE, got another event"),
+            Err(err) => panic!("expected the complete PREPARE, got {err}"),
+        }
+        match received.recv_timeout(Duration::from_millis(500)) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(Event::Message(Message::Prepare { op, .. })) => {
+                panic!("incomplete frame was dispatched as {op:?}")
+            }
+            Ok(_) => panic!("unexpected second event"),
+            Err(err) => panic!("event channel failed: {err}"),
+        }
+    }
+
+    /// A command the client's end of the connection cuts off is dropped,
+    /// as a peer's frame is.
+    #[test]
+    fn client_eof_does_not_complete_an_unterminated_command() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (events, received) = channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = run_client_connection(stream, 1, events);
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(b"SET key ABC").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+
+        match received.recv_timeout(Duration::from_secs(1)) {
+            Ok(Event::Disconnect(1)) => {}
+            Ok(Event::Command { .. }) => panic!("incomplete command was dispatched"),
+            Ok(_) => panic!("unexpected event"),
+            Err(err) => panic!("expected a disconnect, got {err}"),
+        }
+    }
+
+    /// Regression test case for https://github.com/penberg/vsr-rs/issues/15
+    #[test]
+    fn stalled_peer_does_not_block_other_peers() {
+        let stalled = TcpListener::bind("127.0.0.1:0").unwrap();
+        let healthy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addresses = vec![
+            stalled.local_addr().unwrap(),
+            healthy.local_addr().unwrap(),
+            "127.0.0.1:1".parse().unwrap(),
+        ];
+        let (events, _events_rx) = channel();
+        let outboxes = Outboxes::new(2, &addresses, events);
+        // Accept the stalled peer's connection but never read from it.
+        let _stalled_stream = thread::spawn(move || stalled.accept().unwrap().0);
+
+        for _ in 0..16 {
+            outboxes.send_to(0, prepare_put(&"v".repeat(4 << 20)));
+        }
+        outboxes.send_to(
+            1,
+            Frame::Message(Message::Commit {
+                view_number: 0,
+                commit_number: 0,
+            }),
+        );
+
+        let (line_tx, line_rx) = channel();
+        thread::spawn(move || {
+            let (stream, _) = healthy.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            line_tx.send(line).unwrap();
+        });
+        let line = line_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("healthy peer got nothing");
+        assert_eq!(line, "COMMIT 0 0\n");
     }
 }
 

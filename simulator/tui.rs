@@ -242,7 +242,7 @@ fn interactive_options(replica_count: usize) -> Options {
 fn main() -> Result<()> {
     let args = Args::parse();
     let (seed, options) = if args.interactive {
-        (0, interactive_options(args.replicas.max(1)))
+        (0, interactive_options(args.replicas))
     } else {
         let seed = parse_seed(args.seed.as_deref().unwrap_or_default())?;
         let mut prng = ChaCha8Rng::seed_from_u64(seed);

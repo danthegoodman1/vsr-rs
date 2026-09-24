@@ -23,3 +23,7 @@ futures = "0.3"
 # env_logger.
 tracing = { version = "0.1", features = ["log"] }
 writeahead = "0.4.1"
+
+[[example]]
+name = "kvstore"
+test = true

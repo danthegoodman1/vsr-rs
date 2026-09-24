@@ -70,8 +70,8 @@ Each node keeps its data in `kvstore-node-N`, or the directory given with
   changed, and the counters, which say how far the log is compacted and
   from which op number the entries replace what came before. A torn write
   fails the checksum, and recovery drops it whole. A write that changed
-  only the commit number is not written. The journal grows its files
-  256 KiB at a time, with zeros, so that each write lands in blocks
+  only the commit number is not written. writeahead grows the journal's
+  files 256 KiB at a time, with zeros, so that each write lands in blocks
   already allocated and its fsync writes only data: on ext4, an fsync
   that allocates blocks commits the filesystem's journal too, and takes
   nearly twice as long.

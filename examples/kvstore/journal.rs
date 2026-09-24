@@ -48,6 +48,10 @@ pub struct EntryCodec<Op> {
     pub decode: fn(&str) -> Result<LogEntry<Op>, String>,
 }
 
+/// The journal of one replica. writeahead's writer thread holds the
+/// directory's lock until the journal and every [`Landing`] it returned
+/// are dropped; the last of them to go waits for the writer to finish what
+/// it was sent.
 pub struct Journal<Op> {
     writer: WriteHandle,
     codec: EntryCodec<Op>,
@@ -62,7 +66,6 @@ pub struct Journal<Op> {
     /// The deletion of files a replay no longer needs, while writeahead's
     /// writer thread has yet to answer it, see [`Journal::finish`].
     trimming: Option<Trim>,
-    _wal: WriteAhead<JournalFile>,
 }
 
 /// A write on its way to the journal, see [`Journal::submit`].
@@ -83,20 +86,18 @@ pub fn set_sync_delay(delay: Duration) {
     SYNC_DELAY_NANOS.store(delay.as_nanos() as u64, Ordering::Relaxed);
 }
 
-/// How far ahead of the records writeahead grows a journal file, see
-/// [`JournalFile::set_len`]. The zeros of each growth go to disk with the
-/// next write and slow it, and every replica grows its file on the same
-/// ops, since their logs match, so a long fill slows a quorum at once;
-/// 256 KiB keeps that write within the spread of the others.
+/// How far ahead of its records writeahead fills a journal file with
+/// zeros, so that each write lands in blocks already allocated. The zeros
+/// go to disk with the write that crosses into a new window and slow it,
+/// and every replica crosses on the same ops, since their logs match, so a
+/// long fill slows a quorum at once; 256 KiB keeps that write within the
+/// spread of the others.
 pub(crate) const PREALLOCATION: u64 = 256 * 1024;
 
-/// What [`JournalFile::set_len`] grows a file with.
-static ZEROS: [u8; PREALLOCATION as usize] = [0; PREALLOCATION as usize];
-
-/// The journal's files: writeahead's own, grown with zeros, and with each
-/// fsync lengthened by the delay [`set_sync_delay`] sets. The delay is
-/// spent on the thread that fsyncs, and is a spin, since a sleep this short
-/// overshoots by more than it waits.
+/// The journal's files: writeahead's own, with each fsync lengthened by
+/// the delay [`set_sync_delay`] sets. The delay is spent on the thread
+/// that fsyncs, and is a spin, since a sleep this short overshoots by more
+/// than it waits.
 #[derive(Debug)]
 pub struct JournalFile(SimpleFile);
 
@@ -131,23 +132,8 @@ impl FileIo for JournalFile {
         self.0.len()
     }
 
-    /// Grows the file by writing zeros where writeahead's own file leaves a
-    /// hole. A write into a hole allocates blocks, and on ext4 the fsync of
-    /// every such write then commits the filesystem's journal as well,
-    /// which nearly doubles its time; a write into zeros written ahead
-    /// fsyncs only its data. The fsync of the write that follows makes the
-    /// zeros durable.
     fn set_len(&mut self, len: u64) -> anyhow::Result<()> {
-        let mut end = self.0.len()?;
-        if len <= end {
-            return self.0.set_len(len);
-        }
-        while end < len {
-            let count = (len - end).min(PREALLOCATION);
-            self.0.write_at(end, &ZEROS[..count as usize])?;
-            end += count;
-        }
-        Ok(())
+        self.0.set_len(len)
     }
 }
 
@@ -172,6 +158,11 @@ impl<Op: Clone> Journal<Op> {
             log_dir: dir.to_path_buf(),
             max_file_size,
             preallocation_chunk_size: Some(PREALLOCATION),
+            // A write is one record, which the log must take whole. One
+            // that installs a log, after a view change, a recovery, or a
+            // checkpoint, can hold every retained entry: under load, more
+            // than writeahead's default limit on a batch.
+            max_batch_bytes: isize::MAX as usize,
             ..Default::default()
         });
         wal.start()
@@ -212,7 +203,10 @@ impl<Op: Clone> Journal<Op> {
             }
             Ok::<(), String>(())
         })?;
+        // The journal only writes from here on, and the manager, which
+        // keeps a cache for reads up to date on every write, goes.
         drop(stream);
+        drop(wal);
         let mut journal = Journal {
             writer,
             codec,
@@ -220,7 +214,6 @@ impl<Op: Clone> Journal<Op> {
             last_file: 0,
             trimmed_before: 0,
             trimming: None,
-            _wal: wal,
         };
         let Some((header, last_file)) = header else {
             return Ok((journal, None));
@@ -281,9 +274,10 @@ impl<Op: Clone> Journal<Op> {
 
     /// Starts appending `write` as one record, with one fsync, on
     /// writeahead's writer thread, and returns the future of its landing.
-    /// The first poll sends the record, and the future wakes its waker
-    /// from that thread once the record is durable. Hand what it yields to
-    /// `finish` before the next `submit`.
+    /// The first poll queues the record, since the journal keeps at most a
+    /// write and a trim in writeahead's queue, far below its capacity, and
+    /// the future wakes its waker from that thread once the record is
+    /// durable. Hand what it yields to `finish` before the next `submit`.
     pub fn submit(&self, write: &LogWrite<Op>) -> Landing {
         let mut record = String::new();
         for (i, entry) in write.entries.iter().enumerate() {
@@ -341,7 +335,7 @@ impl<Op: Clone> Journal<Op> {
             .map_or(self.last_file, |(_, file)| (*file).min(self.last_file));
         let trim_out = self.trim_out()?;
         if oldest > self.trimmed_before && !trim_out {
-            // Sent, not awaited: the first poll hands it to the writer,
+            // Sent, not awaited: the first poll queues it for the writer,
             // which deletes the files once the writes queued ahead of it
             // are done, while the caller goes on; a later `finish` reads
             // the answer. A crash before then leaves files a later trim
@@ -378,18 +372,5 @@ impl<Op: Clone> Journal<Op> {
             );
         }
         Ok(false)
-    }
-}
-
-impl<Op> Drop for Journal<Op> {
-    /// Waits until writeahead's writer thread, which the log does not join,
-    /// has done all it was sent, so that the directory can be opened again
-    /// at once. The writer rotates a file after it answers the writes and
-    /// trims committed alongside, so the second of two trims that delete
-    /// nothing comes back once it is idle.
-    fn drop(&mut self) {
-        for _ in 0..2 {
-            let _ = block_on(self.writer.trim_before(0));
-        }
     }
 }

@@ -1,629 +1,438 @@
-//! Measures what the durable log costs.
+//! Measures what durability costs in the kvstore's event loop.
 //!
-//! Three replicas and a set of closed-loop clients run in one process, each
-//! replica on its own thread with the event loop of the kvstore example:
-//! take every message already queued, step the replica, persist, send.
-//! Messages travel over channels, so the numbers isolate what the replicas
-//! do from the network. The state machine is the same fjall store in every
-//! configuration, persisted once a second. Three configurations differ only
-//! in the library and the journal:
+//! Three kvstore nodes run in one process, each on its own thread with the
+//! kvstore's own event loop, store, journal, constants, and timer. What a
+//! node sends goes through a router thread of its own to the node it is
+//! for, as the kvstore's sender thread would put it on the wire, so the
+//! numbers leave the network out. Closed-loop clients send their commands
+//! to node 0 the way the kvstore's client connections do, each waiting for
+//! its reply before it sends the next. Two configurations:
 //!
-//! - `original`: the library as it was before the durable log, embedded
-//!   from commit 0b64760 in `original.rs`, with the fjall store.
-//! - `durable-nojournal`: the current library with the fjall store, the
-//!   journal switched off. The difference from `original` is what the new
-//!   bookkeeping costs in memory.
-//! - `durable`: the current library with the fjall store and the journal:
-//!   one write and one fsync per batch of events on every replica, and
-//!   compaction after every store persist. The difference from
-//!   `durable-nojournal` is the price of the log being on disk.
+//! - `journal`: the kvstore as it runs: a journal write and fsync of what
+//!   the replica changed more than the commit number, one write at a time
+//!   while the event loop steps on, and a store persist every second.
+//! - `no-journal`: the same with the journal off. The difference is what
+//!   the journal costs.
 //!
-//! Run with `cargo run --release -p vsr-bench`. Data goes under
-//! `target/bench`, so fsync hits whatever disk the repository is on; a
-//! tmpfs would make it free and the numbers meaningless.
+//! Each configuration runs `REPEAT` times, three unless set, taking turns
+//! with the other so that drift in the machine falls on both. The report
+//! gives the median of each column, the range of throughput, and the
+//! number of runs in which the cluster changed views, which none should.
+//! Latencies are those of the requests answered in the measured seconds.
+//! `fsync/s` counts, per node, the journal writes and the store persists,
+//! each of which fsyncs; the syncs with which the journal starts a new
+//! file are left out. A run fails if no request is answered for three
+//! seconds or a node's thread ends, and so does a shutdown that takes ten;
+//! either prints what each node last did and which threads still run. The
+//! library's own CPU cost is for `vsr-micro` to measure.
+//!
+//! ```console
+//! cargo run --release -p vsr-bench
+//! CLIENTS=1,16,256 REPEAT=5 cargo run --release -p vsr-bench
+//! CONFIG=journal cargo run --release -p vsr-bench
+//! ```
+//!
+//! Data goes under `target/bench`, or the directory given as the
+//! argument, so fsync hits whatever disk that is on. To emulate other
+//! hardware, put the data on a tmpfs, where fsync costs nothing, and set
+//! `FSYNC_US` to the microseconds each journal write spends after its
+//! fsync, and `NET_US` to the one-way delay of every frame between nodes.
+//! The clients stay on node 0, as if on its machine, and the store's
+//! persists, once a second, stay free.
+//!
+//! ```console
+//! NET_US=100 FSYNC_US=50 cargo run --release -p vsr-bench -- /dev/shm/vsr-bench
+//! ```
 
 #[allow(dead_code)]
-#[path = "original.rs"]
-mod original;
+#[path = "../../examples/kvstore/journal.rs"]
+mod journal;
+#[allow(dead_code)]
+#[path = "../../examples/kvstore/node.rs"]
+mod node;
 
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
+use node::{client_id, config, run_timer, Command, Event, Frame, Node, Start, Stats, TICK};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use vsr_rs::{Checkpoint, ClientRecord, LogEntry, OpNumber, Replica, ReplicaID, StateMachine};
+use vsr_rs::ReplicaID;
 
-/// How often each replica runs its idle logic.
-const TICK: Duration = Duration::from_millis(100);
-/// Ticks between two persists of the store.
-const FLUSH_TICKS: u64 = 10;
-/// Log entries kept behind what the store has persisted.
-const LOG_RETENTION: usize = 1_000;
-const WAL_FILE_SIZE: u64 = 64 * 1024 * 1024;
 const REPLICAS: usize = 3;
 const KEY_SPACE: u64 = 100_000;
+const WARMUP: Duration = Duration::from_secs(2);
+const MEASURE: Duration = Duration::from_secs(8);
+/// How long a run may go without answering a request.
+const STALL: Duration = Duration::from_secs(3);
+/// How long the threads of a run may take to stop.
+const SHUTDOWN: Duration = Duration::from_secs(10);
+const CONFIGURATIONS: [(&str, bool); 2] = [("journal", true), ("no-journal", false)];
 
-/// A write of `value` to `key`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Op {
-    key: u64,
-    value: u64,
+/// The hardware the bench emulates, see the module documentation.
+#[derive(Clone, Copy)]
+struct Emulation {
+    /// One-way delay of every frame between nodes.
+    network: Duration,
+    /// Time each journal write spends after its fsync.
+    fsync: Duration,
 }
 
-// ---------------------------------------------------------------------------
-// The store, shared by every configuration
-
-const APPLIED_KEY: &str = "m/applied";
-
-struct Store {
-    db: Database,
-    keyspace: Keyspace,
-    applied: OpNumber,
+/// What one run measured.
+struct Measurement {
+    ops_per_second: f64,
+    p50: Duration,
+    p99: Duration,
+    max: Duration,
+    /// Journal writes and store persists per node per second.
+    fsyncs_per_second: f64,
+    /// Whether any node left the first view.
+    view_changed: bool,
 }
 
-impl Store {
-    fn open(path: &Path) -> Store {
-        let db = Database::builder(path)
-            .manual_journal_persist(true)
-            .open()
-            .expect("open store");
-        let keyspace = db
-            .keyspace("kv", KeyspaceCreateOptions::default)
-            .expect("open keyspace");
-        Store {
-            db,
-            keyspace,
-            applied: 0,
+/// The threads of one run, and what they share.
+struct Cluster {
+    stop: Arc<AtomicBool>,
+    /// The nodes' event channels.
+    events: Vec<Sender<Event>>,
+    stats: Vec<Arc<Stats>>,
+    nodes: Vec<JoinHandle<()>>,
+    helpers: Vec<JoinHandle<()>>,
+    /// Requests answered so far, by every client.
+    answered: Arc<AtomicU64>,
+    /// The incarnation of node 0, which the clients' ids carry.
+    incarnation: u64,
+}
+
+/// Spawns a thread named `name`.
+fn spawn<T: Send + 'static>(
+    name: String,
+    run: impl FnOnce() -> T + Send + 'static,
+) -> JoinHandle<T> {
+    thread::Builder::new()
+        .name(name)
+        .spawn(run)
+        .expect("spawn a thread")
+}
+
+impl Cluster {
+    /// Starts three new nodes in `dir`, with the journal on or off, a timer
+    /// and a router for each.
+    fn start(dir: &Path, journaled: bool, emulation: Emulation) -> Result<Cluster, String> {
+        let config = config(REPLICAS);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut cluster = Cluster {
+            stop: stop.clone(),
+            events: Vec::new(),
+            stats: Vec::new(),
+            nodes: Vec::new(),
+            helpers: Vec::new(),
+            answered: Arc::new(AtomicU64::new(0)),
+            incarnation: 0,
+        };
+        let mut nodes = Vec::new();
+        for id in 0..REPLICAS {
+            let node_dir = dir.join(format!("node{id}"));
+            let mut node = match Node::open(id, config.clone(), &node_dir, Start::Init) {
+                Ok(node) => node,
+                Err(err) => {
+                    cluster.stop()?;
+                    return Err(err);
+                }
+            };
+            node.journaled = journaled;
+            node.announce_views = false;
+            cluster.stats.push(node.stats.clone());
+            let (events, events_rx) = channel();
+            let (timer_events, stop) = (events.clone(), stop.clone());
+            cluster.helpers.push(spawn(format!("timer {id}"), move || {
+                run_timer(timer_events, || stop.load(Ordering::Relaxed))
+            }));
+            cluster.events.push(events);
+            nodes.push((node, events_rx));
         }
-    }
-
-    fn persist(&self) {
-        self.db
-            .persist(PersistMode::SyncData)
-            .expect("persist store");
-    }
-
-    /// Writes `op` as op `op_number`, and the client's reply if given, in
-    /// one batch.
-    fn write(&mut self, op_number: OpNumber, op: &Op, client: Option<(usize, usize)>) {
-        let mut batch = self.db.batch();
-        batch.insert(
-            &self.keyspace,
-            format!("k/{}", op.key),
-            op.value.to_le_bytes().to_vec(),
-        );
-        if let Some((client_id, request_number)) = client {
-            batch.insert(
-                &self.keyspace,
-                format!("c/{client_id}"),
-                format!("{request_number} -"),
-            );
+        cluster.incarnation = nodes[0].0.incarnation;
+        for (id, (mut node, events_rx)) in nodes.into_iter().enumerate() {
+            let (frames, frames_rx) = channel::<(ReplicaID, Frame)>();
+            let (peers, stop) = (cluster.events.clone(), stop.clone());
+            cluster.helpers.push(spawn(format!("router {id}"), move || {
+                route(frames_rx, peers, stop, emulation.network)
+            }));
+            let wake = cluster.events[id].clone();
+            cluster.nodes.push(spawn(format!("node {id}"), move || {
+                node.run(events_rx, wake, frames);
+            }));
         }
-        batch.insert(&self.keyspace, APPLIED_KEY, op_number.to_string());
-        batch.commit().expect("write store");
-        self.applied = op_number;
-    }
-}
-
-/// The store behind the original library, which hands `apply` the op
-/// alone: it writes the key and the op number.
-struct OriginalStore(Store);
-
-impl original::StateMachine for OriginalStore {
-    type Input = Op;
-    type Output = ();
-
-    fn apply(&mut self, op: Op) {
-        let op_number = self.0.applied + 1;
-        self.0.write(op_number, &op, None);
-    }
-}
-
-/// The store behind the current library: it also writes the client's
-/// reply, which a restart needs.
-struct DurableStore(Store);
-
-impl StateMachine for DurableStore {
-    type Input = Op;
-    type Output = ();
-    type Snapshot = Vec<(u64, u64)>;
-
-    fn apply(&mut self, op_number: OpNumber, entry: &LogEntry<Op>) {
-        self.0.write(
-            op_number,
-            &entry.op,
-            Some((entry.client_id, entry.request_number)),
-        );
+        Ok(cluster)
     }
 
-    fn snapshot(&self) -> Vec<(u64, u64)> {
-        let snapshot = self.0.db.snapshot();
-        snapshot
-            .prefix(&self.0.keyspace, "k/")
-            .map(|guard| {
-                let (key, value) = guard.into_inner().expect("read store");
-                let key = String::from_utf8_lossy(&key[2..]).parse().expect("key");
-                let value = u64::from_le_bytes(value[..8].try_into().expect("value"));
-                (key, value)
+    /// Starts `count` closed-loop clients of node 0. Each returns the
+    /// latencies of the requests it had answered from `measure_from` to
+    /// `end`.
+    fn clients(
+        &mut self,
+        count: usize,
+        measure_from: Instant,
+        end: Instant,
+    ) -> Vec<JoinHandle<Vec<Duration>>> {
+        (0..count)
+            .map(|i| {
+                let events = self.events[0].clone();
+                let stop = self.stop.clone();
+                let answered = self.answered.clone();
+                let connection = client_id(0, self.incarnation, i as u64);
+                spawn(format!("client {i}"), move || {
+                    let mut prng = ChaCha8Rng::seed_from_u64(i as u64);
+                    let (respond_tx, respond_rx) = channel();
+                    let mut latencies = Vec::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        let key = prng.gen_range(0..KEY_SPACE);
+                        let command =
+                            Command::Set(format!("k{key}"), prng.gen::<u64>().to_string());
+                        let sent = Instant::now();
+                        let event = Event::Command {
+                            connection,
+                            command,
+                            respond: respond_tx.clone(),
+                        };
+                        if events.send(event).is_err() || !wait(&respond_rx, &stop) {
+                            break;
+                        }
+                        let now = Instant::now();
+                        answered.fetch_add(1, Ordering::Relaxed);
+                        if (measure_from..=end).contains(&now) {
+                            latencies.push(now - sent);
+                        }
+                    }
+                    latencies
+                })
             })
             .collect()
     }
 
-    fn restore(&mut self, checkpoint: Checkpoint<(), Vec<(u64, u64)>>) {
-        let mut batch = self.0.db.batch();
-        for (key, value) in checkpoint.state {
-            batch.insert(
-                &self.0.keyspace,
-                format!("k/{key}"),
-                value.to_le_bytes().to_vec(),
-            );
+    /// What each node last did, and which threads still run.
+    fn report(&self) -> String {
+        let mut report = String::new();
+        for (id, stats) in self.stats.iter().enumerate() {
+            report.push_str(&format!(
+                "\n  node {id}: {} batches, {} journal writes, {} store persists, view {}, commit {}",
+                stats.batches.load(Ordering::Relaxed),
+                stats.journal_writes.load(Ordering::Relaxed),
+                stats.store_persists.load(Ordering::Relaxed),
+                stats.view_number.load(Ordering::Relaxed),
+                stats.commit_number.load(Ordering::Relaxed),
+            ));
         }
-        for ClientRecord {
-            client_id,
-            request_number,
-            ..
-        } in checkpoint.client_table
+        let running: Vec<&str> = self
+            .nodes
+            .iter()
+            .chain(&self.helpers)
+            .filter(|thread| !thread.is_finished())
+            .filter_map(|thread| thread.thread().name())
+            .collect();
+        report.push_str(&format!("\n  threads running: {}", running.join(", ")));
+        report
+    }
+
+    /// Journal writes and store persists so far, over every node.
+    fn fsyncs(&self) -> u64 {
+        self.stats
+            .iter()
+            .map(|stats| {
+                stats.journal_writes.load(Ordering::Relaxed)
+                    + stats.store_persists.load(Ordering::Relaxed)
+            })
+            .sum()
+    }
+
+    /// Stops every thread, and fails with a report if one does not stop in
+    /// time. The nodes stop on the `Event::Stop` sent here.
+    fn stop(mut self) -> Result<(), String> {
+        self.stop.store(true, Ordering::Relaxed);
+        for events in self.events.drain(..) {
+            let _ = events.send(Event::Stop);
+        }
+        let deadline = Instant::now() + SHUTDOWN;
+        while !self
+            .nodes
+            .iter()
+            .chain(&self.helpers)
+            .all(JoinHandle::is_finished)
         {
-            batch.insert(
-                &self.0.keyspace,
-                format!("c/{client_id}"),
-                format!("{request_number} -"),
-            );
+            if Instant::now() > deadline {
+                return Err(format!("the cluster did not stop:{}", self.report()));
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        batch.insert(
-            &self.0.keyspace,
-            APPLIED_KEY,
-            checkpoint.op_number.to_string(),
-        );
-        batch.commit().expect("write store");
-        self.0
-            .db
-            .persist(PersistMode::SyncAll)
-            .expect("persist store");
-        self.0.applied = checkpoint.op_number;
+        for thread in self.nodes.into_iter().chain(self.helpers) {
+            thread.join().map_err(|_| "a node panicked".to_string())?;
+        }
+        Ok(())
     }
 }
 
-// ---------------------------------------------------------------------------
-// The journal, shared with the kvstore example
-
-#[path = "../../examples/kvstore/journal.rs"]
-mod journal;
-
-use journal::{EntryCodec, Journal};
-
-fn encode_entry(entry: &LogEntry<Op>) -> String {
-    format!(
-        "{} {} {} {}",
-        entry.client_id, entry.request_number, entry.op.key, entry.op.value
-    )
+/// Moves what a node sends to the nodes it is for, until stopped, each
+/// frame `delay` after it was sent. A delay spins the router's thread,
+/// since a sleep this short overshoots by more than it waits.
+fn route(
+    frames: Receiver<(ReplicaID, Frame)>,
+    nodes: Vec<Sender<Event>>,
+    stop: Arc<AtomicBool>,
+    delay: Duration,
+) {
+    if delay.is_zero() {
+        while !stop.load(Ordering::Relaxed) {
+            match frames.recv_timeout(TICK) {
+                Ok((dst, frame)) => {
+                    let _ = nodes[dst].send(frame.into());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        return;
+    }
+    let mut due = VecDeque::new();
+    while !stop.load(Ordering::Relaxed) {
+        loop {
+            match frames.try_recv() {
+                Ok((dst, frame)) => due.push_back((Instant::now() + delay, dst, frame)),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        let now = Instant::now();
+        while due.front().is_some_and(|(at, _, _)| *at <= now) {
+            let (_, dst, frame) = due.pop_front().expect("a frame is due");
+            let _ = nodes[dst].send(frame.into());
+        }
+        std::hint::spin_loop();
+    }
 }
 
-fn decode_entry(text: &str) -> Result<LogEntry<Op>, String> {
-    let mut words = text.split_whitespace();
-    let mut number = || -> Result<u64, String> {
-        words
-            .next()
-            .ok_or("truncated entry")?
-            .parse()
-            .map_err(|_| "bad number".to_string())
+/// Waits for a client's reply. Returns false if the run stopped first.
+fn wait(replies: &Receiver<String>, stop: &AtomicBool) -> bool {
+    loop {
+        match replies.recv_timeout(TICK) {
+            Ok(_) => return true,
+            Err(RecvTimeoutError::Timeout) if !stop.load(Ordering::Relaxed) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Runs `clients` closed-loop clients against three new nodes in `dir`.
+fn run(
+    dir: &Path,
+    journaled: bool,
+    clients: usize,
+    emulation: Emulation,
+) -> Result<Measurement, String> {
+    let _ = std::fs::remove_dir_all(dir);
+    let mut cluster = Cluster::start(dir, journaled, emulation)?;
+    let started = Instant::now();
+    let measure_from = started + WARMUP;
+    let end = measure_from + MEASURE;
+    let client_threads = cluster.clients(clients, measure_from, end);
+    let (mut last_answered, mut last_progress) = (0, Instant::now());
+    let mut fsyncs_from = None;
+    while Instant::now() < end {
+        thread::sleep(Duration::from_millis(50));
+        if fsyncs_from.is_none() && Instant::now() >= measure_from {
+            fsyncs_from = Some(cluster.fsyncs());
+        }
+        let answered = cluster.answered.load(Ordering::Relaxed);
+        if answered > last_answered {
+            (last_answered, last_progress) = (answered, Instant::now());
+        }
+        let failure = if cluster.nodes.iter().any(JoinHandle::is_finished) {
+            Some("a node's thread ended".to_string())
+        } else if last_progress.elapsed() > STALL {
+            Some(format!(
+                "no request answered for {:.1}s",
+                last_progress.elapsed().as_secs_f64()
+            ))
+        } else {
+            None
+        };
+        if let Some(failure) = failure {
+            let report = cluster.report();
+            let _ = cluster.stop();
+            return Err(format!("{failure}:{report}"));
+        }
+    }
+    let fsyncs = cluster.fsyncs() - fsyncs_from.unwrap_or(0);
+    let view_changed = cluster
+        .stats
+        .iter()
+        .any(|stats| stats.view_number.load(Ordering::Relaxed) > 0);
+    cluster.stop()?;
+    let mut latencies: Vec<Duration> = Vec::new();
+    for client in client_threads {
+        latencies.extend(client.join().map_err(|_| "a client panicked".to_string())?);
+    }
+    latencies.sort();
+    let percentile = |p: f64| -> Duration {
+        latencies
+            .get(((latencies.len().max(1) - 1) as f64 * p).round() as usize)
+            .copied()
+            .unwrap_or_default()
     };
-    Ok(LogEntry {
-        client_id: number()? as usize,
-        request_number: number()? as usize,
-        op: Op {
-            key: number()?,
-            value: number()?,
-        },
+    let seconds = MEASURE.as_secs_f64();
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(Measurement {
+        ops_per_second: latencies.len() as f64 / seconds,
+        p50: percentile(0.5),
+        p99: percentile(0.99),
+        max: percentile(1.0),
+        fsyncs_per_second: fsyncs as f64 / seconds / REPLICAS as f64,
+        view_changed,
     })
 }
 
-const ENTRY_CODEC: EntryCodec<Op> = EntryCodec {
-    encode: encode_entry,
-    decode: decode_entry,
-};
-
-// ---------------------------------------------------------------------------
-// One harness for both libraries
-
-/// A reply as the client thread sees it.
-struct ReplyEvent {
-    client_id: usize,
-    request_number: usize,
-    view_number: usize,
-}
-
-/// What a replica thread does with its replica, and a client thread with
-/// its clients, for one library.
-trait Version: Sized + 'static {
-    type Msg: Send + 'static;
-    type Replica: Send + 'static;
-    type Client;
-
-    fn replica(
-        id: ReplicaID,
-        dir: &Path,
-        journaled: bool,
-        batches: Arc<AtomicU64>,
-    ) -> Self::Replica;
-    fn client(id: usize) -> Self::Client;
-    fn request(client: &mut Self::Client, op: Op) -> usize;
-    fn client_messages(client: &mut Self::Client) -> Vec<(ReplicaID, Self::Msg)>;
-    fn reply(client: &mut Self::Client, request_number: usize, view_number: usize) -> bool;
-    fn client_idle(client: &mut Self::Client);
-    fn on_message(replica: &mut Self::Replica, message: Self::Msg);
-    fn on_idle(replica: &mut Self::Replica);
-    fn persist(replica: &mut Self::Replica);
-    fn flush_store(replica: &mut Self::Replica);
-    fn drain(replica: &mut Self::Replica) -> (Vec<(ReplicaID, Self::Msg)>, Vec<ReplyEvent>);
-    /// Messages that may go out before the persist. The original library
-    /// has none.
-    fn drain_early(_replica: &mut Self::Replica) -> Vec<(ReplicaID, Self::Msg)> {
-        Vec::new()
+/// The median of `values`, which must not be empty.
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[middle]
+    } else {
+        (values[middle - 1] + values[middle]) / 2.0
     }
 }
 
-fn config<C>(new: fn() -> C, add: fn(&mut C)) -> C {
-    let mut config = new();
-    for _ in 0..REPLICAS {
-        add(&mut config);
-    }
-    config
-}
-
-struct Original;
-
-impl Version for Original {
-    type Msg = original::Message<Op>;
-    type Replica = original::Replica<OriginalStore>;
-    type Client = original::Client<Op>;
-
-    fn replica(
-        id: ReplicaID,
-        dir: &Path,
-        _journaled: bool,
-        _batches: Arc<AtomicU64>,
-    ) -> Self::Replica {
-        let store = OriginalStore(Store::open(&dir.join("store")));
-        original::Replica::new(
-            id,
-            config(original::Config::new, |c| {
-                c.add_replica();
-            }),
-            store,
-        )
-    }
-    fn client(id: usize) -> Self::Client {
-        original::Client::new(
-            id,
-            config(original::Config::new, |c| {
-                c.add_replica();
-            }),
-        )
-    }
-    fn request(client: &mut Self::Client, op: Op) -> usize {
-        client.on_request(op)
-    }
-    fn client_messages(client: &mut Self::Client) -> Vec<(ReplicaID, Self::Msg)> {
-        client.drain().collect()
-    }
-    fn reply(client: &mut Self::Client, request_number: usize, view_number: usize) -> bool {
-        client.on_reply(request_number, view_number)
-    }
-    fn client_idle(client: &mut Self::Client) {
-        client.on_idle();
-    }
-    fn on_message(replica: &mut Self::Replica, message: Self::Msg) {
-        replica.on_message(message);
-    }
-    fn on_idle(replica: &mut Self::Replica) {
-        replica.on_idle();
-    }
-    fn persist(_replica: &mut Self::Replica) {}
-    fn flush_store(replica: &mut Self::Replica) {
-        replica.state_machine().0.persist();
-    }
-    fn drain(replica: &mut Self::Replica) -> (Vec<(ReplicaID, Self::Msg)>, Vec<ReplyEvent>) {
-        let messages = replica.drain_messages().collect();
-        let replies = replica
-            .drain_replies()
-            .map(|reply| ReplyEvent {
-                client_id: reply.client_id,
-                request_number: reply.request_number,
-                view_number: reply.view_number,
-            })
-            .collect();
-        (messages, replies)
+fn env_list(name: &str, default: &[usize]) -> Vec<usize> {
+    match std::env::var(name) {
+        Ok(list) => list
+            .split(',')
+            .map(|n| n.trim().parse().unwrap_or_else(|_| panic!("bad {name}")))
+            .collect(),
+        Err(_) => default.to_vec(),
     }
 }
 
-/// The current library, with or without the journal.
-struct Durable {
-    replica: Replica<DurableStore>,
-    journal: Option<Journal<Op>>,
-    batches: Arc<AtomicU64>,
-}
-
-struct Current;
-
-impl Version for Current {
-    type Msg = vsr_rs::MessageFor<DurableStore>;
-    type Replica = Durable;
-    type Client = vsr_rs::Client<Op>;
-
-    fn replica(
-        id: ReplicaID,
-        dir: &Path,
-        journaled: bool,
-        batches: Arc<AtomicU64>,
-    ) -> Self::Replica {
-        let store = DurableStore(Store::open(&dir.join("store")));
-        let replica = Replica::new(
-            id,
-            config(vsr_rs::Config::new, |c| {
-                c.add_replica();
-            }),
-            store,
-        );
-        let journal = journaled.then(|| {
-            Journal::open::<()>(&dir.join("journal"), WAL_FILE_SIZE, ENTRY_CODEC)
-                .expect("open journal")
-                .0
-        });
-        Durable {
-            replica,
-            journal,
-            batches,
-        }
-    }
-    fn client(id: usize) -> Self::Client {
-        vsr_rs::Client::new(
-            id,
-            config(vsr_rs::Config::new, |c| {
-                c.add_replica();
-            }),
-        )
-    }
-    fn request(client: &mut Self::Client, op: Op) -> usize {
-        client.on_request(op)
-    }
-    fn client_messages(client: &mut Self::Client) -> Vec<(ReplicaID, Self::Msg)> {
-        client.drain().collect()
-    }
-    fn reply(client: &mut Self::Client, request_number: usize, view_number: usize) -> bool {
-        client.on_reply(request_number, view_number)
-    }
-    fn client_idle(client: &mut Self::Client) {
-        client.on_idle();
-    }
-    fn on_message(replica: &mut Self::Replica, message: Self::Msg) {
-        replica.replica.on_message(message);
-    }
-    fn on_idle(replica: &mut Self::Replica) {
-        replica.replica.on_idle();
-    }
-    fn persist(replica: &mut Self::Replica) {
-        match &mut replica.journal {
-            Some(journal) => {
-                if journal
-                    .persist(&mut replica.replica)
-                    .expect("write journal")
-                {
-                    replica.batches.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            None => {
-                replica.replica.take_log_changes();
-            }
-        }
-    }
-    fn flush_store(replica: &mut Self::Replica) {
-        let applied = replica.replica.applied();
-        replica.replica.state_machine().0.persist();
-        replica
-            .replica
-            .compact(applied.saturating_sub(LOG_RETENTION));
-    }
-    fn drain_early(replica: &mut Self::Replica) -> Vec<(ReplicaID, Self::Msg)> {
-        replica.replica.drain_messages_before_persist().collect()
-    }
-    fn drain(replica: &mut Self::Replica) -> (Vec<(ReplicaID, Self::Msg)>, Vec<ReplyEvent>) {
-        let messages = replica.replica.drain_messages().collect();
-        let replies = replica
-            .replica
-            .drain_replies()
-            .map(|reply| ReplyEvent {
-                client_id: reply.client_id,
-                request_number: reply.request_number,
-                view_number: reply.view_number,
-            })
-            .collect();
-        (messages, replies)
-    }
-}
-
-/// A replica's event loop: every message already queued, then the
-/// messages that need not wait, then persist, then the rest. Idle logic
-/// every tick, a store persist every `FLUSH_TICKS`.
-fn run_replica<V: Version>(
-    mut replica: V::Replica,
-    inbox: Receiver<V::Msg>,
-    peers: Vec<Sender<V::Msg>>,
-    replies: Sender<ReplyEvent>,
-    stop: Arc<AtomicBool>,
-) {
-    let mut next_tick = Instant::now() + TICK;
-    let mut ticks = 0u64;
-    while !stop.load(Ordering::Relaxed) {
-        let timeout = next_tick.saturating_duration_since(Instant::now());
-        match inbox.recv_timeout(timeout) {
-            Ok(message) => V::on_message(&mut replica, message),
-            Err(RecvTimeoutError::Timeout) => {
-                // A tick that fell due while messages kept the loop busy
-                // is not made up for: an idle period means the inbox was
-                // empty for a while, as with the kvstore's timer thread.
-                V::on_idle(&mut replica);
-                ticks += 1;
-                next_tick = Instant::now() + TICK;
-                if ticks.is_multiple_of(FLUSH_TICKS) {
-                    V::flush_store(&mut replica);
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => return,
-        }
-        while let Ok(message) = inbox.try_recv() {
-            V::on_message(&mut replica, message);
-        }
-        for (dst, message) in V::drain_early(&mut replica) {
-            let _ = peers[dst].send(message);
-        }
-        V::persist(&mut replica);
-        let (messages, reply_events) = V::drain(&mut replica);
-        for (dst, message) in messages {
-            let _ = peers[dst].send(message);
-        }
-        for reply in reply_events {
-            let _ = replies.send(reply);
-        }
-    }
-}
-
-struct Sample {
-    ops: u64,
-    latencies: Vec<Duration>,
-}
-
-type Inboxes<V> = Vec<Sender<<V as Version>::Msg>>;
-
-/// Runs `clients` closed-loop clients for `warmup` then `measure`, and
-/// returns what happened during `measure`.
-fn run_clients<V: Version>(
-    clients: usize,
-    peers: &[Sender<V::Msg>],
-    replies: &Receiver<ReplyEvent>,
-    warmup: Duration,
-    measure: Duration,
-) -> Sample {
-    let mut prng = ChaCha8Rng::seed_from_u64(1);
-    let mut states: Vec<V::Client> = (0..clients).map(V::client).collect();
-    let mut sent_at: HashMap<usize, Instant> = HashMap::new();
-    let mut send =
-        |client_id: usize, states: &mut Vec<V::Client>, sent_at: &mut HashMap<usize, Instant>| {
-            let op = Op {
-                key: prng.gen_range(0..KEY_SPACE),
-                value: prng.gen(),
-            };
-            V::request(&mut states[client_id], op);
-            sent_at.insert(client_id, Instant::now());
-            for (dst, message) in V::client_messages(&mut states[client_id]) {
-                let _ = peers[dst].send(message);
-            }
-        };
-    for client_id in 0..clients {
-        send(client_id, &mut states, &mut sent_at);
-    }
-    let started = Instant::now();
-    let measure_from = started + warmup;
-    let end = measure_from + measure;
-    let mut sample = Sample {
-        ops: 0,
-        latencies: Vec::new(),
-    };
-    let mut resend_at = Instant::now() + TICK * 5;
-    loop {
-        let now = Instant::now();
-        if now >= end {
-            return sample;
-        }
-        match replies.recv_timeout(resend_at.saturating_duration_since(now)) {
-            Ok(reply) => {
-                let client = &mut states[reply.client_id];
-                if V::reply(client, reply.request_number, reply.view_number) {
-                    let latency = sent_at[&reply.client_id].elapsed();
-                    if Instant::now() >= measure_from {
-                        sample.ops += 1;
-                        sample.latencies.push(latency);
-                    }
-                    send(reply.client_id, &mut states, &mut sent_at);
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // A request that reached a replica during a view change
-                // was dropped; re-send it, to every replica, as the kvstore
-                // does every few ticks.
-                for client in states.iter_mut() {
-                    V::client_idle(client);
-                    for (dst, message) in V::client_messages(client) {
-                        let _ = peers[dst].send(message);
-                    }
-                }
-                resend_at = Instant::now() + TICK * 5;
-            }
-            Err(RecvTimeoutError::Disconnected) => return sample,
-        }
-    }
-}
-
-/// Runs one configuration with `clients` clients and reports.
-fn run<V: Version>(name: &str, journaled: bool, clients: usize, data: &Path) {
-    let dir = data.join(format!("{name}-{clients}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    let batches = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let (reply_tx, reply_rx) = channel::<ReplyEvent>();
-    let (inboxes, receivers): (Inboxes<V>, Vec<Receiver<V::Msg>>) =
-        (0..REPLICAS).map(|_| channel()).unzip();
-    let mut threads = Vec::new();
-    for (id, inbox) in receivers.into_iter().enumerate() {
-        let replica = V::replica(
-            id,
-            &dir.join(format!("node{id}")),
-            journaled,
-            batches.clone(),
-        );
-        let peers = inboxes.clone();
-        let replies = reply_tx.clone();
-        let stop = stop.clone();
-        threads.push(thread::spawn(move || {
-            run_replica::<V>(replica, inbox, peers, replies, stop)
-        }));
-    }
-    drop(reply_tx);
-    let warmup = Duration::from_secs(2);
-    let measure = Duration::from_secs(8);
-    let batches_before = batches.load(Ordering::Relaxed);
-    let sample = run_clients::<V>(clients, &inboxes, &reply_rx, warmup, measure);
-    let batches_during = batches.load(Ordering::Relaxed) - batches_before;
-    stop.store(true, Ordering::Relaxed);
-    drop(inboxes);
-    for thread in threads {
-        let _ = thread.join();
-    }
-    let mut latencies = sample.latencies;
-    latencies.sort();
-    let percentile = |p: f64| -> Duration {
-        if latencies.is_empty() {
-            return Duration::ZERO;
-        }
-        let index = ((latencies.len() - 1) as f64 * p).round() as usize;
-        latencies[index]
-    };
-    let seconds = measure.as_secs_f64();
-    let ops_per_second = sample.ops as f64 / seconds;
-    let fsyncs = batches_during as f64 / seconds / REPLICAS as f64;
+/// Prints one row of the report, from the runs of one configuration.
+fn report(name: &str, clients: usize, runs: &[Measurement]) {
+    let column = |value: &dyn Fn(&Measurement) -> f64| median(runs.iter().map(value).collect());
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let (low, high) = runs.iter().fold((f64::MAX, 0f64), |(low, high), run| {
+        (low.min(run.ops_per_second), high.max(run.ops_per_second))
+    });
     println!(
-        "{name:<18} {clients:>7} {ops_per_second:>10.0} {:>9.2} {:>9.2} {:>9.2} {fsyncs:>10.0} {:>9.1}",
-        percentile(0.5).as_secs_f64() * 1e3,
-        percentile(0.99).as_secs_f64() * 1e3,
-        percentile(1.0).as_secs_f64() * 1e3,
-        if fsyncs > 0.0 { ops_per_second / fsyncs } else { 0.0 },
+        "{name:<13} {clients:>7} {:>10.0} {:>17} {:>9.2} {:>9.2} {:>9.2} {:>9.0} {:>9.1} {:>6}",
+        column(&|run| run.ops_per_second),
+        format!("{low:.0}-{high:.0}"),
+        column(&|run| ms(run.p50)),
+        column(&|run| ms(run.p99)),
+        column(&|run| ms(run.max)),
+        column(&|run| run.fsyncs_per_second),
+        column(&|run| run.ops_per_second / run.fsyncs_per_second.max(f64::MIN_POSITIVE)),
+        runs.iter().filter(|run| run.view_changed).count(),
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn main() {
@@ -633,38 +442,67 @@ fn main() {
             .nth(1)
             .unwrap_or_else(|| "target/bench".to_string()),
     );
-    let client_counts: Vec<usize> = match std::env::var("CLIENTS") {
-        Ok(list) => list
-            .split(',')
-            .map(|n| n.parse().expect("CLIENTS"))
-            .collect(),
-        Err(_) => vec![1, 8, 64],
+    let client_counts = env_list("CLIENTS", &[1, 16, 64]);
+    let repeat = env_list("REPEAT", &[3])[0].max(1);
+    let configurations: Vec<(&str, bool)> = match std::env::var("CONFIG") {
+        Ok(only) => match CONFIGURATIONS.iter().find(|(name, _)| *name == only) {
+            Some(configuration) => vec![*configuration],
+            None => {
+                eprintln!("unknown CONFIG {only:?}: journal or no-journal");
+                std::process::exit(2);
+            }
+        },
+        Err(_) => CONFIGURATIONS.to_vec(),
     };
+    let micros = |name| Duration::from_micros(env_list(name, &[0])[0] as u64);
+    let emulation = Emulation {
+        network: micros("NET_US"),
+        fsync: micros("FSYNC_US"),
+    };
+    journal::set_sync_delay(emulation.fsync);
     std::fs::create_dir_all(&data).expect("data directory");
     println!(
-        "{} replicas on their own threads, channels between them, fjall store persisted every {}s, data in {}",
-        REPLICAS,
-        (TICK * FLUSH_TICKS as u32).as_secs_f64(),
-        data.display()
+        "{REPLICAS} kvstore nodes on their own threads, channels between them, data in {}; median of {repeat} runs of {}s",
+        data.display(),
+        MEASURE.as_secs()
     );
+    if emulation.network > Duration::ZERO || emulation.fsync > Duration::ZERO {
+        println!(
+            "emulating {} µs between nodes each way and {} µs more per journal fsync",
+            emulation.network.as_micros(),
+            emulation.fsync.as_micros()
+        );
+    }
     println!();
     println!(
-        "{:<18} {:>7} {:>10} {:>9} {:>9} {:>9} {:>10} {:>9}",
-        "configuration", "clients", "ops/s", "p50 ms", "p99 ms", "max ms", "fsync/s", "ops/fsync"
+        "{:<13} {:>7} {:>10} {:>17} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6}",
+        "configuration",
+        "clients",
+        "ops/s",
+        "ops/s range",
+        "p50 ms",
+        "p99 ms",
+        "max ms",
+        "fsync/s",
+        "ops/fsync",
+        "views"
     );
-    let only = std::env::var("CONFIG").ok();
     for &clients in &client_counts {
-        if only.as_deref().is_none_or(|name| name == "original") {
-            run::<Original>("original", false, clients, &data);
+        let mut runs: Vec<Vec<Measurement>> = configurations.iter().map(|_| Vec::new()).collect();
+        for i in 0..repeat {
+            for (runs, (name, journaled)) in runs.iter_mut().zip(&configurations) {
+                let dir = data.join(format!("{name}-{clients}-{i}"));
+                match run(&dir, *journaled, clients, emulation) {
+                    Ok(measurement) => runs.push(measurement),
+                    Err(err) => {
+                        eprintln!("{name} with {clients} clients, run {i}: {err}");
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
-        if only
-            .as_deref()
-            .is_none_or(|name| name == "durable-nojournal")
-        {
-            run::<Current>("durable-nojournal", false, clients, &data);
-        }
-        if only.as_deref().is_none_or(|name| name == "durable") {
-            run::<Current>("durable", true, clients, &data);
+        for (runs, (name, _)) in runs.iter().zip(&configurations) {
+            report(name, clients, runs);
         }
     }
 }

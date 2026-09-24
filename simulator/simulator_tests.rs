@@ -117,10 +117,10 @@ fn fault_script() {
     assert_eq!(1, snapshot.reboots);
 }
 
-/// Runs `script` on a quiet cluster: perfect network, no random crashes,
-/// restarts, blackouts, or flushes, every replica in the liveness core, so
-/// that the script alone decides what happens.
-fn run_script(seed: u64, requests_max: usize, script: &str) -> Simulator {
+/// A quiet cluster: perfect network, no random crashes, restarts,
+/// blackouts, or flushes, every write landing in its step, every replica in
+/// the liveness core, so that a script alone decides what happens.
+fn quiet(seed: u64, requests_max: usize) -> Simulator {
     let _ = env_logger::try_init();
     let mut prng = ChaCha8Rng::seed_from_u64(seed);
     let mut options = Options::lite(&mut prng);
@@ -135,9 +135,15 @@ fn run_script(seed: u64, requests_max: usize, script: &str) -> Simulator {
     options.log_retention = 0;
     options.full_core = true;
     options.requests_max = requests_max;
+    options.write_out_probability = 0.0;
+    Simulator::init(seed, options).expect("options are valid")
+}
+
+/// Runs `script` on a quiet cluster, see [`quiet`].
+fn run_script(seed: u64, requests_max: usize, script: &str) -> Simulator {
     let script = parse_script(script).unwrap();
     let last_tick = script.last().map(|(tick, _)| *tick).unwrap_or(0);
-    let mut simulator = Simulator::init(seed, options).expect("options are valid");
+    let mut simulator = quiet(seed, requests_max);
     if let Err(err) = simulator.run_script(&script, Limits::default()) {
         panic!("script failed at tick {}: {err:#}", simulator.ticks);
     }
@@ -263,43 +269,154 @@ fn power_loss_after_every_checkpoint() {
             simulator.power_losses > simulator.crashes / 2,
             "seed {seed}"
         );
+        assert!(simulator.lost_writes > 0, "seed {seed} lost no write");
     }
 }
 
-/// The liveness core must judge a replica that lost power by what its
-/// disk says, since that is what it restarts as. Seed 17238020951159820783
-/// at commit cf5628a put a replica that had restored a checkpoint, then
-/// lost power before persisting the step, into the core on the strength of
-/// its in-memory status; it restarted recovering, with the primary of its
-/// persisted view crashed for good, and the core never converged.
+/// Runs `simulator` through `script` up to tick `until`, and returns the
+/// faults left.
+fn run_until<'a>(
+    simulator: &mut Simulator,
+    script: &'a [(u64, Fault)],
+    until: u64,
+) -> &'a [(u64, Fault)] {
+    let mut next = 0;
+    while simulator.ticks < until {
+        while next < script.len() && script[next].0 <= simulator.ticks {
+            simulator.apply(script[next].1);
+            next += 1;
+        }
+        simulator.step_run(Limits::default()).unwrap();
+    }
+    &script[next..]
+}
+
+/// A replica that loses power in the step that completes its recovery,
+/// having restored the primary's checkpoint, comes back recovering, and
+/// the liveness core takes it for what it restarts as. Seed
+/// 17238020951159820783 at commit cf5628a put such a replica into the
+/// core as a healthy one; it restarted recovering, with the primary of
+/// its persisted view crashed for good, and the core never converged.
 #[test]
-fn liveness_core_judges_power_lost_replicas_by_disk() {
-    let _ = env_logger::try_init();
-    let seed = 17238020951159820783;
-    let mut prng = ChaCha8Rng::seed_from_u64(seed);
-    let options = Options::swarm(&mut prng);
-    let mut simulator = Simulator::init(seed, options).expect("options are valid");
-    if let Err(err) = simulator.run(Limits::default()) {
-        panic!("seed {seed} failed at tick {}: {err:#}", simulator.ticks);
+fn power_loss_in_the_recovery_step() {
+    let script = parse_script(
+        "300 flush 0\n\
+         300 flush 1\n\
+         300 flush 2\n\
+         500 reboot 1\n",
+    )
+    .unwrap();
+    let mut simulator = quiet(11, 20_000);
+    simulator.options.checkpoint_power_loss_probability = 1.0;
+    simulator.options.full_core = false;
+    let rest = run_until(&mut simulator, &script, 700);
+    assert!(!simulator.is_up(1));
+    assert_eq!(1, simulator.lost_writes);
+    assert!(simulator.replicas()[1].is_recovering());
+    if let Err(err) = simulator.run_script(rest, Limits::default()) {
+        panic!("script failed at tick {}: {err:#}", simulator.ticks);
     }
 }
 
-/// A replica that lost power right after restoring a checkpoint restarts
-/// from a disk that lost its last step, so its commit number in memory
-/// steps back to what was persisted, and its client table is the one the
-/// state machine flushed. Seeds 18270094277230390851 and 4992333150870101077
-/// at commit 534b85c tripped the monotonic commit property on that.
+/// A backup restores a checkpoint, which its state machine makes durable
+/// at once, and loses power before the step is written. It restarts from
+/// a disk behind its state machine: its commit number steps back from
+/// what it had in memory, its log gives way to the checkpoint, and its
+/// client table is the one the state machine flushed. Seeds
+/// 18270094277230390851 and 4992333150870101077 at commit 534b85c tripped
+/// the monotonic commit property on that.
 #[test]
 fn restart_from_a_disk_that_lost_the_last_step() {
-    let _ = env_logger::try_init();
-    for seed in [18270094277230390851, 4992333150870101077] {
-        let mut prng = ChaCha8Rng::seed_from_u64(seed);
-        let options = Options::swarm(&mut prng);
-        let mut simulator = Simulator::init(seed, options).expect("options are valid");
-        if let Err(err) = simulator.run(Limits::default()) {
-            panic!("seed {seed} failed at tick {}: {err:#}", simulator.ticks);
-        }
+    let script = parse_script(
+        "300 partition 2\n\
+         600 flush 0\n\
+         601 flush 1\n\
+         1000 heal 2\n\
+         1600 restart 2\n",
+    )
+    .unwrap();
+    let mut simulator = quiet(10, 20_000);
+    simulator.options.checkpoint_power_loss_probability = 1.0;
+    let rest = run_until(&mut simulator, &script, 1600);
+    assert!(!simulator.is_up(2));
+    assert_eq!(1, simulator.lost_writes);
+    if let Err(err) = simulator.run_script(rest, Limits::default()) {
+        panic!("script failed at tick {}: {err:#}", simulator.ticks);
     }
+    assert!(simulator.is_up(2));
+}
+
+/// A power loss loses whatever a replica did since its last write, a
+/// compaction here, whether the replica was running, caught in a
+/// blackout, or paused.
+#[test]
+fn power_loss_before_a_step_is_written() {
+    let simulator = run_script(
+        8,
+        20_000,
+        "300 flush 0\n\
+         300 power-loss 0\n\
+         600 restart 0\n\
+         900 flush 1\n\
+         900 blackout\n\
+         1000 restart 0\n\
+         1000 restart 1\n\
+         1000 restart 2\n\
+         1500 flush 2\n\
+         1500 crash 2\n\
+         1700 power-loss 2\n\
+         1900 restart 2\n",
+    );
+    assert_eq!(3, simulator.lost_steps);
+    assert_eq!(3, simulator.lost_writes);
+}
+
+/// A replica that lost its disk writes it again as recovering, in the view
+/// it had, before it does anything: a power loss in its first step brings
+/// it back recovering, in that view.
+#[test]
+fn power_loss_before_a_rebooted_replica_writes() {
+    let script = parse_script(
+        "100 crash 0\n\
+         1500 restart 0\n\
+         2000 crash 1\n\
+         2100 reboot 1\n\
+         2100 lose-step 1\n\
+         2500 restart 1\n",
+    )
+    .unwrap();
+    let mut simulator = quiet(20, 20_000);
+    let rest = run_until(&mut simulator, &script, 2100);
+    let view_number = simulator.replicas()[1].view_number();
+    let rest = run_until(&mut simulator, rest, 2101);
+    assert!(view_number > 0, "no view change before the reboot");
+    assert!(!simulator.is_up(1));
+    assert_eq!(1, simulator.lost_steps);
+    let replica = &simulator.replicas()[1];
+    assert!(replica.is_recovering());
+    assert_eq!(view_number, replica.view_number());
+    if let Err(err) = simulator.run_script(rest, Limits::default()) {
+        panic!("script failed at tick {}: {err:#}", simulator.ticks);
+    }
+}
+
+/// A primary rebuilt from its disk restarts into a view change, which
+/// moves its view in memory: the restart is a step. A second power loss
+/// before its write loses it, and brings the replica back from the same
+/// disk.
+#[test]
+fn power_loss_before_a_restart_is_written() {
+    let simulator = run_script(
+        21,
+        20_000,
+        "100 power-loss 0\n\
+         500 restart 0\n\
+         500 power-loss 0\n\
+         900 restart 0\n",
+    );
+    assert_eq!(2, simulator.power_losses);
+    assert_eq!(1, simulator.lost_steps);
+    assert_eq!(1, simulator.lost_writes);
 }
 
 /// Replicas lose power after sending what need not wait and before
@@ -318,6 +435,149 @@ fn power_loss_between_send_and_persist() {
             options.step_power_loss_probability = 0.002;
             options.log_retention = 0;
         });
-        assert!(simulator.power_losses > 0, "seed {seed}");
+        assert!(simulator.lost_writes > 0, "seed {seed} lost no write");
     }
+}
+
+/// Writes stay out while their replicas step on, and replicas lose power
+/// often, for a few seeds. Some crashes find a write out, which lands in
+/// some and is lost in others; replicas execute only what landed writes
+/// hold.
+#[test]
+fn power_loss_with_a_write_out() {
+    for seed in [25, 26, 27] {
+        let simulator = run(seed, |options| {
+            options.write_out_probability = 0.9;
+            options.replica_crash_probability = 0.0;
+            options.replica_restart_probability = 0.02;
+            options.replica_reboot_probability = 0.0;
+            options.replica_flush_probability = 0.05;
+            options.step_power_loss_probability = 0.002;
+        });
+        assert!(simulator.writes_landed_at_crash > 0, "seed {seed}");
+        assert!(
+            simulator.writes_landed_at_crash < simulator.writes_out_at_crash,
+            "seed {seed}"
+        );
+    }
+}
+
+/// Replica 1's write of op 1 stays out, and it loses power: the write
+/// lands whole or not at all, and the restart holds op 1 exactly when it
+/// landed. Over a few seeds both happen, and no acknowledgement of op 1
+/// leaves first.
+#[test]
+fn power_loss_with_a_write_out_lands_it_or_not() {
+    let mut outcomes = [0; 2];
+    for seed in 30..50 {
+        let mut simulator = quiet(seed, 1);
+        simulator.options.request_probability = 0.0;
+        while simulator.ticks < 2 {
+            simulator.step_run(Limits::default()).unwrap();
+        }
+        simulator.options.request_probability = 1.0;
+        simulator.options.write_out_probability = 1.0;
+        simulator.options.write_land_probability = 0.0;
+        while simulator.replicas()[1].op_number() == 0 {
+            simulator.step_run(Limits::default()).unwrap();
+        }
+        simulator.apply(Fault::PowerLoss(1));
+        assert_eq!(1, simulator.writes_out_at_crash, "seed {seed}");
+        let landed = simulator.writes_landed_at_crash;
+        assert_eq!(landed, simulator.replicas()[1].op_number(), "seed {seed}");
+        outcomes[landed] += 1;
+    }
+    assert!(outcomes.iter().all(|&count| count > 0), "{outcomes:?}");
+}
+
+/// A primary executes an op in the step that commits it, sends what it
+/// executed, and loses power before the step's write, taking its commit
+/// number with it; a quorum's disks hold the op. The simulator recorded
+/// commits only at the end of a tick, and failed these seeds of the full
+/// swarm, and one of the lite one, at 32fccf2 with execution at commit
+/// added: in 17626432488707759623 the primary sends a lagging replica a
+/// checkpoint that holds the op, and in 5371941143654615824 it replies to
+/// the client. Every write lands in its step.
+#[test]
+fn op_executed_in_a_step_that_lost_power() {
+    let seeds = [
+        (17626432488707759623, false),
+        (15906584926357116181, false),
+        (860930819270137469, false),
+        (5273492533068031821, false),
+        (5371941143654615824, true),
+    ];
+    for (seed, lite) in seeds {
+        let mut prng = ChaCha8Rng::seed_from_u64(seed);
+        let mut options = if lite {
+            Options::lite(&mut prng)
+        } else {
+            Options::swarm(&mut prng)
+        };
+        options.write_out_probability = 0.0;
+        let mut simulator = Simulator::init(seed, options).expect("options are valid");
+        if let Err(err) = simulator.run(Limits::default()) {
+            panic!("seed {seed} failed at tick {}: {err:#}", simulator.ticks);
+        }
+    }
+}
+
+/// A replica acknowledges an op and enters a view change, and the write
+/// that holds the acknowledged op stays out while the replica goes on into
+/// a later view, whose log replaces the one it acknowledged. The
+/// acknowledgement leaves once the write lands, backed by the log of its
+/// view on disk. `durable-promise` judged it by the replica's log instead,
+/// and failed seeds 2086361338446829227 and 16092517535111013271 of the
+/// full swarm at 32fccf2 with writes that stay out added.
+#[test]
+fn acknowledgement_released_after_a_later_view_started() {
+    for seed in [2086361338446829227, 16092517535111013271] {
+        let mut prng = ChaCha8Rng::seed_from_u64(seed);
+        let options = Options::swarm(&mut prng);
+        assert!(options.write_out_probability > 0.0);
+        let mut simulator = Simulator::init(seed, options).expect("options are valid");
+        if let Err(err) = simulator.run(Limits::default()) {
+            panic!("seed {seed} failed at tick {}: {err:#}", simulator.ticks);
+        }
+    }
+}
+
+/// Replicas' processes die with their state machines anywhere between
+/// their last flush and what they had applied, which their owners make
+/// durable before the restart. A state machine can then be ahead of the
+/// log's commit number, and the restart compacts the log up to it.
+#[test]
+fn process_crashes() {
+    let mut ahead = 0;
+    for seed in [22, 23, 24] {
+        let simulator = run(seed, |options| {
+            options.replica_crash_probability = 0.0005;
+            options.replica_restart_probability = 0.01;
+            options.replica_power_loss_probability = 0.0;
+            options.replica_process_crash_probability = 1.0;
+            options.replica_reboot_probability = 0.0;
+            options.replica_flush_probability = 0.01;
+            options.log_retention = 0;
+        });
+        assert!(simulator.process_crashes > 0, "seed {seed}");
+        ahead += simulator.process_crashes_ahead;
+    }
+    assert!(ahead > 0);
+}
+
+/// A backup and then the primary lose their processes, the backup after a
+/// flush that leaves some of what it applied unflushed.
+#[test]
+fn process_crash_script() {
+    let simulator = run_script(
+        12,
+        20_000,
+        "300 flush 1\n\
+         800 process-crash 1\n\
+         1200 restart 1\n\
+         1500 process-crash 0\n\
+         1900 restart 0\n",
+    );
+    assert_eq!(2, simulator.process_crashes);
+    assert_eq!(0, simulator.power_losses);
 }

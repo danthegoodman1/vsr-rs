@@ -16,6 +16,9 @@ struct Args {
     /// Run a small 3-replica cluster with fewer requests.
     #[arg(long)]
     lite: bool,
+    /// Override the number of replicas.
+    #[arg(long)]
+    replicas: Option<usize>,
     /// Override the number of requests to send.
     #[arg(long)]
     requests_max: Option<usize>,
@@ -45,6 +48,11 @@ struct Args {
     /// the replica restarts from its disk.
     #[arg(long)]
     replica_power_loss_probability: Option<f64>,
+    /// Override the probability that a crash that leaves the power on
+    /// kills the process, which loses the replica's memory, rather than
+    /// pausing it.
+    #[arg(long)]
+    replica_process_crash_probability: Option<f64>,
     /// Override the per-tick probability that every replica loses power.
     #[arg(long)]
     blackout_probability: Option<f64>,
@@ -64,6 +72,14 @@ struct Args {
     /// sending what need not wait, before persisting the step.
     #[arg(long)]
     step_power_loss_probability: Option<f64>,
+    /// Override the probability that a replica's write stays out after the
+    /// step that took it.
+    #[arg(long)]
+    write_out_probability: Option<f64>,
+    /// Override the probability that a write that is out lands at each
+    /// later step.
+    #[arg(long)]
+    write_land_probability: Option<f64>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -114,11 +130,17 @@ fn main() -> anyhow::Result<()> {
     if let Some(p) = args.replica_power_loss_probability {
         options.replica_power_loss_probability = p;
     }
+    if let Some(p) = args.replica_process_crash_probability {
+        options.replica_process_crash_probability = p;
+    }
     if let Some(p) = args.blackout_probability {
         options.blackout_probability = p;
     }
     if let Some(p) = args.replica_flush_probability {
         options.replica_flush_probability = p;
+    }
+    if let Some(n) = args.replicas {
+        options.replica_count = n;
     }
     if let Some(n) = args.log_retention {
         options.log_retention = n;
@@ -128,6 +150,12 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(p) = args.step_power_loss_probability {
         options.step_power_loss_probability = p;
+    }
+    if let Some(p) = args.write_out_probability {
+        options.write_out_probability = p;
+    }
+    if let Some(p) = args.write_land_probability {
+        options.write_land_probability = p;
     }
     let limits = Limits {
         ticks_max_requests: args.ticks_max_requests,
@@ -161,9 +189,15 @@ fn main() -> anyhow::Result<()> {
         simulator.requests_sent, simulator.requests_replied
     );
     println!(
-        "          replicas: crashes={} power_losses={} restarts={} reboots={} flushes={} core={:?} up={:?}",
+        "          replicas: crashes={} power_losses={} process_crashes={} ahead={} lost_steps={} lost_writes={} writes_out_at_crash={} landed={} restarts={} reboots={} flushes={} core={:?} up={:?}",
         simulator.crashes,
         simulator.power_losses,
+        simulator.process_crashes,
+        simulator.process_crashes_ahead,
+        simulator.lost_steps,
+        simulator.lost_writes,
+        simulator.writes_out_at_crash,
+        simulator.writes_landed_at_crash,
         simulator.restarts,
         simulator.reboots,
         simulator.flushes,

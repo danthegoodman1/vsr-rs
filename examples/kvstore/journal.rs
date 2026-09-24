@@ -1,41 +1,44 @@
 //! A replica's persistent state in a write-ahead log from the `writeahead`
 //! crate. The kvstore example and the benchmark share it.
 //!
-//! The log is append-only, so the state is kept as records: an entry
-//! (`E`), a truncation of the entries from an op number on (`T`), a
-//! compaction of the entries up to an op number (`C`), and the counters
-//! (`H`). Every batch the owner writes after a step ends with an `H`
-//! record, and a replay applies a batch only once it has seen that record:
-//! a crash in the middle of a write can leave the first records of a
-//! batch on disk, and those describe a state the replica never
-//! acknowledged. A step that changed nothing but the commit number is not
-//! written at all: the next batch's counters carry it, and a restart
-//! takes the commit number from the state machine when the log is behind
-//! it. Files that hold nothing a replay needs are deleted.
+//! The log is append-only, so the state is kept as the library's writes,
+//! one writeahead record each: a line per entry (`E`), then a line with the
+//! counters (`H`), which says how far the log is compacted and from which
+//! op number the entries replace what came before. A record is
+//! checksummed, and recovery keeps the longest valid prefix of records, so
+//! a write is on disk whole or not at all. Files that hold nothing a replay
+//! needs are deleted.
 
 use futures::executor::block_on;
 use futures::StreamExt;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use vsr_rs::{LogEntry, OpNumber, PersistentState, Replica, StateMachine};
-use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions, WriteHandle};
+use std::fmt::Write;
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
+use vsr_rs::{LogEntry, LogWrite, OpNumber, PersistentState};
+use writeahead::{
+    FileIo, RecordID, SimpleFile, TrimStats, WriteAhead, WriteAheadOptions, WriteHandle,
+};
 
-/// The replica's counters, as last written to the journal.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The counters of one write.
+#[derive(Clone, Copy, Debug)]
 struct Header {
     view_number: usize,
     last_normal_view: usize,
     commit_number: usize,
     log_start: OpNumber,
+    entries_from: OpNumber,
     op_number: OpNumber,
     recovering: bool,
 }
 
-/// One record, as read back.
+/// One line of a write, as read back.
 enum Record<Op> {
     Entry(OpNumber, LogEntry<Op>),
-    Truncate(OpNumber),
-    Compact(OpNumber),
     Header(Header),
 }
 
@@ -46,22 +49,110 @@ pub struct EntryCodec<Op> {
 }
 
 pub struct Journal<Op> {
-    dir: PathBuf,
     writer: WriteHandle,
     codec: EntryCodec<Op>,
-    header: Header,
-    /// The file holding the latest copy of each retained entry.
-    files: BTreeMap<OpNumber, u64>,
+    /// The files holding the retained entries: each maps the first op
+    /// number of a run of entries to the file that holds the run, which
+    /// lasts until the next run. Later runs were written later, so their
+    /// files are no older.
+    runs: BTreeMap<OpNumber, u64>,
+    /// The file holding the latest write.
+    last_file: u64,
     trimmed_before: u64,
-    _wal: WriteAhead<SimpleFile>,
+    /// The deletion of files a replay no longer needs, while writeahead's
+    /// writer thread has yet to answer it, see [`Journal::finish`].
+    trimming: Option<Trim>,
+    _wal: WriteAhead<JournalFile>,
+}
+
+/// A write on its way to the journal, see [`Journal::submit`].
+pub type Landing = Pin<Box<dyn Future<Output = Result<Vec<RecordID>, String>> + Send>>;
+
+/// A deletion of journal files on its way to writeahead's writer thread.
+type Trim = Pin<Box<dyn Future<Output = Result<TrimStats, String>> + Send>>;
+
+/// Nanoseconds every journal fsync in this process takes beyond the
+/// disk's, see [`set_sync_delay`].
+static SYNC_DELAY_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Makes every journal fsync in this process take `delay` longer, as on a
+/// slower disk. The benchmark sets it to emulate a disk with its data on a
+/// tmpfs, where fsync costs nothing; the kvstore leaves it at zero.
+#[allow(dead_code)]
+pub fn set_sync_delay(delay: Duration) {
+    SYNC_DELAY_NANOS.store(delay.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// How far ahead of the records writeahead grows a journal file, see
+/// [`JournalFile::set_len`]. The zeros of each growth go to disk with the
+/// next write and slow it, and every replica grows its file on the same
+/// ops, since their logs match, so a long fill slows a quorum at once;
+/// 256 KiB keeps that write within the spread of the others.
+pub(crate) const PREALLOCATION: u64 = 256 * 1024;
+
+/// What [`JournalFile::set_len`] grows a file with.
+static ZEROS: [u8; PREALLOCATION as usize] = [0; PREALLOCATION as usize];
+
+/// The journal's files: writeahead's own, grown with zeros, and with each
+/// fsync lengthened by the delay [`set_sync_delay`] sets. The delay is
+/// spent on the thread that fsyncs, and is a spin, since a sleep this short
+/// overshoots by more than it waits.
+#[derive(Debug)]
+pub struct JournalFile(SimpleFile);
+
+impl FileIo for JournalFile {
+    fn open(path: &Path) -> anyhow::Result<Self> {
+        SimpleFile::open(path).map(JournalFile)
+    }
+
+    fn open_existing(path: &Path) -> anyhow::Result<Self> {
+        SimpleFile::open_existing(path).map(JournalFile)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.0.read_at(offset, buf)
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+        self.0.write_at(offset, data)
+    }
+
+    fn sync(&mut self) -> anyhow::Result<()> {
+        self.0.sync()?;
+        let delay = Duration::from_nanos(SYNC_DELAY_NANOS.load(Ordering::Relaxed));
+        let synced = Instant::now();
+        while synced.elapsed() < delay {
+            std::hint::spin_loop();
+        }
+        Ok(())
+    }
+
+    fn len(&self) -> anyhow::Result<u64> {
+        self.0.len()
+    }
+
+    /// Grows the file by writing zeros where writeahead's own file leaves a
+    /// hole. A write into a hole allocates blocks, and on ext4 the fsync of
+    /// every such write then commits the filesystem's journal as well,
+    /// which nearly doubles its time; a write into zeros written ahead
+    /// fsyncs only its data. The fsync of the write that follows makes the
+    /// zeros durable.
+    fn set_len(&mut self, len: u64) -> anyhow::Result<()> {
+        let mut end = self.0.len()?;
+        if len <= end {
+            return self.0.set_len(len);
+        }
+        while end < len {
+            let count = (len - end).min(PREALLOCATION);
+            self.0.write_at(end, &ZEROS[..count as usize])?;
+            end += count;
+        }
+        Ok(())
+    }
 }
 
 /// A journal and the state it replayed, if it had run before.
-pub type Opened<Op, Output> = (Journal<Op>, Option<PersistentState<Op, Output>>);
-
-fn utf8(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
+pub type Opened<Op> = (Journal<Op>, Option<PersistentState<Op>>);
 
 fn number(word: Option<&str>) -> Result<usize, String> {
     let word = word.ok_or("truncated journal record")?;
@@ -71,16 +162,16 @@ fn number(word: Option<&str>) -> Result<usize, String> {
 
 impl<Op: Clone> Journal<Op> {
     /// Opens the journal in `dir` and replays it. Returns the replica's
-    /// state if it has run before, without the client table, which the
-    /// state machine keeps.
-    pub fn open<Output: Clone>(
+    /// state if it has run before.
+    pub fn open(
         dir: &Path,
         max_file_size: u64,
         codec: EntryCodec<Op>,
-    ) -> Result<Opened<Op, Output>, String> {
-        let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
+    ) -> Result<Opened<Op>, String> {
+        let mut wal = WriteAhead::<JournalFile>::with_options(WriteAheadOptions {
             log_dir: dir.to_path_buf(),
             max_file_size,
+            preallocation_chunk_size: Some(PREALLOCATION),
             ..Default::default()
         });
         wal.start()
@@ -89,50 +180,49 @@ impl<Op: Clone> Journal<Op> {
             .writer()
             .map_err(|err| format!("cannot write journal: {err}"))?;
         let mut entries: BTreeMap<OpNumber, (LogEntry<Op>, u64)> = BTreeMap::new();
-        let mut header: Option<Header> = None;
-        let mut pending: Vec<(Record<Op>, u64)> = Vec::new();
+        let mut header: Option<(Header, u64)> = None;
         let mut stream = wal
             .create_stream()
             .map_err(|err| format!("cannot read journal: {err}"))?;
         block_on(async {
             while let Some(item) = stream.next().await {
                 let (id, bytes) = item.map_err(|err| format!("cannot read journal: {err}"))?;
-                let line = utf8(&bytes);
-                let record = Self::decode(&codec, &line)?;
-                let Record::Header(latest) = record else {
-                    pending.push((record, id.file_id));
-                    continue;
-                };
-                // The batch is whole: apply it.
-                for (record, file_id) in pending.drain(..) {
-                    match record {
-                        Record::Entry(op_number, entry) => {
-                            entries.insert(op_number, (entry, file_id));
-                        }
-                        Record::Truncate(from) => {
-                            entries.split_off(&from);
-                        }
-                        Record::Compact(log_start) => {
-                            entries = entries.split_off(&(log_start + 1));
-                        }
-                        Record::Header(_) => unreachable!(),
+                let write = String::from_utf8(bytes)
+                    .map_err(|_| "journal record is not UTF-8".to_string())?;
+                let mut written = Vec::new();
+                let mut counters = None;
+                for line in write.lines() {
+                    if counters.is_some() {
+                        return Err("journal record continues after its counters".to_string());
+                    }
+                    match Self::decode(&codec, line)? {
+                        Record::Entry(op_number, entry) => written.push((op_number, entry)),
+                        Record::Header(latest) => counters = Some(latest),
                     }
                 }
-                header = Some(latest);
+                let counters = counters.ok_or(
+                    "journal record without counters, as an older kvstore wrote them: remove the data directory and start the node with --recover",
+                )?;
+                entries = entries.split_off(&(counters.log_start + 1));
+                entries.split_off(&counters.entries_from);
+                for (op_number, entry) in written {
+                    entries.insert(op_number, (entry, id.file_id));
+                }
+                header = Some((counters, id.file_id));
             }
             Ok::<(), String>(())
         })?;
         drop(stream);
         let mut journal = Journal {
-            dir: dir.to_path_buf(),
             writer,
             codec,
-            header: Header::default(),
-            files: BTreeMap::new(),
+            runs: BTreeMap::new(),
+            last_file: 0,
             trimmed_before: 0,
+            trimming: None,
             _wal: wal,
         };
-        let Some(header) = header else {
+        let Some((header, last_file)) = header else {
             return Ok((journal, None));
         };
         let mut log = Vec::with_capacity(header.op_number - header.log_start);
@@ -141,16 +231,17 @@ impl<Op: Clone> Journal<Op> {
                 .remove(&op_number)
                 .ok_or_else(|| format!("journal lacks op {op_number}"))?;
             log.push(entry);
-            journal.files.insert(op_number, file);
+            if journal.runs.last_key_value().map(|(_, run)| *run) != Some(file) {
+                journal.runs.insert(op_number, file);
+            }
         }
-        journal.header = header;
+        journal.last_file = last_file;
         let state = PersistentState {
             view_number: header.view_number,
             last_normal_view: header.last_normal_view,
             commit_number: header.commit_number,
             log_start: header.log_start,
             log,
-            client_table: Vec::new(),
             recovering: header.recovering,
         };
         Ok((journal, Some(state)))
@@ -168,13 +259,12 @@ impl<Op: Clone> Journal<Op> {
                     .ok_or("truncated journal record")?;
                 Record::Entry(op_number, (codec.decode)(text)?)
             }
-            "T" => Record::Truncate(number(words.next())?),
-            "C" => Record::Compact(number(words.next())?),
             "H" => Record::Header(Header {
                 view_number: number(words.next())?,
                 last_normal_view: number(words.next())?,
                 commit_number: number(words.next())?,
                 log_start: number(words.next())?,
+                entries_from: number(words.next())?,
                 op_number: number(words.next())?,
                 recovering: number(words.next())? != 0,
             }),
@@ -182,86 +272,124 @@ impl<Op: Clone> Journal<Op> {
         })
     }
 
-    /// Writes what the last steps changed, in one batch with one fsync,
-    /// then deletes the files that hold nothing a replay needs any more.
-    /// Returns whether anything had to be written.
-    pub fn persist<SM: StateMachine<Input = Op>>(
-        &mut self,
-        replica: &mut Replica<SM>,
-    ) -> Result<bool, String> {
-        let mut records: Vec<Vec<u8>> = Vec::new();
-        let mut written: Vec<OpNumber> = Vec::new();
-        let log_start = replica.log_start();
-        if log_start > self.header.log_start {
-            records.push(format!("C {log_start}").into_bytes());
+    /// Appends `write` as one record, with one fsync, then has writeahead
+    /// delete the files that hold nothing a replay needs any more.
+    pub fn append(&mut self, write: &LogWrite<Op>) -> Result<(), String> {
+        let ids = block_on(self.submit(write))?;
+        self.finish(write, ids)
+    }
+
+    /// Starts appending `write` as one record, with one fsync, on
+    /// writeahead's writer thread, and returns the future of its landing.
+    /// The first poll sends the record, and the future wakes its waker
+    /// from that thread once the record is durable. Hand what it yields to
+    /// `finish` before the next `submit`.
+    pub fn submit(&self, write: &LogWrite<Op>) -> Landing {
+        let mut record = String::new();
+        for (i, entry) in write.entries.iter().enumerate() {
+            let op_number = write.entries_from + i;
+            let _ = writeln!(record, "E {op_number} {}", (self.codec.encode)(entry));
         }
-        if let Some(from) = replica.take_log_changes() {
-            if from <= self.header.op_number {
-                records.push(format!("T {from}").into_bytes());
-            }
-            let first = from.max(log_start + 1);
-            for (i, entry) in replica.log_from(first).iter().enumerate() {
-                let op_number = first + i;
-                records.push(format!("E {op_number} {}", (self.codec.encode)(entry)).into_bytes());
-                written.push(op_number);
-            }
-        }
-        let header = Header {
-            view_number: replica.view_number(),
-            last_normal_view: replica.last_normal_view(),
-            commit_number: replica.commit_number(),
-            log_start,
-            op_number: replica.op_number(),
-            recovering: replica.is_recovering(),
-        };
-        let commit_only = Header {
-            commit_number: self.header.commit_number,
-            ..header
-        } == self.header;
-        if records.is_empty() && commit_only {
-            // Only the commit number moved, which needs no write before
-            // anything the step produced is delivered.
-            self.header.commit_number = header.commit_number;
-            return Ok(false);
-        }
-        records.push(
-            format!(
-                "H {} {} {} {} {} {}",
-                header.view_number,
-                header.last_normal_view,
-                header.commit_number,
-                header.log_start,
-                header.op_number,
-                u8::from(header.recovering)
-            )
-            .into_bytes(),
+        let _ = write!(
+            record,
+            "H {} {} {} {} {} {} {}",
+            write.view_number,
+            write.last_normal_view,
+            write.commit_number,
+            write.log_start,
+            write.entries_from,
+            write.op_number(),
+            u8::from(write.recovering)
         );
-        let ids = block_on(self.writer.write_batch(records))
-            .map_err(|err| format!("cannot write journal: {err}"))?;
-        let file = ids.last().map(|id| id.file_id).unwrap_or(0);
-        for op_number in written {
-            self.files.insert(op_number, file);
+        let writer = self.writer.clone();
+        Box::pin(async move {
+            writer
+                .write_batch(vec![record.into_bytes()])
+                .await
+                .map_err(|err| format!("cannot write journal: {err}"))
+        })
+    }
+
+    /// Records where `write`, which `submit` started, landed, then has
+    /// writeahead delete the files that hold nothing a replay needs any
+    /// more.
+    pub fn finish(&mut self, write: &LogWrite<Op>, ids: Vec<RecordID>) -> Result<(), String> {
+        self.last_file = ids.last().map(|id| id.file_id).unwrap_or(self.last_file);
+        // The replaced entries no longer pin their files; the new ones pin
+        // this one, and the compacted ones leave the first run.
+        self.runs.split_off(&write.entries_from);
+        if !write.entries.is_empty() {
+            self.runs.insert(write.entries_from, self.last_file);
         }
-        // Entries compacted or truncated away no longer pin their files.
-        self.files = self.files.split_off(&(log_start + 1));
-        self.files.split_off(&(header.op_number + 1));
-        self.header = header;
+        let first_retained = write.log_start + 1;
+        let covering = self
+            .runs
+            .range(..=first_retained)
+            .next_back()
+            .map(|(_, file)| *file);
+        self.runs = self.runs.split_off(&first_retained);
+        if let Some(file) = covering {
+            if write.op_number() >= first_retained {
+                self.runs.entry(first_retained).or_insert(file);
+            }
+        }
         // A replay needs the files from the oldest retained entry's on, and
         // the one just written, which holds the counters.
-        let oldest = self.files.values().min().copied().unwrap_or(file).min(file);
-        if oldest > self.trimmed_before {
-            let stats = block_on(self.writer.trim_before(oldest))
-                .map_err(|err| format!("cannot trim journal: {err}"))?;
-            if stats.files_deleted > 0 {
-                log::debug!(
-                    "journal {}: deleted {} files, {} bytes",
-                    self.dir.display(),
-                    stats.files_deleted,
-                    stats.bytes_reclaimed
-                );
-            }
+        let oldest = self
+            .runs
+            .first_key_value()
+            .map_or(self.last_file, |(_, file)| (*file).min(self.last_file));
+        let trim_out = self.trim_out()?;
+        if oldest > self.trimmed_before && !trim_out {
+            // Sent, not awaited: the first poll hands it to the writer,
+            // which deletes the files once the writes queued ahead of it
+            // are done, while the caller goes on; a later `finish` reads
+            // the answer. A crash before then leaves files a later trim
+            // deletes.
+            let writer = self.writer.clone();
+            self.trimming = Some(Box::pin(async move {
+                writer
+                    .trim_before(oldest)
+                    .await
+                    .map_err(|err| format!("cannot trim journal: {err}"))
+            }));
+            self.trim_out()?;
             self.trimmed_before = oldest;
         }
-        Ok(true)
+        Ok(())
+    }
+
+    /// Reads writeahead's answer to the trim that is out, if it has come.
+    /// Returns whether the trim is still out.
+    fn trim_out(&mut self) -> Result<bool, String> {
+        let Some(trim) = &mut self.trimming else {
+            return Ok(false);
+        };
+        let Poll::Ready(stats) = trim.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+            return Ok(true);
+        };
+        self.trimming = None;
+        let stats = stats?;
+        if stats.files_deleted > 0 {
+            log::debug!(
+                "journal: deleted {} files, {} bytes",
+                stats.files_deleted,
+                stats.bytes_reclaimed
+            );
+        }
+        Ok(false)
+    }
+}
+
+impl<Op> Drop for Journal<Op> {
+    /// Waits until writeahead's writer thread, which the log does not join,
+    /// has done all it was sent, so that the directory can be opened again
+    /// at once. The writer rotates a file after it answers the writes and
+    /// trims committed alongside, so the second of two trims that delete
+    /// nothing comes back once it is idle.
+    fn drop(&mut self) {
+        for _ in 0..2 {
+            let _ = block_on(self.writer.trim_before(0));
+        }
     }
 }

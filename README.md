@@ -54,8 +54,9 @@ A `Replica` and a `Client` are state machines that their owner steps:
 2. Tell each one that time has passed with `on_idle`, at a regular
    interval. That drives heartbeats, retransmission, and the view change
    timer.
-3. Afterwards, drain what they want sent with `drain_messages`,
-   `drain_replies`, and `drain`, and deliver it however you like.
+3. Afterwards, persist the replica's write with `persist`. Then drain
+   what they want sent with `drain_messages`, `drain_replies`, and
+   `drain`, and deliver it however you like.
 
 You provide the rest:
 
@@ -68,20 +69,24 @@ You provide the rest:
   arrive, are duplicated, or are reordered.
 - **Timers.** Call `on_idle` at a fixed period. The library measures time
   in idle periods, not seconds.
-- **Persistence.** After each step, before delivering what the step
-  produced, write what `PersistentState` describes: a few counters, the
-  client table, and the log entries from the change marker on. Pass it to
-  `Replica::restart` when the replica restarts, with the number of ops the
-  state machine had made durable; the replica applies the rest again. That
-  ordering is the whole durability argument: an acknowledgement leaves only
-  after the entry it covers is on disk, and the replica executes committed
-  operations only when its replies are drained, after the step is
-  persisted, so a state machine that persists what it executes never gets
-  ahead of the log. Two things cost nothing in that argument, and the
-  library exposes both: messages that promise nothing about the sender's
-  durable state, a `Prepare` above all, can leave before the write, which
-  overlaps the primary's write with the backups', and a step that changed
-  only the commit number needs no write before delivery.
+- **Persistence.** After each step, call `persist` with a function that
+  makes the replica's `LogWrite` durable: a few counters and the log
+  entries that changed. Handing the write back releases what waited for
+  it. An owner that writes while the replica goes on takes the write with
+  `take_write` and hands it back with `persisted` itself. Rebuild the
+  replica's `PersistentState` from the writes when it restarts, and pass
+  it to `Replica::restart` with a state machine made durable as of the ops
+  it had applied, and the client table it keeps with them; the replica
+  applies the rest again. That ordering is the whole durability argument:
+  an acknowledgement leaves only after the entry it covers is on disk, and
+  the replica executes a committed operation only once a handed-back write
+  holds it, so a state machine that persists what it executes never gets
+  ahead of the log. Three things cost nothing in that argument, and the
+  library exposes all three: messages that promise nothing about the
+  sender's durable state, a `Prepare` above all, can leave before the
+  write, which overlaps the primary's write with the backups'; replies
+  can leave before it too, since an earlier write holds what they answer;
+  and a write that changed only the commit number needs no sync.
 - **Compaction.** Once the state machine has made its state durable, call
   `compact` with the op number it reached. A replica that needs entries
   another one has compacted gets a checkpoint of its state instead.
@@ -105,14 +110,14 @@ here.
 | Recovery | 4.3 | done, with a persisted view number[^michael17] |
 | State transfer | 5.2 | done, without the truncation defect[^vanlightly22] |
 | Checkpoints and log compaction | 5.1 | done, checkpoints come from the state machine |
-| Durable log | | done, the owner persists after every step |
+| Durable log | | done, the owner persists a write after every step |
 | Reconfiguration | 7 | out of scope, membership is fixed |
 
 ## Getting started
 
 A replicated counter, with three replicas and one client in a single
 process. A test or a simulator delivers the messages like this; a real
-program puts them on the wire.
+program persists each write and puts the messages on the wire.
 
 ```rust
 use vsr_rs::{Checkpoint, Client, Config, LogEntry, OpNumber, Replica, StateMachine};
@@ -151,6 +156,9 @@ client.on_request(5);
 loop {
     let mut queue: Vec<_> = client.drain().collect();
     for replica in &mut replicas {
+        // Nothing to make durable in memory: hand the write straight back.
+        let write = replica.take_write();
+        replica.persisted(write);
         queue.extend(replica.drain_messages());
         for reply in replica.drain_replies() {
             println!("request {} -> {}", reply.request_number, reply.result);
@@ -167,16 +175,17 @@ loop {
 
 For a complete program, [`examples/kvstore`](examples/kvstore) is a
 replicated key-value store over TCP that speaks a Redis-like protocol. It
-persists the replica's log with the `writeahead` crate, one fsync per batch
-of events, and keeps the store in a `fjall` database that is persisted once
-a second, after which the log is compacted. Start three nodes, each in its
-own terminal:
+persists the replica's log with the `writeahead` crate, one fsync per
+journal write, which holds every batch of events stepped while the last
+write was out, and keeps the store in a `fjall` database that is persisted
+once a second, after which the log is compacted. Start three nodes of a new
+cluster, each in its own terminal:
 
 ```console
 cargo build --example kvstore
-./target/debug/examples/kvstore --id 0 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6379
-./target/debug/examples/kvstore --id 1 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6380
-./target/debug/examples/kvstore --id 2 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6381
+./target/debug/examples/kvstore --init --id 0 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6379
+./target/debug/examples/kvstore --init --id 1 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6380
+./target/debug/examples/kvstore --init --id 2 --replicas 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --listen 127.0.0.1:6381
 ```
 
 Talk to any of them:
@@ -191,17 +200,17 @@ bar
 ```
 
 Stop node 0 with Ctrl-C, or kill it. The others pick a new primary within
-a second and keep serving. Start node 0 again and it comes back from its
-disk and rejoins as a backup. Kill all three and start them again, and
-they come back with everything they had committed.
+a second and keep serving. Start node 0 again, without `--init`, and it
+comes back from its disk and rejoins as a backup. Kill all three and start
+them again, and they come back with everything they had committed.
 
 ## Verification
 
-To run the integration tests, type:
-
+To run the integration tests, the simulator's tests, and the kvstore
+example's, type:
 
 ```console
-cargo test --workspace
+cargo test --workspace --all-targets
 ```
 
 ### Simulator
@@ -210,19 +219,29 @@ cargo test --workspace
 TigerBeetle's VOPR. It runs a cluster and its clients in one thread, passes
 every message through a network that loses, replays, and delays them,
 crashes and restarts replicas, sometimes from what they persisted after a
-power loss, sometimes with their disk wiped, cuts the power of every
-replica at once, or of a replica between sending what need not wait and
-persisting the step, makes state machines flush and replicas compact
-their logs, and checks a set of safety properties after every tick:
+power loss, sometimes after their process died with a state machine
+ahead of its last flush, sometimes with their disk wiped, cuts the power
+of every replica at once, or of a replica between sending what need not
+wait and persisting the step, makes state machines flush and replicas
+compact their logs, and checks a set of safety properties after every
+tick:
 
 - committed prefixes agree on every replica,
-- committed operations survive on enough replicas,
+- committed operations survive on enough disks,
+- every operation a replica executed is on its disk,
 - every reply matches a committed request,
 - no request runs twice.
 
+It also checks every message as it leaves: a replica acknowledges an op,
+takes part in a view change, or answers a recovery only with state its
+disk holds.
+
 Each replica has a disk that the simulator writes the way an owner would,
-from the change marker after every step, and a replica that lost power
-is rebuilt from it.
+from the replica's write after every step. In most runs a write can also
+stay out for several steps while the replica goes on, as with an owner
+that writes on another thread. A replica that loses power loses its memory
+at once, with any step it had not yet written, lands a write that was out
+whole or not at all, and is rebuilt from its disk.
 
 The seed determines the whole configuration, from cluster size to fault
 rates. Once the requests are done, faults stop and a random majority of
@@ -250,19 +269,54 @@ scripts/simulate --report          # the runs of the current commit
 scripts/simulate --report --all    # every commit ever run
 ```
 
-### Benchmark
-
-[`bench/`](bench) measures what the durable log costs. Three replicas run
-on their own threads with the event loop of the kvstore example and a
-fjall store, and a set of closed-loop clients drives them over channels.
-It compares the library as it was before the durable log, embedded from
-the commit that preceded it, with the current library with the journal
-off and on, so the cost of the new bookkeeping and the cost of the fsync
-per batch can be read apart.
+To check that the simulator catches persistence bugs, `scripts/mutants`
+plants each of a few known ones in a scratch copy, such as an
+acknowledgement sent before its write, and reports how many of 400 seeds
+catch it:
 
 ```console
+scripts/mutants
+```
+
+### Benchmark
+
+[`bench/`](bench) holds two benchmarks.
+
+`vsr-micro` measures the library alone: three replicas and a set of
+closed-loop clients in one thread, with no I/O, reporting the time the
+replicas take and the messages between them per operation, by the number
+of operations in flight. On the development machine, the library before
+the durable log (commit `0b64760`) and now, through the same loop:
+
+| ops in flight | 1 | 16 | 64 | 256 | 1,024 | 4,096 | 16,384 |
+|---|---|---|---|---|---|---|---|
+| before, ns/op | 314 | 166 | 189 | 273 | 627 | 2,152 | 9,493 |
+| now, ns/op | 463 | 155 | 143 | 147 | 169 | 186 | 214 |
+
+With one operation in flight the library now spends more on each, on the
+write it builds and on holding back what waits for it; with more, it
+spends less, and the cost no longer grows with the operations in flight.
+Messages per operation fell from four to two once several are in flight:
+a backup acknowledges a batch of `Prepare`s with one `PrepareOk`.
+
+`vsr-bench` measures what durability costs in the kvstore's event loop.
+Three kvstore nodes run in one process, each on its own thread with the
+kvstore's event loop, store, journal, and timer, with channels between
+them in place of TCP, and closed-loop clients send commands to node 0.
+It runs the nodes with the journal on and off, several times each, and
+reports the median and the spread of throughput, latency percentiles, and
+fsyncs per node per second, journal writes and store persists alike.
+
+It can also emulate other hardware: with the data on a tmpfs, where
+fsync costs nothing, `FSYNC_US` adds that many microseconds to every
+journal fsync, and `NET_US` delays every frame between nodes by that many
+microseconds each way.
+
+```console
+cargo run --release -p vsr-bench --bin vsr-micro
 cargo run --release -p vsr-bench
-CLIENTS=1,16,256 cargo run --release -p vsr-bench
+CLIENTS=1,16,256 REPEAT=5 cargo run --release -p vsr-bench
+NET_US=100 FSYNC_US=50 cargo run --release -p vsr-bench -- /dev/shm/vsr-bench
 ```
 
 ### Coverage

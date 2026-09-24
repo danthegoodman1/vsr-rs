@@ -1,15 +1,22 @@
 //! Properties are invariants checked after every tick and at the
 //! end of the run.
 
-use crate::state_machine::{Accumulator, Op};
+use crate::disk::Disk;
+use crate::network::message_kind;
+use crate::state_machine::{Accumulator, Msg, Op};
 use anyhow::{ensure, Result};
 use std::collections::{BTreeMap, BTreeSet};
-use vsr_rs::{ClientID, LogEntry, OpNumber, Replica, Reply, RequestNumber};
+use vsr_rs::{
+    ClientID, LogEntry, LogSegment, Message, OpNumber, PersistentState, Replica, ReplicaID, Reply,
+    RequestNumber,
+};
 
 /// Read-only view of the simulated system handed to properties.
 pub struct SimContext<'a> {
     pub tick: u64,
     pub replicas: &'a [Replica<Accumulator>],
+    /// Each replica's disk.
+    pub disks: &'a [Disk],
     /// Every op committed so far, in op number order: the simulator
     /// records each one from the log of the replica that committed it, at
     /// the tick it did, before any replica can compact it. Op `n` is at
@@ -28,17 +35,36 @@ pub trait Property {
     /// Called after every tick.
     fn check(&mut self, ctx: &SimContext) -> Result<()>;
 
+    /// Called before each round of the replicas' steps, after whatever
+    /// came before them in the tick: a step can lose power and take its
+    /// replica's commit number with it.
+    fn before_steps(&mut self, _ctx: &SimContext) -> Result<()> {
+        Ok(())
+    }
+
     /// Called once at the end of the run, after the network has been drained
     /// with faults disabled.
     fn finalize(&mut self, _ctx: &SimContext) -> Result<()> {
         Ok(())
     }
 
-    /// Called when a replica comes back from a crash as something other
-    /// than what it was in memory: with no memory at all, or from a disk
-    /// that lost the last step. Whatever the property tracked about that
-    /// replica starts over.
+    /// Called when a replica is rebuilt as something other than what it
+    /// was in memory: with no memory at all, or from a disk behind its
+    /// commit number. Whatever the property tracked about that replica
+    /// starts over.
     fn on_restart(&mut self, _replica_id: usize) {}
+
+    /// Called as replica `id` sends `message`, with the replica and its
+    /// disk as of then.
+    fn on_send(
+        &mut self,
+        _id: ReplicaID,
+        _replica: &Replica<Accumulator>,
+        _disk: &PersistentState<Op>,
+        _message: &Msg,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The default property set.
@@ -50,27 +76,23 @@ pub fn default_properties() -> Vec<Box<dyn Property>> {
         Box::new(NoDuplicateOps::default()),
         Box::new(RepliesMatchCommits::default()),
         Box::new(Durability::default()),
+        Box::new(ExecutedOpsDurable::default()),
+        Box::new(DurablePromise),
         Box::new(Convergence),
     ]
 }
 
-/// Whether `replica` holds the committed op `op_number`, which is `entry`:
-/// in its log, or in its state if it has compacted the entry.
-fn holds(replica: &Replica<Accumulator>, op_number: OpNumber, entry: &LogEntry<Op>) -> bool {
-    let log_start = replica.log_start();
-    op_number <= log_start || replica.log().get(op_number - log_start - 1) == Some(entry)
-}
-
-/// Every committed op is held by enough replicas to survive any view
-/// change: every quorum the replicas that are not recovering could form
-/// must include one that holds it. With nobody recovering that is a
-/// majority. A recovering replica holds nothing and takes part in no quorum,
-/// so it counts on neither side. A primary only commits on a quorum of
-/// `PrepareOk` messages, and a backup only acknowledges an op once it is in
-/// its log, so this must hold at the tick the commit happens, on whichever
-/// replica committed it. A crashed replica still holds what is on its disk,
-/// which the simulator keeps equal to its log. Committed prefixes are never
-/// truncated, so each committed op needs checking once per replica.
+/// Every committed op is on enough disks to survive any view change: every
+/// quorum that the replicas whose disks are not recovering could form must
+/// include a disk that holds it. With nobody recovering that is a majority.
+/// A recovering replica holds nothing and takes part in no quorum, so it
+/// counts on neither side. A primary commits only on a quorum of
+/// `PrepareOk` messages, and a replica sends one only once its disk holds
+/// the op, so this must hold as soon as the commit happens, on whichever
+/// replica committed it: it is checked before every round of steps, which
+/// can lose power and the commit number with it, and after every tick.
+/// Committed prefixes are never truncated, so each committed op needs
+/// checking once per replica.
 #[derive(Default)]
 pub struct Durability {
     /// Per replica: number of committed ops already verified.
@@ -88,13 +110,17 @@ impl Property for Durability {
         }
     }
 
+    fn before_steps(&mut self, ctx: &SimContext) -> Result<()> {
+        self.check(ctx)
+    }
+
     fn check(&mut self, ctx: &SimContext) -> Result<()> {
         self.verified.resize(ctx.replicas.len(), 0);
         let quorum = ctx.replicas.len() / 2 + 1;
         let participants = ctx
-            .replicas
+            .disks
             .iter()
-            .filter(|replica| !replica.is_recovering())
+            .filter(|disk| !disk.state.recovering)
             .count();
         let needed = (participants + 1).saturating_sub(quorum);
         for (id, replica) in ctx.replicas.iter().enumerate() {
@@ -102,19 +128,221 @@ impl Property for Durability {
             for op_number in self.verified[id] + 1..=commit {
                 let entry = &ctx.committed[op_number - 1];
                 let copies = ctx
-                    .replicas
+                    .disks
                     .iter()
-                    .filter(|other| !other.is_recovering() && holds(other, op_number, entry))
+                    .filter(|disk| !disk.state.recovering && disk.holds(op_number, entry))
                     .count();
                 ensure!(
                     copies >= needed,
-                    "tick {}: replica {id} committed op {op_number} held by {copies} of {participants} replicas not recovering, {needed} needed to meet every quorum of {quorum}",
+                    "tick {}: replica {id} committed op {op_number} held by {copies} of {participants} disks not recovering, {needed} needed to meet every quorum of {quorum}",
                     ctx.tick
                 );
             }
             self.verified[id] = commit;
         }
         Ok(())
+    }
+}
+
+/// Every op a replica has executed is on its disk: in the state machine's
+/// flush, or in the log as memory holds it. Otherwise a state machine that
+/// persists what it executes could hold an op that a restart cannot find
+/// in the log. Once verified, an op stays so: the disk drops a log entry
+/// only after the state machine has flushed it. It holds after each step,
+/// not before: a replica that restored a checkpoint in a delivery has its
+/// owner make it durable as its step begins.
+#[derive(Default)]
+pub struct ExecutedOpsDurable {
+    /// Per replica: the ops already verified.
+    verified: Vec<OpNumber>,
+}
+
+impl Property for ExecutedOpsDurable {
+    fn name(&self) -> &'static str {
+        "executed-ops-durable"
+    }
+
+    fn on_restart(&mut self, replica_id: usize) {
+        if let Some(verified) = self.verified.get_mut(replica_id) {
+            *verified = 0;
+        }
+    }
+
+    fn check(&mut self, ctx: &SimContext) -> Result<()> {
+        self.verified.resize(ctx.replicas.len(), 0);
+        for (id, replica) in ctx.replicas.iter().enumerate() {
+            let disk = &ctx.disks[id];
+            let applied = replica.applied();
+            for op_number in self.verified[id].max(disk.applied) + 1..=applied {
+                let entry = op_number
+                    .checked_sub(replica.log_start() + 1)
+                    .and_then(|index| replica.log().get(index));
+                ensure!(
+                    entry.is_some_and(|entry| disk.holds(op_number, entry)),
+                    "tick {}: replica {id} executed op {op_number}, which its disk does not hold",
+                    ctx.tick
+                );
+            }
+            self.verified[id] = applied;
+        }
+        Ok(())
+    }
+}
+
+/// A replica sends these only for state on its disk, which each message is
+/// checked against as it leaves:
+///
+/// - `PrepareOk` for op `n` in view `v`: the disk was last normal in `v`
+///   and holds the replica's uncommitted entries up to op `n`, or was last
+///   normal in a later view. A write can be out while the replica goes on
+///   into a later view, whose log replaces the one the acknowledgement
+///   covers; once the replica was last normal after `v`, the disk's log of
+///   view `v` is the reference instead of the replica's.
+/// - `StartViewChange`, `DoViewChange`, and `StartView` for view `v`: the
+///   disk's view is at least `v`.
+/// - `DoViewChange` and `StartView`: the disk holds the log they carry.
+/// - `Recovery` for view `v`: the disk is recovering, in `v` or later.
+/// - `RecoveryResponse` for view `v`: the disk is recovering no more, its
+///   view is at least `v`, and it holds the log a primary's response
+///   carries.
+///
+/// A later delivery in the same step can supersede a message the step
+/// produced earlier and change what it described: a `DoViewChange` for `v`
+/// once view `v` starts, a `StartView` or a primary's `RecoveryResponse`
+/// for `v` once a later view does, a `Recovery` once the recovery
+/// completes. The disk then holds the later state, which the check takes
+/// instead. `Prepare`, `Commit`, `GetState`, and `NewState` ask for or
+/// report state the receiver acts on, and may leave before the write.
+pub struct DurablePromise;
+
+impl Property for DurablePromise {
+    fn name(&self) -> &'static str {
+        "durable-promise"
+    }
+
+    fn check(&mut self, _ctx: &SimContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_send(
+        &mut self,
+        id: ReplicaID,
+        replica: &Replica<Accumulator>,
+        disk: &PersistentState<Op>,
+        message: &Msg,
+    ) -> Result<()> {
+        let backed = match message {
+            Message::PrepareOk {
+                view_number,
+                op_number,
+                ..
+            } => {
+                !disk.recovering
+                    && (disk.last_normal_view > *view_number
+                        || (disk.last_normal_view == *view_number
+                            && disk.log_start + disk.log.len() >= *op_number
+                            && (replica.last_normal_view() > *view_number
+                                || holds_uncommitted(disk, replica, *op_number))))
+            }
+            Message::StartViewChange { view_number, .. } => disk.view_number >= *view_number,
+            Message::DoViewChange {
+                view_number,
+                last_normal_view,
+                segment,
+                ..
+            } => {
+                disk.view_number >= *view_number
+                    && (disk.last_normal_view >= *view_number
+                        || (disk.last_normal_view >= *last_normal_view
+                            && holds_segment(disk, segment)))
+            }
+            Message::StartView {
+                view_number,
+                segment,
+                ..
+            } => {
+                disk.view_number >= *view_number
+                    && (disk.last_normal_view > *view_number
+                        || (disk.last_normal_view == *view_number && holds_segment(disk, segment)))
+            }
+            Message::Recovery { view_number, .. } => {
+                disk.view_number >= *view_number
+                    && (disk.recovering || disk.last_normal_view >= *view_number)
+            }
+            Message::RecoveryResponse {
+                view_number, state, ..
+            } => {
+                !disk.recovering
+                    && disk.view_number >= *view_number
+                    && (disk.last_normal_view > *view_number
+                        || state
+                            .as_ref()
+                            .is_none_or(|state| holds_segment(disk, &state.segment)))
+            }
+            Message::Request { .. }
+            | Message::Prepare { .. }
+            | Message::Commit { .. }
+            | Message::GetState { .. }
+            | Message::NewState { .. } => true,
+        };
+        ensure!(
+            backed,
+            "replica {id} sent {} for view {} that its disk does not back: view {}, last normal view {}, op number {}, recovering {}",
+            message_kind(message),
+            message_view(message),
+            disk.view_number,
+            disk.last_normal_view,
+            disk.log_start + disk.log.len(),
+            disk.recovering
+        );
+        Ok(())
+    }
+}
+
+/// Whether the disk holds the entries the replica has in memory after its
+/// commit number, up to op `op_number`, where both hold them. The
+/// committed ones are what `Durability` and `CommittedPrefixAgreement`
+/// look after.
+fn holds_uncommitted(
+    disk: &PersistentState<Op>,
+    replica: &Replica<Accumulator>,
+    op_number: OpNumber,
+) -> bool {
+    let from = replica
+        .commit_number()
+        .max(replica.log_start())
+        .max(disk.log_start);
+    (from + 1..=op_number.min(replica.op_number())).all(|op| {
+        disk.log.get(op - disk.log_start - 1) == replica.log().get(op - replica.log_start() - 1)
+    })
+}
+
+/// Whether the disk holds every entry of `segment`, or has compacted it,
+/// which only committed entries are.
+fn holds_segment(disk: &PersistentState<Op>, segment: &LogSegment<Op, i64, Accumulator>) -> bool {
+    let start = segment.start();
+    let skip = disk.log_start.saturating_sub(start);
+    if skip >= segment.entries.len() {
+        return true;
+    }
+    let from = start + skip - disk.log_start;
+    disk.log.get(from..from + segment.entries.len() - skip) == Some(&segment.entries[skip..])
+}
+
+/// The view a message names, for error messages.
+fn message_view(message: &Msg) -> usize {
+    match message {
+        Message::Request { .. } => 0,
+        Message::Prepare { view_number, .. }
+        | Message::PrepareOk { view_number, .. }
+        | Message::Commit { view_number, .. }
+        | Message::GetState { view_number, .. }
+        | Message::NewState { view_number, .. }
+        | Message::StartViewChange { view_number, .. }
+        | Message::DoViewChange { view_number, .. }
+        | Message::StartView { view_number, .. }
+        | Message::Recovery { view_number, .. }
+        | Message::RecoveryResponse { view_number, .. } => *view_number,
     }
 }
 
@@ -171,11 +399,13 @@ impl Property for CommitNumberMonotonic {
     }
 }
 
-/// A replica's state machine has applied exactly the committed ops, in
-/// order, and its value is the fold of those operations.
+/// A replica's state machine has applied a prefix of the committed ops, in
+/// order, and its value is the fold of those operations. The prefix is
+/// every committed op unless the replica has a write out: an op executes
+/// only once a landed write holds it.
 #[derive(Default)]
 pub struct StateMatchesCommittedLog {
-    /// Per replica: (number of committed ops already verified, expected value).
+    /// Per replica: (number of applied ops already verified, expected value).
     verified: Vec<(usize, i64)>,
 }
 
@@ -196,17 +426,22 @@ impl Property for StateMatchesCommittedLog {
             let commit = replica.commit_number();
             let state = replica.state_machine();
             let (verified, value) = &mut self.verified[id];
+            let applied = state.applied.len();
             ensure!(
-                state.applied.len() == commit,
-                "tick {}: replica {id} applied {} ops but commit_number is {commit}",
-                ctx.tick,
-                state.applied.len()
+                applied <= commit,
+                "tick {}: replica {id} applied {applied} ops but commit_number is {commit}",
+                ctx.tick
+            );
+            ensure!(
+                applied == commit || ctx.disks[id].outstanding.is_some(),
+                "tick {}: replica {id} applied {applied} of {commit} committed ops with no write out",
+                ctx.tick
             );
             for (i, entry) in ctx
                 .committed
                 .iter()
                 .enumerate()
-                .take(commit)
+                .take(applied)
                 .skip(*verified)
             {
                 ensure!(
@@ -219,7 +454,7 @@ impl Property for StateMatchesCommittedLog {
                 );
                 *value = entry.op.kind.apply(*value);
             }
-            *verified = commit;
+            *verified = applied;
             ensure!(
                 state.value == *value,
                 "tick {}: replica {id} value {} != expected {value}",

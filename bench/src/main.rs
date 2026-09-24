@@ -3,7 +3,7 @@
 //! Three kvstore nodes run in one process, each on its own thread with the
 //! kvstore's own event loop, store, journal, constants, and timer. What a
 //! node sends goes through a router thread of its own to the node it is
-//! for, as the kvstore's sender thread would put it on the wire, so the
+//! for, as the kvstore's sender threads would put it on the wire, so the
 //! numbers leave the network out. Closed-loop clients send their commands
 //! to node 0 the way the kvstore's client connections do, each waiting for
 //! its reply before it sends the next. Two configurations:

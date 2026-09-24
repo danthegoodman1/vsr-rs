@@ -61,7 +61,9 @@
 //! instead, which fetches the state from the others. One thing must survive
 //! even that: the view number. Without it a replica can forget that it asked
 //! for a view change and let two views run at once, as shown by Michael et
-//! al. in "Recovering Shared Objects Without Stable Storage".
+//! al. in "Recovering Shared Objects Without Stable Storage". A cluster
+//! needs at least three replicas: with fewer, a replica that lost its disk
+//! has no quorum of others to recover from.
 //!
 //! # Compaction
 //!
@@ -552,6 +554,10 @@ pub struct Client<Op> {
 
 impl<Op: Clone + Debug> Client<Op> {
     pub fn new(client_id: ClientID, config: Config) -> Client<Op> {
+        assert!(
+            config.replicas().len() >= 3,
+            "a cluster needs at least three replicas"
+        );
         Client {
             config,
             client_id,
@@ -807,6 +813,10 @@ pub struct Replica<SM: StateMachine> {
 impl<SM: StateMachine> Replica<SM> {
     pub fn new(self_id: ReplicaID, config: Config, state_machine: SM) -> Replica<SM> {
         let replica_count = config.replicas().len();
+        assert!(
+            replica_count >= 3,
+            "a cluster needs at least three replicas"
+        );
         Replica {
             self_id,
             config,

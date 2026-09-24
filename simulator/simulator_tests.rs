@@ -494,7 +494,7 @@ fn power_loss_with_a_write_out_lands_it_or_not() {
 /// executed, and loses power before the step's write, taking its commit
 /// number with it; a quorum's disks hold the op. The simulator recorded
 /// commits only at the end of a tick, and failed these seeds of the full
-/// swarm, and one of the lite one, at d452641 with execution at commit
+/// swarm, and one of the lite one, at 32fccf2 with execution at commit
 /// added: in 17626432488707759623 the primary sends a lagging replica a
 /// checkpoint that holds the op, and in 5371941143654615824 it replies to
 /// the client. Every write lands in its step.
@@ -528,7 +528,7 @@ fn op_executed_in_a_step_that_lost_power() {
 /// acknowledgement leaves once the write lands, backed by the log of its
 /// view on disk. `durable-promise` judged it by the replica's log instead,
 /// and failed seeds 2086361338446829227 and 16092517535111013271 of the
-/// full swarm at d452641 with writes that stay out added.
+/// full swarm at 32fccf2 with writes that stay out added.
 #[test]
 fn acknowledgement_released_after_a_later_view_started() {
     for seed in [2086361338446829227, 16092517535111013271] {

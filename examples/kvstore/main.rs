@@ -1652,16 +1652,17 @@ mod disk_tests {
                 node.write().unwrap();
             }
         }
-        // Files rotated every few entries, and every file behind the
-        // retained entries has been deleted.
-        let files = journal_files(&dir);
-        assert!(files[0] > 0, "the first file was never deleted: {files:?}");
-        assert!(files.len() <= 2, "files {files:?}");
         assert_eq!(120, node.replica.op_number());
         assert_eq!(119, node.replica.commit_number());
         assert_eq!(116, node.replica.log_start());
         let before = node.replica.persistent_state();
+        // Files rotated every few entries, and once the journal has closed,
+        // which waits for its deletions, every file behind the retained
+        // entries is gone.
         drop(node);
+        let files = journal_files(&dir);
+        assert!(files[0] > 0, "the first file was never deleted: {files:?}");
+        assert!(files.len() <= 2, "files {files:?}");
 
         let mut node = Node::open_with(1, config(), &dir, Start::Restart, SMALL_WAL_FILE).unwrap();
         assert_eq!(before, node.replica.persistent_state());
@@ -1695,6 +1696,43 @@ mod disk_tests {
             .err()
             .expect("store behind the journal refused");
         assert!(err.contains("compacted"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The journal grows its files with zeros ahead of the records, so
+    /// that each write lands in blocks already allocated.
+    #[cfg(unix)]
+    #[test]
+    fn journal_grows_its_files_with_zeros() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = temp_dir("zeros");
+        let mut node = Node::open(1, config(), &dir, Start::Init).unwrap();
+        // A filesystem that compresses, such as ZFS or btrfs, can store
+        // written zeros as holes, and then the file's blocks tell nothing.
+        let probe = dir.join("probe");
+        std::fs::write(&probe, [0; 64 * 1024]).unwrap();
+        std::fs::File::open(&probe).unwrap().sync_all().unwrap();
+        if std::fs::metadata(&probe).unwrap().blocks() * 512 < 64 * 1024 {
+            eprintln!("skipped: the temp directory stores written zeros as holes");
+            drop(node);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        prepare(&mut node, 1);
+        let last = *journal_files(&dir).last().unwrap();
+        let file = std::fs::metadata(dir.join("journal").join(format!("{last:010}.log"))).unwrap();
+        assert!(
+            file.len() >= crate::journal::PREALLOCATION,
+            "{} bytes",
+            file.len()
+        );
+        assert!(
+            file.blocks() * 512 >= file.len(),
+            "{} of {} bytes allocated",
+            file.blocks() * 512,
+            file.len()
+        );
+        drop(node);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

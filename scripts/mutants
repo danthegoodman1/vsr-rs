@@ -76,8 +76,8 @@ MUTATIONS = {
     "M12": (
         "the primary commits one acknowledgement short of a quorum",
         "lib.rs",
-        "select_nth_unstable_by(quorum - 1,",
-        "select_nth_unstable_by(quorum - 2,",
+        ".count() >= quorum)",
+        ".count() >= quorum - 1)",
         ["--replicas", "3"],
     ),
     "M13": (

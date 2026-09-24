@@ -29,8 +29,8 @@ pub(crate) const PRIMARY_TIMEOUT: usize = 5;
 /// Ticks between two persists of the store, each of which lets the
 /// replica compact its log.
 pub(crate) const FLUSH_TICKS: u64 = 10;
-/// Ticks a journal write may stay out before the node takes its disk for
-/// stalled, see [`Node::batch`].
+/// The tick after a journal write went out at which the node takes its
+/// disk for stalled if the write is still out, see [`Node::batch`].
 pub(crate) const STALLED_WRITE_TICKS: u64 = 2;
 /// The most events the event loop steps before it delivers, so that a
 /// steady stream of them still lets the next write go out.
@@ -936,7 +936,8 @@ impl Node {
     /// produced, see [`Node::deliver`]. Returns false once the event loop
     /// is done: after an [`Event::Stop`], once no write is out.
     ///
-    /// A write out for [`STALLED_WRITE_TICKS`] ticks means a stalled disk.
+    /// A write still out at the [`STALLED_WRITE_TICKS`]th tick after it
+    /// went out, one to two tick periods later, means a stalled disk.
     /// Until it comes back the node delivers nothing, as if it wrote on its
     /// own thread: a primary that went on sending would keep the backups
     /// from electing another while it could answer no client.

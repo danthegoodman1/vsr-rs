@@ -175,9 +175,10 @@ loop {
 
 For a complete program, [`examples/kvstore`](examples/kvstore) is a
 replicated key-value store over TCP that speaks a Redis-like protocol. It
-persists the replica's log with the `writeahead` crate, one fsync per batch
-of events, and keeps the store in a `fjall` database that is persisted once
-a second, after which the log is compacted. Start three nodes of a new
+persists the replica's log with the `writeahead` crate, one fsync per
+journal write, which holds every batch of events stepped while the last
+write was out, and keeps the store in a `fjall` database that is persisted
+once a second, after which the log is compacted. Start three nodes of a new
 cluster, each in its own terminal:
 
 ```console

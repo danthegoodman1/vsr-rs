@@ -70,7 +70,11 @@ Each node keeps its data in `kvstore-node-N`, or the directory given with
   changed, and the counters, which say how far the log is compacted and
   from which op number the entries replace what came before. A torn write
   fails the checksum, and recovery drops it whole. A write that changed
-  only the commit number is not written.
+  only the commit number is not written. The journal grows its files
+  256 KiB at a time, with zeros, so that each write lands in blocks
+  already allocated and its fsync writes only data: on ext4, an fsync
+  that allocates blocks commits the filesystem's journal too, and takes
+  nearly twice as long.
 - `store/` is a `fjall` database with the keys and values, the client
   table, and the number of operations applied, all written in the same
   batch as each operation, and the number of times the node has started,

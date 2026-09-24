@@ -1383,11 +1383,16 @@ impl<SM: StateMachine> Replica<SM> {
             return;
         }
         self.acked[replica_id] = op_number;
-        // A quorum holds every op up to the quorum-th highest watermark.
-        let mut acked = self.acked.clone();
+        // A quorum holds every op up to the quorum-th highest watermark: the
+        // highest that at least a quorum of watermarks reach.
         let quorum = self.config.quorum();
-        let (_, committed, _) = acked.select_nth_unstable_by(quorum - 1, |a, b| b.cmp(a));
-        let committed = *committed;
+        let acked = &self.acked;
+        let committed = acked
+            .iter()
+            .copied()
+            .filter(|&mark| acked.iter().filter(|&&other| other >= mark).count() >= quorum)
+            .max()
+            .unwrap_or(0);
         self.commit_up_to(committed, true);
     }
 
@@ -2159,8 +2164,14 @@ impl<SM: StateMachine> Replica<SM> {
             return;
         }
         if reply {
-            self.reply_ranges
-                .push((self.commit_number + 1, commit_number));
+            // A commit that follows the last extends its range, so that the
+            // ranges `apply_committed` checks for every op stay few while a
+            // write is out and nothing executes.
+            let from = self.commit_number + 1;
+            match self.reply_ranges.last_mut() {
+                Some((_, to)) if *to + 1 == from => *to = commit_number,
+                _ => self.reply_ranges.push((from, commit_number)),
+            }
         }
         self.commit_number = commit_number;
         self.apply_committed(self.durable_op());

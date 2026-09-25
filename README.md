@@ -310,7 +310,21 @@ fsyncs per node per second, journal writes and store persists alike.
 It can also emulate other hardware: with the data on a tmpfs, where
 fsync costs nothing, `FSYNC_US` adds that many microseconds to every
 journal fsync, and `NET_US` delays every frame between nodes by that many
-microseconds each way.
+microseconds each way. On the development machine, with a 150 µs round
+trip between nodes (`NET_US=75`) and the fsync of an NVMe drive with
+power-loss protection, 15 to 100 µs as load grows, the median ops/s of
+three rounds:
+
+| fsync | 1 client | 16 | 64 | 256 | 1,024 |
+|---|---|---|---|---|---|
+| 15 µs | 4.9k | 78.6k | 293.9k | 689.1k | 718.6k |
+| 30 µs | 4.6k | 70.3k | 259.0k | 686.1k | 726.4k |
+| 60 µs | 4.0k | 57.9k | 210.4k | 634.8k | 719.0k |
+| 100 µs | 3.4k | 47.5k | 169.4k | 516.7k | 716.6k |
+
+With enough requests in flight the primary's event loop sets the limit,
+whatever the fsync. With few, each request waits out a round trip and a
+backup's fsync; the primary's own fsync overlaps them.
 
 ```console
 cargo run --release -p vsr-bench --bin vsr-micro

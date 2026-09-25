@@ -76,16 +76,18 @@ Each node keeps its data in `kvstore-node-N`, or the directory given with
   that allocates blocks commits the filesystem's journal too, and takes
   nearly twice as long.
 - `store/` is a `fjall` database with the keys and values, the client
-  table, and the number of operations applied, all written in the same
-  batch as each operation, and the number of times the node has started,
-  which keeps its client ids apart from those of earlier runs. The replica
-  executes an operation only once a journal write holds it, so every
-  operation in the store is in the journal, except those of a checkpoint
-  it restored, which it persists at once. The store never fsyncs on its own
-  otherwise. A timer persists it once a second, and the replica then
-  compacts its log up to what the store has made durable, less a thousand
-  entries kept for replicas a little behind. Journal files with nothing
-  left in them are deleted.
+  table, the number of operations applied, and the number of times the
+  node has started, which keeps its client ids apart from those of earlier
+  runs. The node keeps what the operations it executes write in memory.
+  Once a second, a flush on a thread of its own writes all of it to fjall
+  in one batch, with the number of operations it reaches, and fsyncs, so
+  fjall always holds the state as of an operation number it records. When
+  the flush lands, the replica compacts its log up to that number, less a
+  thousand entries kept for replicas a little behind. The replica executes
+  an operation only once a journal write holds it, so every operation in
+  the store is in the journal, except those of a checkpoint it restored,
+  which it persists at once. Journal files with nothing left in them are
+  deleted.
 
 On restart the node replays the journal, opens the store, and persists
 it: after a process crash the store can hold operations that reached only

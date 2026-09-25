@@ -19,14 +19,14 @@
 //! a write-ahead log through the `writeahead` crate, whose writer thread
 //! writes what the replica changed and fsyncs once, while the event loop
 //! steps on and sends only what need not wait for the write. The store
-//! itself is a `fjall` database that never fsyncs on its own: every
-//! operation is one atomic batch that also records the op number and the
-//! client's reply, and a timer persists the database every second. What it
-//! had persisted is then durable, and the replica compacts its log up to
-//! there, less a retention window. On restart the node replays the
-//! write-ahead log, opens the store, persists whatever the store recovered,
-//! and applies the committed entries the store had not made durable. See
-//! README.md next to this file.
+//! keeps what the operations write, the clients' replies among it, in
+//! memory. Once a second a flush on a thread of its own writes all of it
+//! to a `fjall` database in one atomic batch that also records the op
+//! number it reaches, and fsyncs. When the flush lands, the replica
+//! compacts its log up to there, less a retention window. On restart the
+//! node replays the write-ahead log, opens the store, persists whatever the
+//! store recovered, and applies the committed entries the store had not
+//! made durable. See README.md next to this file.
 //!
 //! The node itself, with its store and event loop, is in `node.rs`, which
 //! the benchmark shares; this file puts it on the network.
@@ -47,6 +47,9 @@ mod journal;
 mod node;
 
 use node::*;
+
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // ---------------------------------------------------------------------------
 // Wire encoding between nodes: one message per line, whitespace separated.
@@ -297,9 +300,9 @@ fn decode(line: &str) -> Result<Frame, String> {
 // ---------------------------------------------------------------------------
 // Networking between nodes
 
-/// Frames queued for one node before further ones are dropped: a few
-/// batches of the event loop, which a node that keeps reading drains.
-const OUTBOX_FRAMES: usize = 4 * MAX_BATCH_EVENTS;
+/// Frames queued for one node before further ones are dropped, which a
+/// node that keeps reading drains.
+const OUTBOX_FRAMES: usize = 4096;
 /// The most frames a sender takes into one write, so that a steady stream
 /// of them still goes out.
 const MAX_FRAMES_PER_FLUSH: usize = 1024;
@@ -760,6 +763,35 @@ mod tests {
     fn out(node: &Node) -> Option<(OpNumber, OpNumber)> {
         let writing = node.writing.as_ref()?;
         Some((writing.write.entries_from, writing.write.op_number()))
+    }
+
+    /// A reply another node routes to one of this node's connections goes
+    /// out in the batch that brings it, even one that stops the node.
+    #[test]
+    fn routed_reply_goes_out_in_its_batch() {
+        let dir = temp_dir("routed-reply", 1);
+        let mut node = Node::open(1, config(3), &dir, Start::Init).unwrap();
+        let (wake, _woken) = channel();
+        let (frames, _frames_rx) = channel();
+        let (respond, responses) = channel();
+        let connection = client_id(1, node.incarnation, 0);
+        let command = Event::Command {
+            connection,
+            command: Command::Set("a".into(), "1".into()),
+            respond,
+        };
+        assert!(node.batch([command], &frames, &wake));
+        let request_number = node.connections[&connection].pending.as_ref().unwrap().0;
+        let reply = Event::Reply(Reply {
+            view_number: 0,
+            client_id: connection as vsr_rs::ClientID,
+            request_number,
+            result: None,
+        });
+        node.batch([reply, Event::Stop], &frames, &wake);
+        assert_eq!("+OK\r\n", responses.try_recv().unwrap());
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The event loop's step sends a write that needs a sync to the journal
@@ -1812,6 +1844,32 @@ mod disk_tests {
         node.step(|_, _| {}, &mut Vec::new()).unwrap()
     }
 
+    /// The event loop's store flush runs on a thread of its own, and the
+    /// node compacts the log only up to what that flush made durable, not
+    /// up to what it applied while the flush was out.
+    #[test]
+    fn compaction_waits_for_the_store_flush() {
+        let dir = temp_dir("flush-compacts");
+        let mut node = Node::open(1, config(), &dir, Start::Init).unwrap();
+        node.log_retention = 0;
+        for op_number in 1..=3 {
+            prepare_committed(&mut node, op_number, op_number - 1);
+        }
+        commit(&mut node, 3);
+        let (wake, events) = channel();
+        node.start_flush(&wake);
+        prepare_committed(&mut node, 4, 3);
+        commit(&mut node, 4);
+        assert_eq!(4, node.replica.applied());
+        assert!(matches!(events.recv().unwrap(), Event::Flushed));
+        node.handle(Event::Flushed);
+        assert_eq!(3, node.replica.log_start());
+        node.flush_store().unwrap();
+        assert_eq!(4, node.replica.log_start());
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Journal files small enough to rotate every few entries.
     const SMALL_WAL_FILE: u64 = 14 * 1024;
 
@@ -1961,9 +2019,10 @@ mod disk_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A step that only moved the commit number is not written. After a
-    /// restart the journal's commit number is behind the store's applied
-    /// count, and the replica takes the store's.
+    /// A step that only moved the commit number is not written. Once the
+    /// store persists what it applied, the journal's commit number is
+    /// behind the store's applied count, and after a restart the replica
+    /// takes the store's.
     #[test]
     fn journal_skips_commit_only_steps() {
         let dir = temp_dir("commit-only");
@@ -1977,6 +2036,7 @@ mod disk_tests {
         });
         assert!(!step(&mut node));
         assert_eq!(3, node.replica.applied());
+        node.replica.state_machine().persist().unwrap();
         drop(node);
 
         let node = Node::open(1, config(), &dir, Start::Restart).unwrap();
@@ -2171,6 +2231,80 @@ mod disk_tests {
         let _ = std::fs::remove_dir_all(dir.with_extension("durable"));
     }
 
+    /// The store reads its writes before a flush makes them durable and
+    /// while one is out; a flush makes durable exactly the ops applied when
+    /// it began; a checkpoint restored while a flush is out replaces what
+    /// that flush wrote.
+    #[test]
+    fn store_writes_back() {
+        let dir = temp_dir("writes-back");
+        let durable_dir = dir.with_extension("durable");
+        let mut store = Store::open(&dir).unwrap();
+        let put = |op_number: usize, key: &str, value: &str| LogEntry {
+            client_id: 3,
+            request_number: op_number,
+            op: Op::Put(key.into(), value.into()),
+        };
+        store.apply(1, &put(1, "a", "1"));
+        assert_eq!(Some("1".into()), store.get("a"));
+        let (landed, flushed) = channel();
+        assert!(store.flush(move || landed.send(()).unwrap()));
+        store.apply(2, &put(2, "a", "2"));
+        store.apply(3, &put(3, "b", "3"));
+        assert!(!store.flush(|| {}), "one flush is out at a time");
+        let pairs = vec![("a".into(), "2".into()), ("b".into(), "3".into())];
+        assert_eq!(pairs, store.snapshot().pairs);
+        flushed.recv().unwrap();
+        assert_eq!(Some(1), store.landed_flush().unwrap());
+        let durable = Store::open(&durable_dir).unwrap();
+        assert_eq!(1, durable.applied);
+        assert_eq!(Some("1".into()), durable.get("a"));
+        assert_eq!(None, durable.get("b"));
+        drop(durable);
+        assert_eq!(pairs, store.snapshot().pairs);
+        store.persist().unwrap();
+        let durable = Store::open(&durable_dir).unwrap();
+        assert_eq!(3, durable.applied);
+        assert_eq!(pairs, durable.snapshot().pairs);
+        let client_table = vec![ClientRecord {
+            client_id: 3,
+            request_number: 3,
+            reply: None,
+        }];
+        assert_eq!(client_table, durable.client_table().unwrap());
+        drop(durable);
+        // A flush this large is still out when the reads below run, so they
+        // see its writes through it rather than through fjall.
+        let many = 20_000;
+        for op_number in 4..4 + many {
+            store.apply(op_number, &put(op_number, &format!("k{op_number}"), "v"));
+        }
+        assert!(store.flush(|| {}));
+        assert_eq!(Some("v".into()), store.get("k4"));
+        assert_eq!(2 + many, store.snapshot().pairs.len());
+        store.apply(4 + many, &put(4 + many, "z", "6"));
+        let checkpoint_pairs = vec![("c".into(), "5".into())];
+        store.restore(Checkpoint {
+            op_number: 9,
+            state: StoreSnapshot {
+                pairs: checkpoint_pairs.clone(),
+            },
+            client_table: Vec::new(),
+        });
+        assert_eq!(checkpoint_pairs, store.snapshot().pairs);
+        drop(store);
+        let durable = Store::open(&durable_dir).unwrap();
+        assert_eq!(9, durable.applied);
+        assert_eq!(checkpoint_pairs, durable.snapshot().pairs);
+        assert_eq!(
+            Vec::<ClientRecord<Option<String>>>::new(),
+            durable.client_table().unwrap()
+        );
+        drop(durable);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&durable_dir);
+    }
+
     /// Runs the test `child` in a process of its own, with the data
     /// directory `dir` in the environment variable `variable`, and waits
     /// for it to exit, as a crash leaves its data.
@@ -2286,7 +2420,7 @@ mod disk_tests {
     /// The child of `process_crash_then_power_loss`: a backup node that
     /// persists its store once, then holds ops that commit all at once in
     /// a step that only moves the commit number, which the journal skips,
-    /// and dies without flushing anything.
+    /// and dies in the store's next flush, before its fsync.
     #[test]
     fn process_crash_child() {
         let Ok(dir) = std::env::var(PROCESS_CRASH_CHILD_DIR) else {
@@ -2303,13 +2437,12 @@ mod disk_tests {
         }
         commit(&mut node, CHILD_OPS);
         assert_eq!(CHILD_OPS, node.replica.state_machine().applied);
-        // The store's writes reach the OS, as they do a moment later in a
-        // running node, and none of them is durable.
-        node.replica
-            .state_machine()
-            .db
-            .persist(PersistMode::Buffer)
-            .unwrap();
+        // A flush writes the store's writes and they reach the OS, as they
+        // do a moment later in a running node, and the process dies before
+        // the flush's fsync.
+        let store = node.replica.state_machine();
+        store.write_unsynced().unwrap();
+        store.db.persist(PersistMode::Buffer).unwrap();
         std::process::exit(0);
     }
 

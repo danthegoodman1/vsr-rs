@@ -5,15 +5,16 @@
 use crate::journal::{EntryCodec, Journal, Landing};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 use futures::future::{maybe_done, MaybeDone};
-use std::cell::Cell;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use vsr_rs::{
     Checkpoint, Client, ClientID, ClientRecord, Config, LogEntry, LogSegment, LogWrite, MessageFor,
@@ -32,9 +33,12 @@ pub(crate) const FLUSH_TICKS: u64 = 10;
 /// The tick after a journal write went out at which the node takes its
 /// disk for stalled if the write is still out, see [`Node::batch`].
 pub(crate) const STALLED_WRITE_TICKS: u64 = 2;
-/// The most events the event loop steps before it delivers, so that a
-/// steady stream of them still lets the next write go out.
-pub(crate) const MAX_BATCH_EVENTS: usize = 1024;
+/// The most events the event loop steps before it delivers, few enough
+/// that the other nodes work on one batch while this node steps the next.
+pub(crate) const MAX_BATCH_EVENTS: usize = 16;
+/// The fewest replies worth handing to the answerer thread; the loop
+/// wakes fewer connections itself, sooner than a handoff would.
+pub(crate) const HANDED_OFF_ANSWERS: usize = 16;
 /// Log entries kept behind what the store has persisted, so that a replica
 /// a little behind catches up from the log rather than from a checkpoint.
 pub(crate) const LOG_RETENTION: usize = 1_000;
@@ -159,27 +163,53 @@ impl<'a> Tokens<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// The store: a fjall database that never fsyncs on its own
+// The store: a fjall database that never fsyncs on its own, behind the
+// writes applied since the last flush
 
 /// Key prefixes in the store's one keyspace.
 pub(crate) const KEY_PREFIX: &str = "k/";
 pub(crate) const CLIENT_PREFIX: &str = "c/";
 /// The number of operations applied to the store, written in the same
-/// batch as each operation.
+/// batch as the operations' writes.
 pub(crate) const APPLIED_KEY: &str = "m/applied";
 /// The number of times the node has started, which keeps the client ids
 /// of one run apart from those of the others.
 pub(crate) const INCARNATION_KEY: &str = "m/incarnation";
 
 /// The key-value store. The output of an op is the value read by a GET.
+/// An op's writes stay in memory until a flush writes them to fjall, with
+/// the op number they reach, in one batch, and fsyncs.
 pub(crate) struct Store {
     pub(crate) path: PathBuf,
     pub(crate) db: Database,
     pub(crate) keyspace: Keyspace,
-    /// The number of operations applied, as recorded in the store.
+    /// The number of operations applied.
     pub(crate) applied: OpNumber,
     /// The number of times the store was persisted, each with an fsync.
-    pub(crate) persists: Cell<u64>,
+    pub(crate) persists: Arc<AtomicU64>,
+    /// The writes of the operations applied since the last flush began.
+    dirty: RefCell<Writes>,
+    /// The flush out, if any.
+    flushing: RefCell<Option<Flushing>>,
+}
+
+/// The writes of a run of operations, which a flush encodes for fjall.
+#[derive(Default)]
+struct Writes {
+    values: HashMap<String, String>,
+    /// Each client's latest request number and its reply.
+    clients: HashMap<ClientID, (RequestNumber, Option<String>)>,
+}
+
+/// A flush on a thread of its own.
+struct Flushing {
+    /// The writes it makes durable, which reads see until it lands.
+    writes: Arc<Writes>,
+    /// The op number it makes the store durable as of.
+    op_number: OpNumber,
+    /// Its result, sent before it wakes the event loop.
+    done: Receiver<Result<(), String>>,
+    thread: JoinHandle<()>,
 }
 
 /// Every key and value in the store, for a replica that fell behind a
@@ -207,7 +237,9 @@ impl Store {
             db,
             keyspace,
             applied: 0,
-            persists: Cell::new(0),
+            persists: Arc::default(),
+            dirty: RefCell::default(),
+            flushing: RefCell::default(),
         };
         store.applied = store.read_counter(APPLIED_KEY)?;
         Ok(store)
@@ -244,12 +276,16 @@ impl Store {
     /// The client table as the store recorded it, for `Replica::restart`.
     pub(crate) fn client_table(&self) -> Result<Vec<ClientRecord<Option<String>>>, String> {
         let mut table = Vec::new();
-        for guard in self.keyspace.prefix(CLIENT_PREFIX) {
-            let (key, value) = guard.into_inner().map_err(|err| err.to_string())?;
-            let client_id = utf8(&key[CLIENT_PREFIX.len()..])
+        let mut records = self.committed(CLIENT_PREFIX);
+        self.overlay(|writes| {
+            for (client_id, (request_number, reply)) in &writes.clients {
+                records.insert(client_id.to_string(), encode_client(*request_number, reply));
+            }
+        });
+        for (key, value) in records {
+            let client_id = key
                 .parse()
                 .map_err(|_| "bad client id in store".to_string())?;
-            let value = utf8(&value);
             let mut t = Tokens::new(&value);
             table.push(ClientRecord {
                 client_id,
@@ -262,20 +298,181 @@ impl Store {
 
     /// Makes everything applied so far durable.
     pub(crate) fn persist(&self) -> Result<(), String> {
-        self.db
-            .persist(PersistMode::SyncData)
-            .map_err(|err| format!("cannot persist store at {}: {err}", self.path.display()))?;
-        self.persists.set(self.persists.get() + 1);
-        #[cfg(test)]
-        power::record_durable(&self.path);
+        self.finish_flush()?;
+        let (writes, op_number) = (self.dirty.take(), self.applied);
+        make_durable(&self.db, &self.keyspace, &writes, op_number, &self.path)?;
+        self.persists.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
+    /// Starts a flush of the writes applied so far on a thread of its own,
+    /// which calls `landed` once they are durable, unless a flush is out.
+    /// Returns whether it started one.
+    pub(crate) fn flush(&self, landed: impl FnOnce() + Send + 'static) -> bool {
+        if self.flushing.borrow().is_some() {
+            return false;
+        }
+        let writes = Arc::new(self.dirty.take());
+        let op_number = self.applied;
+        let (db, keyspace, persists) = (
+            self.db.clone(),
+            self.keyspace.clone(),
+            self.persists.clone(),
+        );
+        let (flushed, path) = (writes.clone(), self.path.clone());
+        let (result, done) = std::sync::mpsc::channel();
+        let flush = move || {
+            let flushed = make_durable(&db, &keyspace, &flushed, op_number, &path);
+            if flushed.is_ok() {
+                persists.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = result.send(flushed);
+            landed();
+        };
+        let thread = std::thread::Builder::new()
+            .name("store flush".to_string())
+            .spawn(flush)
+            .unwrap_or_else(|err| fatal(&format!("cannot start the store's flush: {err}")));
+        *self.flushing.borrow_mut() = Some(Flushing {
+            writes,
+            op_number,
+            done,
+            thread,
+        });
+        true
+    }
+
+    /// Writes what a flush would to fjall, without its fsync, as a flush
+    /// the process dies in does.
+    #[cfg(test)]
+    pub(crate) fn write_unsynced(&self) -> Result<(), String> {
+        self.finish_flush()?;
+        write_batch(&self.db, &self.keyspace, &self.dirty.take(), self.applied)
+    }
+
+    /// Waits for the flush out, if any, and returns the op number it made
+    /// the store durable as of.
+    pub(crate) fn finish_flush(&self) -> Result<Option<OpNumber>, String> {
+        self.take_flush(true)
+    }
+
+    /// `finish_flush`, for a flush that has landed; one still out stays out.
+    pub(crate) fn landed_flush(&self) -> Result<Option<OpNumber>, String> {
+        self.take_flush(false)
+    }
+
+    fn take_flush(&self, wait: bool) -> Result<Option<OpNumber>, String> {
+        let mut out = self.flushing.borrow_mut();
+        let Some(flushing) = out.as_ref() else {
+            return Ok(None);
+        };
+        let result = if wait {
+            flushing.done.recv().ok()
+        } else {
+            match flushing.done.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => return Ok(None),
+                Err(TryRecvError::Disconnected) => None,
+            }
+        };
+        let flushing = out.take().expect("a flush is out");
+        let joined = flushing.thread.join();
+        match (result, joined) {
+            (Some(result), Ok(())) => result.map(|()| Some(flushing.op_number)),
+            _ => Err("the store's flush panicked".to_string()),
+        }
+    }
+
     pub(crate) fn get(&self, key: &str) -> Option<String> {
+        if let Some(value) = self.dirty.borrow().values.get(key) {
+            return Some(value.clone());
+        }
+        if let Some(flushing) = &*self.flushing.borrow() {
+            if let Some(value) = flushing.writes.values.get(key) {
+                return Some(value.clone());
+            }
+        }
         self.keyspace
             .get(format!("{KEY_PREFIX}{key}"))
             .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")))
             .map(|value| utf8(&value))
+    }
+
+    /// The keys under `prefix` in fjall, less the prefix, and their values,
+    /// in key order.
+    fn committed(&self, prefix: &str) -> BTreeMap<String, String> {
+        let mut pairs = BTreeMap::new();
+        for guard in self.db.snapshot().prefix(&self.keyspace, prefix) {
+            let (key, value) = guard
+                .into_inner()
+                .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")));
+            pairs.insert(utf8(&key[prefix.len()..]), utf8(&value));
+        }
+        pairs
+    }
+
+    /// Calls `apply` with the writes fjall may lack: those of the flush
+    /// out, then those applied since.
+    fn overlay(&self, mut apply: impl FnMut(&Writes)) {
+        if let Some(flushing) = &*self.flushing.borrow() {
+            apply(&flushing.writes);
+        }
+        apply(&self.dirty.borrow());
+    }
+}
+
+/// A client's latest request number and reply as the store keeps them.
+fn encode_client(request_number: RequestNumber, reply: &Option<String>) -> String {
+    format!("{request_number} {}", encode_result(reply))
+}
+
+/// Writes `writes` and the op number they reach to fjall in one batch, and
+/// fsyncs.
+fn make_durable(
+    db: &Database,
+    keyspace: &Keyspace,
+    writes: &Writes,
+    op_number: OpNumber,
+    path: &Path,
+) -> Result<(), String> {
+    write_batch(db, keyspace, writes, op_number)?;
+    db.persist(PersistMode::SyncData)
+        .map_err(|err| format!("cannot persist store at {}: {err}", path.display()))?;
+    #[cfg(test)]
+    power::record_durable(path);
+    Ok(())
+}
+
+/// Writes `writes` and the op number they reach to fjall in one batch.
+fn write_batch(
+    db: &Database,
+    keyspace: &Keyspace,
+    writes: &Writes,
+    op_number: OpNumber,
+) -> Result<(), String> {
+    let mut batch = db.batch();
+    for (key, value) in &writes.values {
+        batch.insert(keyspace, format!("{KEY_PREFIX}{key}"), value.as_str());
+    }
+    for (client_id, (request_number, reply)) in &writes.clients {
+        batch.insert(
+            keyspace,
+            format!("{CLIENT_PREFIX}{client_id}"),
+            encode_client(*request_number, reply),
+        );
+    }
+    batch.insert(keyspace, APPLIED_KEY, op_number.to_string());
+    batch
+        .commit()
+        .map_err(|err| format!("cannot write store: {err}"))
+}
+
+impl Drop for Store {
+    /// Waits for the flush out, so that the store is closed once dropped.
+    fn drop(&mut self) {
+        if let Err(err) = self.finish_flush() {
+            eprintln!("{err}");
+        }
     }
 }
 
@@ -290,37 +487,30 @@ impl StateMachine for Store {
     type Snapshot = StoreSnapshot;
 
     fn apply(&mut self, op_number: OpNumber, entry: &LogEntry<Op>) -> Option<String> {
-        let mut batch = self.db.batch();
         let result = match &entry.op {
             Op::Put(key, value) => {
-                batch.insert(&self.keyspace, format!("{KEY_PREFIX}{key}"), value.as_str());
+                let values = &mut self.dirty.get_mut().values;
+                values.insert(key.clone(), value.clone());
                 None
             }
             Op::Get(key) => self.get(key),
         };
-        batch.insert(
-            &self.keyspace,
-            format!("{CLIENT_PREFIX}{}", entry.client_id),
-            format!("{} {}", entry.request_number, encode_result(&result)),
-        );
-        batch.insert(&self.keyspace, APPLIED_KEY, op_number.to_string());
-        batch
-            .commit()
-            .unwrap_or_else(|err| fatal(&format!("cannot write store: {err}")));
+        let clients = &mut self.dirty.get_mut().clients;
+        clients.insert(entry.client_id, (entry.request_number, result.clone()));
         self.applied = op_number;
         result
     }
 
     fn snapshot(&self) -> StoreSnapshot {
-        let snapshot = self.db.snapshot();
-        let mut pairs = Vec::new();
-        for guard in snapshot.prefix(&self.keyspace, KEY_PREFIX) {
-            let (key, value) = guard
-                .into_inner()
-                .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")));
-            pairs.push((utf8(&key[KEY_PREFIX.len()..]), utf8(&value)));
+        let mut pairs = self.committed(KEY_PREFIX);
+        self.overlay(|writes| {
+            for (key, value) in &writes.values {
+                pairs.insert(key.clone(), value.clone());
+            }
+        });
+        StoreSnapshot {
+            pairs: pairs.into_iter().collect(),
         }
-        StoreSnapshot { pairs }
     }
 
     /// Replaces the keys, values, and client table with the checkpoint's,
@@ -331,6 +521,8 @@ impl StateMachine for Store {
         pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let mut table = checkpoint.client_table;
         table.sort_unstable_by_key(|record| record.client_id);
+        self.finish_flush().unwrap_or_else(|err| fatal(&err));
+        *self.dirty.get_mut() = Writes::default();
         let mut batch = self.db.batch();
         for guard in self.keyspace.prefix(KEY_PREFIX) {
             let key = guard
@@ -364,7 +556,7 @@ impl StateMachine for Store {
             batch.insert(
                 &self.keyspace,
                 format!("{CLIENT_PREFIX}{}", record.client_id),
-                format!("{} {}", record.request_number, encode_result(&record.reply)),
+                encode_client(record.request_number, &record.reply),
             );
         }
         batch.insert(
@@ -375,8 +567,8 @@ impl StateMachine for Store {
         batch
             .commit()
             .unwrap_or_else(|err| fatal(&format!("cannot write store: {err}")));
-        self.persist().unwrap_or_else(|err| fatal(&err));
         self.applied = checkpoint.op_number;
+        self.persist().unwrap_or_else(|err| fatal(&err));
     }
 }
 
@@ -478,6 +670,9 @@ pub(crate) enum Event {
     /// that is out may have landed, and the loop polls it to see, see
     /// [`Node::run`].
     Written,
+    /// The store's flush landed: the node compacts the log up to where it
+    /// made the store durable, see [`Node::store_flushed`].
+    Flushed,
     /// Ends [`Node::run`] once no write is out. The kvstore runs until it
     /// is killed; the benchmark and the tests stop their nodes.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -490,9 +685,16 @@ pub(crate) struct Connection {
     pub(crate) pending: Option<(RequestNumber, Command, Sender<String>)>,
 }
 
-/// Hands a reply to the connection waiting for it, if it is still there
+/// A reply as a client connection takes it, and where to send it.
+pub(crate) type Answer = (Sender<String>, String);
+
+/// Queues a reply for the connection waiting for it, if it is still there
 /// and still waiting for that request.
-pub(crate) fn deliver_reply(connections: &mut HashMap<u64, Connection>, reply: KvReply) {
+pub(crate) fn deliver_reply(
+    connections: &mut HashMap<u64, Connection>,
+    answers: &mut Vec<Answer>,
+    reply: KvReply,
+) {
     let Some(connection) = connections.get_mut(&(reply.client_id as u64)) else {
         return;
     };
@@ -501,7 +703,7 @@ pub(crate) fn deliver_reply(connections: &mut HashMap<u64, Connection>, reply: K
         .on_reply(reply.request_number, reply.view_number);
     if answers_pending {
         if let Some((_, command, respond)) = connection.pending.take() {
-            let _ = respond.send(format_reply(&command, reply.result));
+            answers.push((respond, format_reply(&command, reply.result)));
         }
     }
 }
@@ -549,6 +751,12 @@ pub(crate) struct Node {
     /// carry.
     pub(crate) incarnation: u64,
     pub(crate) connections: HashMap<u64, Connection>,
+    /// Replies for the connections, handed out after each batch, see
+    /// [`Node::hand_out`].
+    pub(crate) answers: Vec<Answer>,
+    /// The thread that hands replies to the connections while
+    /// [`Node::run`] runs.
+    pub(crate) answerer: Option<Sender<Vec<Answer>>>,
     pub(crate) ticks: u64,
     pub(crate) view: usize,
     /// Log entries kept behind what the store has persisted.
@@ -686,6 +894,8 @@ impl Node {
             incarnation,
             config,
             connections: HashMap::new(),
+            answers: Vec::new(),
+            answerer: None,
             ticks: 0,
             log_retention: LOG_RETENTION,
             journaled: true,
@@ -808,6 +1018,26 @@ impl Node {
         }
         self.after_write(&mut send, &mut replies);
         self.answer(&mut replies, outbox);
+        self.hand_out();
+    }
+
+    /// Sends the replies ready to their connections.
+    fn hand_out(&mut self) {
+        if self.answers.is_empty() {
+            return;
+        }
+        match &self.answerer {
+            Some(answerer) if self.answers.len() >= HANDED_OFF_ANSWERS => {
+                if answerer.send(std::mem::take(&mut self.answers)).is_err() {
+                    fatal("the answerer thread is gone");
+                }
+            }
+            _ => {
+                for (respond, answer) in self.answers.drain(..) {
+                    let _ = respond.send(answer);
+                }
+            }
+        }
     }
 
     /// Sends `write` to the journal: the first poll hands it to
@@ -853,7 +1083,7 @@ impl Node {
         for reply in replies.drain(..) {
             let owner = node_of(reply.client_id);
             if owner == self.id {
-                deliver_reply(&mut self.connections, reply);
+                deliver_reply(&mut self.connections, &mut self.answers, reply);
             } else {
                 outbox.send_to(owner, Frame::Reply(reply));
             }
@@ -861,11 +1091,11 @@ impl Node {
     }
 
     /// Steps the replica or a client with one event. Returns whether the
-    /// store is due for a persist.
+    /// store is due for a flush.
     pub(crate) fn handle(&mut self, event: Event) -> bool {
         match event {
             Event::Message(message) => self.replica.on_message(message),
-            Event::Reply(reply) => deliver_reply(&mut self.connections, reply),
+            Event::Reply(reply) => deliver_reply(&mut self.connections, &mut self.answers, reply),
             Event::Command {
                 connection: id,
                 command,
@@ -902,6 +1132,7 @@ impl Node {
                 return self.ticks.is_multiple_of(FLUSH_TICKS);
             }
             Event::Written => self.woken = true,
+            Event::Flushed => self.store_flushed(),
             Event::Stop => self.stopping = true,
         }
         false
@@ -910,12 +1141,33 @@ impl Node {
     /// Persists the store, which makes everything it has applied durable,
     /// and compacts the log up to there, less the retention window. The
     /// compaction reaches the journal with the next write.
+    #[cfg(test)]
     pub(crate) fn flush_store(&mut self) -> Result<(), String> {
         let applied = self.replica.applied();
         self.replica.state_machine().persist()?;
         self.replica
             .compact(applied.saturating_sub(self.log_retention));
         Ok(())
+    }
+
+    /// Starts a flush of the store on a thread of its own, which wakes the
+    /// event loop through `wake` with an [`Event::Flushed`] when it lands,
+    /// unless a flush is out.
+    pub(crate) fn start_flush(&mut self, wake: &Sender<Event>) {
+        let wake = wake.clone();
+        self.replica.state_machine().flush(move || {
+            let _ = wake.send(Event::Flushed);
+        });
+    }
+
+    /// Compacts the log up to where the flush that landed made the store
+    /// durable, less the retention window.
+    fn store_flushed(&mut self) {
+        let flushed = self.replica.state_machine().landed_flush();
+        if let Some(op_number) = flushed.unwrap_or_else(|err| fatal(&err)) {
+            self.replica
+                .compact(op_number.saturating_sub(self.log_retention));
+        }
     }
 
     /// Runs the event loop until an [`Event::Stop`], stepping every batch
@@ -931,6 +1183,16 @@ impl Node {
         wake: Sender<Event>,
         outbox: impl Outbox,
     ) {
+        let (answerer, batches) = std::sync::mpsc::channel::<Vec<Answer>>();
+        let answering = std::thread::Builder::new()
+            .name(format!("node {} answers", self.id))
+            .spawn(move || {
+                for (respond, answer) in batches.into_iter().flatten() {
+                    let _ = respond.send(answer);
+                }
+            })
+            .unwrap_or_else(|err| fatal(&format!("cannot start the answerer thread: {err}")));
+        self.answerer = Some(answerer);
         // Whatever the replica produced on the way up goes out now.
         self.deliver(&outbox, &wake);
         while let Ok(event) = events.recv() {
@@ -941,6 +1203,8 @@ impl Node {
                 break;
             }
         }
+        self.answerer = None;
+        let _ = answering.join();
     }
 
     /// Steps the node with a batch of events, then delivers what it
@@ -962,6 +1226,7 @@ impl Node {
         for event in events {
             flush_store |= self.handle(event);
         }
+        self.hand_out();
         if std::mem::take(&mut self.woken) {
             self.landed(wake);
         }
@@ -973,7 +1238,7 @@ impl Node {
         }
         self.deliver(outbox, wake);
         if flush_store {
-            self.flush_store().unwrap_or_else(|err| fatal(&err));
+            self.start_flush(wake);
         }
         let stats = &self.stats;
         stats.batches.fetch_add(1, Ordering::Relaxed);
@@ -981,7 +1246,11 @@ impl Node {
         stats.view_number.store(view_number, Ordering::Relaxed);
         let commit_number = self.replica.commit_number() as u64;
         stats.commit_number.store(commit_number, Ordering::Relaxed);
-        let persists = self.replica.state_machine().persists.get();
+        let persists = self
+            .replica
+            .state_machine()
+            .persists
+            .load(Ordering::Relaxed);
         stats.store_persists.store(persists, Ordering::Relaxed);
         if self.replica.view_number() != self.view {
             self.view = self.replica.view_number();
@@ -1029,8 +1298,8 @@ impl Wake for JournalWaker {
 }
 
 /// Power losses for the tests. A node's journal keeps every write, since
-/// it fsyncs each one; its store goes back to what it last persisted, a
-/// copy of which every `Store::persist` keeps. fjall 3.1.10 also fsyncs
+/// it fsyncs each one; its store goes back to what it last made durable, a
+/// copy of which every store flush and persist keeps. fjall 3.1.10 also fsyncs
 /// its journal when it recovers on open, which this model leaves out: it
 /// holds the kvstore to its own contract with the library rather than to
 /// what one version of fjall happens to do.
@@ -1075,7 +1344,7 @@ pub(crate) mod power {
         }
     }
 
-    /// Keeps a copy of the store at `path` as it is right after a persist.
+    /// Keeps a copy of the store at `path` as it is right after an fsync.
     pub fn record_durable(path: &Path) {
         copy_dir(path, &durable(path));
     }

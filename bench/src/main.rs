@@ -51,6 +51,9 @@ mod journal;
 #[path = "../../examples/kvstore/node.rs"]
 mod node;
 
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use node::{client_id, config, run_timer, Command, Event, Frame, Node, Start, Stats, TICK};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;

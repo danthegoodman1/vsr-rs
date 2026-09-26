@@ -338,7 +338,7 @@ cargo run --release -p vsr-simulator
 ```
 
 Every run prints its seed; pass it back to reproduce the run exactly. A git
-commit hash works as a seed too, which is how CI runs it.
+commit hash works as a seed too.
 
 ```console
 cargo run --release -p vsr-simulator -- 10693013600028533629
@@ -354,6 +354,11 @@ scripts/simulate --budget 1h
 scripts/simulate --report          # the runs of the current commit
 scripts/simulate --report --all    # every commit ever run
 ```
+
+CI runs a ten-minute sweep on every pull request, next to formatting,
+clippy, and the tests in a debug build, which checks arithmetic for
+overflow. A two-hour sweep runs on `main` every night and files an issue
+with the seeds of any runs that fail.
 
 To check that the simulator catches persistence bugs, `scripts/mutants`
 plants each of a few known ones in a scratch copy, such as an

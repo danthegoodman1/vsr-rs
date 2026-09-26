@@ -3624,3 +3624,8 @@ impl<SM: StateMachine> Replica<SM> {
         self.replies.drain(..)
     }
 }
+
+// Compiles and runs the README's example with the doctests.
+#[cfg(doctest)]
+#[doc = include_str!("README.md")]
+struct ReadmeExample;

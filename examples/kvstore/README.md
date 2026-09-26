@@ -75,10 +75,12 @@ Each node keeps its data in `kvstore-node-N`, or the directory given with
   already allocated and its fsync writes only data: on ext4, an fsync
   that allocates blocks commits the filesystem's journal too, and takes
   nearly twice as long.
-- `store/` is a `fjall` database with the keys and values, the client
-  table, the number of operations applied, and the number of times the
-  node has started, which keeps its client ids apart from those of earlier
-  runs. The node keeps what the operations it executes write in memory.
+- `store/` is a `fjall` database. Its `meta` keyspace holds the number of
+  operations applied, the number of times the node has started, which
+  keeps its client ids apart from those of earlier runs, and which of two
+  data keyspaces is current; that one holds the keys and values and the
+  client table. The node keeps what the operations it executes write in
+  memory.
   Once a second, a flush on a thread of its own writes all of it to fjall
   in one batch, with the number of operations it reaches, and fsyncs, so
   fjall always holds the state as of an operation number it records. When
@@ -88,6 +90,19 @@ Each node keeps its data in `kvstore-node-N`, or the directory given with
   the store is in the journal, except those of a checkpoint it restored,
   which it persists at once. Journal files with nothing left in them are
   deleted.
+- A replica further behind fetches a checkpoint, 256 KiB of keys at a
+  time. The node that serves it keeps a fjall snapshot of the state as of
+  its last flush, and reads each chunk from it on a thread of its own
+  while the other node stages the one before; it compacts no entry after
+  the snapshot while nodes ask for its chunks. The fetching node writes the
+  chunks into the data keyspace that is not current, unsynced, and then
+  one batch makes it current with the checkpoint's operation number, and
+  one fsync makes all of it durable. A crash before that leaves the old
+  state, and the next open clears what was staged. On this machine, on
+  tmpfs, a million keys of 100 bytes come in 428 chunks: each costs the
+  serving node's event loop about 0.3 ms, with the read ahead, and the
+  fetching node's about 0.8 ms to stage, and the restore takes 55 ms, so
+  the transfer takes about half a second plus a round trip per chunk.
 
 On restart the node replays the journal, opens the store, and persists
 it: after a process crash the store can hold operations that reached only
@@ -98,7 +113,14 @@ refused.
 
 ## Notes
 
-- Keys and values are single words. One command at a time per connection.
+- Keys and values are single words.
+- Each connection is a session with up to 16 commands in flight. It reads
+  commands as they come and answers them in order. A SET is a request in
+  the log; a GET is a query, which the primary answers once a quorum has
+  confirmed its view, with no log entry and no fsync. The client table holds
+  16,384 sessions; a connection whose session was evicted gets
+  `-ERR session evicted; the command may or may not have run` for each
+  command it had in flight, and its next command opens a new session.
 - `RUST_LOG=trace` shows every protocol message, `RUST_LOG=debug` the
   journal's file deletions.
 - `cargo test --example kvstore` runs an in-process cluster against real

@@ -16,8 +16,7 @@ use anyhow::Result;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use vsr_rs::{
-    ClientRecord, Config, LogEntry, LogWrite, OpNumber, PersistentState, Replica, ReplicaID, Reply,
-    StateMachine, ViewNumber,
+    Config, LogEntry, LogWrite, OpNumber, PersistentState, Replica, ReplicaID, Reply, ViewNumber,
 };
 
 /// The chance that a step loses power before its write.
@@ -69,12 +68,10 @@ pub struct Disk {
     pub state: PersistentState<Op>,
     /// The write the owner has taken and not yet landed, if any.
     pub outstanding: Option<LogWrite<Op>>,
-    /// The state machine as of its last flush, the number of ops it had
-    /// applied then, and the client table as of then, which a durable
-    /// state machine keeps alongside what it applies.
+    /// The state machine as of its last flush, client table included, and
+    /// the number of ops it had applied then.
     pub state_machine: Accumulator,
     pub applied: OpNumber,
-    pub client_table: Vec<ClientRecord<i64>>,
 }
 
 impl Default for Disk {
@@ -84,7 +81,6 @@ impl Default for Disk {
             outstanding: None,
             state_machine: Accumulator::default(),
             applied: 0,
-            client_table: Vec::new(),
         }
     }
 }
@@ -202,57 +198,38 @@ impl Disk {
     /// The state machine writes its state to disk.
     pub fn flush(&mut self, replica: &Replica<Accumulator>) {
         self.applied = replica.applied();
-        self.state_machine = replica.state_machine().clone();
-        self.client_table = replica.client_table();
+        self.state_machine = replica.state_machine().flushed();
     }
 
     /// The state machine as a process crash leaves it, made durable by its
-    /// owner before the restart: what it had flushed, and the operations
-    /// after it up to `op_number`, which it had applied and which reached
-    /// the page cache. The replica's log still holds them, since it
-    /// compacts only what the state machine flushed.
+    /// owner before the restart: what it had flushed, and what it applied
+    /// and recorded after that up to `op_number`, which reached the page
+    /// cache. The replica's log still holds those ops, since it compacts
+    /// only what the state machine flushed.
     pub fn flush_up_to(&mut self, replica: &Replica<Accumulator>, op_number: OpNumber) {
         assert!(op_number <= replica.applied());
-        while self.applied < op_number {
-            let op = self.applied + 1;
-            let entry = &replica.log()[op - replica.log_start() - 1];
-            let reply = self.state_machine.apply(op, entry);
-            match self
-                .client_table
-                .iter_mut()
-                .find(|record| record.client_id == entry.client_id)
-            {
-                Some(record) => {
-                    record.request_number = entry.request_number;
-                    record.reply = reply;
-                }
-                None => self.client_table.push(ClientRecord {
-                    client_id: entry.client_id,
-                    request_number: entry.request_number,
-                    reply,
-                }),
-            }
-            self.applied = op;
+        if op_number > self.applied {
+            self.state_machine
+                .catch_up(replica.state_machine(), self.applied, op_number);
+            self.applied = op_number;
         }
     }
 
     /// The replica its owner rebuilds from this disk after a power loss,
-    /// with the state machine and its client table as of its last flush.
+    /// with the state machine as of its last flush.
     pub fn restart(&self, id: ReplicaID, config: Config, nonce: u64) -> Replica<Accumulator> {
         Replica::restart(
             id,
             config,
             self.state_machine.clone(),
             self.applied,
-            self.client_table.clone(),
             self.state.clone(),
             nonce,
         )
     }
 
     /// Whether the disk holds what `replica` does in memory, but for the
-    /// commit number, which a write may skip, and the client table, which
-    /// comes back from the state machine.
+    /// commit number, which a write may skip.
     pub fn matches(&self, replica: &Replica<Accumulator>) -> bool {
         self.state.view_number == replica.view_number()
             && self.state.last_normal_view == replica.last_normal_view()

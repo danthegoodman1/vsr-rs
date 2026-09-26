@@ -4,16 +4,19 @@
 use crate::disk::Disk;
 use crate::network::message_kind;
 use crate::state_machine::{Accumulator, Msg, Op};
-use anyhow::{ensure, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use anyhow::{bail, ensure, Result};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use vsr_rs::{
-    ClientID, LogEntry, LogSegment, Message, OpNumber, PersistentState, Replica, ReplicaID, Reply,
-    RequestNumber,
+    ClientID, ClientRecord, Config, LogEntry, LogSegment, Message, OpNumber, PersistentState,
+    QueryNumber, Replica, ReplicaID, Reply, RequestNumber, StateMachine,
 };
 
 /// Read-only view of the simulated system handed to properties.
 pub struct SimContext<'a> {
     pub tick: u64,
+    pub config: &'a Config,
+    /// What the committed log does, fed up to `committed`.
+    pub model: &'a Model,
     pub replicas: &'a [Replica<Accumulator>],
     /// Each replica's disk.
     pub disks: &'a [Disk],
@@ -24,9 +27,28 @@ pub struct SimContext<'a> {
     pub committed: &'a [LogEntry<Op>],
     /// Replies the clients have received, in order.
     pub replies: &'a [Reply<i64>],
+    /// The queries the clients completed, in order.
+    pub answers: &'a [Answer],
     /// The replicas that must converge: all of them during the safety
     /// phase, the liveness core afterwards.
     pub core: &'a [usize],
+}
+
+/// A query a client completed.
+#[derive(Clone, Debug)]
+pub struct Answer {
+    pub tick: u64,
+    pub client_id: ClientID,
+    pub query_number: QueryNumber,
+    /// The most requests executed in what any client had completed when
+    /// the query was submitted: its requests, and the states its queries
+    /// read.
+    pub floor: i64,
+    /// The most requests executed among those its client had completed
+    /// when the query completed: those the client submitted before it.
+    pub own: i64,
+    /// The number of requests executed in the state the query read.
+    pub result: i64,
 }
 
 pub trait Property {
@@ -75,6 +97,7 @@ pub fn default_properties() -> Vec<Box<dyn Property>> {
         Box::new(CommittedPrefixAgreement::default()),
         Box::new(NoDuplicateOps::default()),
         Box::new(RepliesMatchCommits::default()),
+        Box::new(LinearizableQueries::default()),
         Box::new(Durability::default()),
         Box::new(ExecutedOpsDurable::default()),
         Box::new(DurablePromise),
@@ -279,11 +302,17 @@ impl Property for DurablePromise {
                             .as_ref()
                             .is_none_or(|state| holds_segment(disk, &state.segment)))
             }
-            Message::Request { .. }
+            Message::Register { .. }
+            | Message::Request { .. }
+            | Message::Query { .. }
+            | Message::ConfirmView { .. }
+            | Message::ConfirmViewOk { .. }
             | Message::Prepare { .. }
             | Message::Commit { .. }
             | Message::GetState { .. }
-            | Message::NewState { .. } => true,
+            | Message::NewState { .. }
+            | Message::GetChunk { .. }
+            | Message::NewChunk { .. } => true,
         };
         ensure!(
             backed,
@@ -319,7 +348,7 @@ fn holds_uncommitted(
 
 /// Whether the disk holds every entry of `segment`, or has compacted it,
 /// which only committed entries are.
-fn holds_segment(disk: &PersistentState<Op>, segment: &LogSegment<Op, i64, Accumulator>) -> bool {
+fn holds_segment(disk: &PersistentState<Op>, segment: &LogSegment<Op>) -> bool {
     let start = segment.start();
     let skip = disk.log_start.saturating_sub(start);
     if skip >= segment.entries.len() {
@@ -332,7 +361,14 @@ fn holds_segment(disk: &PersistentState<Op>, segment: &LogSegment<Op, i64, Accum
 /// The view a message names, for error messages.
 fn message_view(message: &Msg) -> usize {
     match message {
-        Message::Request { .. } => 0,
+        Message::Register { .. }
+        | Message::Request { .. }
+        | Message::Query { .. }
+        | Message::GetChunk { .. }
+        | Message::NewChunk { .. } => 0,
+        Message::ConfirmView { view_number, .. } | Message::ConfirmViewOk { view_number, .. } => {
+            *view_number
+        }
         Message::Prepare { view_number, .. }
         | Message::PrepareOk { view_number, .. }
         | Message::Commit { view_number, .. }
@@ -399,13 +435,114 @@ impl Property for CommitNumberMonotonic {
     }
 }
 
-/// A replica's state machine has applied a prefix of the committed ops, in
-/// order, and its value is the fold of those operations. The prefix is
-/// every committed op unless the replica has a write out: an op executes
-/// only once a landed write holds it.
+/// What the committed log does, fed it in order: which requests execute and
+/// with what result, which sessions it opens, and which it evicts. The
+/// simulator feeds it as ops commit, and the properties check the replicas
+/// against it.
+#[derive(Default)]
+pub struct Model {
+    /// Committed entries fed so far.
+    fed: usize,
+    value: i64,
+    /// The client table after the entries fed.
+    table: BTreeMap<ClientID, ClientRecord<i64>>,
+    /// Sessions evicted, by client and session.
+    evicted: BTreeSet<(ClientID, OpNumber)>,
+    /// The sessions registrations were answered with, by client.
+    sessions: BTreeSet<(ClientID, OpNumber)>,
+    /// The ops executed, with their op numbers, in order.
+    executed: Vec<(OpNumber, Op)>,
+    /// The result of each request that executed, the number of requests
+    /// executed up to it, by client, session, and request number.
+    results: BTreeMap<(ClientID, OpNumber, RequestNumber), i64>,
+}
+
+impl Model {
+    /// Feeds the committed entries not fed yet. A request executes only as
+    /// its session's next one.
+    pub fn feed(&mut self, config: &Config, tick: u64, committed: &[LogEntry<Op>]) -> Result<()> {
+        for entry in &committed[self.fed..] {
+            self.fed += 1;
+            let op_number = self.fed;
+            let (client_id, session, request_number, answered, op) = match entry {
+                LogEntry::Register { client_id } => {
+                    let session = self.register(config, op_number, *client_id);
+                    self.sessions.insert((*client_id, session));
+                    continue;
+                }
+                LogEntry::Request {
+                    client_id,
+                    session,
+                    request_number,
+                    answered,
+                    op,
+                } => (*client_id, *session, *request_number, *answered, op),
+            };
+            let Some(record) = self
+                .table
+                .get_mut(&client_id)
+                .filter(|record| record.session == session)
+            else {
+                continue;
+            };
+            ensure!(
+                request_number == record.request_number + 1,
+                "tick {tick}: op {op_number} is request {request_number} of client {client_id} in session {session}, after request {}",
+                record.request_number
+            );
+            self.value = op.kind.apply(self.value);
+            self.executed.push((op_number, op.clone()));
+            let position = self.executed.len() as i64;
+            record.request_number = request_number;
+            record.replies.push_back(position);
+            let kept = request_number
+                .saturating_sub(answered)
+                .clamp(1, config.in_flight_max());
+            while record.replies.len() > kept {
+                record.replies.pop_front();
+            }
+            record.op_number = op_number;
+            self.results
+                .insert((client_id, session, request_number), position);
+        }
+        Ok(())
+    }
+
+    /// Registers `client_id` at `op_number`, and returns its session.
+    fn register(&mut self, config: &Config, op_number: OpNumber, client_id: ClientID) -> OpNumber {
+        if let Some(record) = self.table.get(&client_id) {
+            return record.session;
+        }
+        if self.table.len() >= config.clients_max() {
+            let (&evicted, record) = self
+                .table
+                .iter()
+                .min_by_key(|(_, record)| record.op_number)
+                .expect("a full table holds a session");
+            self.evicted.insert((evicted, record.session));
+            self.table.remove(&evicted);
+        }
+        let record = ClientRecord {
+            client_id,
+            session: op_number,
+            request_number: 0,
+            replies: VecDeque::new(),
+            op_number,
+        };
+        self.table.insert(client_id, record);
+        op_number
+    }
+}
+
+/// A replica's state machine has applied the requests the committed log
+/// executes, in order, up to the replica's applied op number, and its value
+/// is their fold. That is every committed op unless the replica has a write
+/// out: an op executes only once a landed write holds it. The state
+/// machine's client table is the replica's, and, once it has applied every
+/// committed op, the model's.
 #[derive(Default)]
 pub struct StateMatchesCommittedLog {
-    /// Per replica: (number of applied ops already verified, expected value).
+    /// Per replica: (number of executed ops already verified, expected value).
     verified: Vec<(usize, i64)>,
 }
 
@@ -424,9 +561,7 @@ impl Property for StateMatchesCommittedLog {
         self.verified.resize(ctx.replicas.len(), (0, 0));
         for (id, replica) in ctx.replicas.iter().enumerate() {
             let commit = replica.commit_number();
-            let state = replica.state_machine();
-            let (verified, value) = &mut self.verified[id];
-            let applied = state.applied.len();
+            let applied = replica.applied();
             ensure!(
                 applied <= commit,
                 "tick {}: replica {id} applied {applied} ops but commit_number is {commit}",
@@ -437,29 +572,47 @@ impl Property for StateMatchesCommittedLog {
                 "tick {}: replica {id} applied {applied} of {commit} committed ops with no write out",
                 ctx.tick
             );
-            for (i, entry) in ctx
-                .committed
+            let state = replica.state_machine();
+            let executed = &ctx.model.executed;
+            let expected = executed.partition_point(|(op_number, _)| *op_number <= applied);
+            ensure!(
+                state.applied.len() == expected,
+                "tick {}: replica {id} executed {} requests up to op {applied}, but the log executes {expected}",
+                ctx.tick,
+                state.applied.len()
+            );
+            let (verified, value) = &mut self.verified[id];
+            let checking = state.applied[*verified..expected]
                 .iter()
-                .enumerate()
-                .take(applied)
-                .skip(*verified)
-            {
+                .zip(&executed[*verified..expected]);
+            for (applied, executed) in checking {
                 ensure!(
-                    state.applied[i] == entry.op,
-                    "tick {}: replica {id} applied {:?} as op {} but the committed op is {:?}",
-                    ctx.tick,
-                    state.applied[i],
-                    i + 1,
-                    entry.op
+                    applied == executed,
+                    "tick {}: replica {id} executed {applied:?}, but the log executes {executed:?}",
+                    ctx.tick
                 );
-                *value = entry.op.kind.apply(*value);
+                *value = executed.1.kind.apply(*value);
             }
-            *verified = applied;
+            *verified = expected;
             ensure!(
                 state.value == *value,
                 "tick {}: replica {id} value {} != expected {value}",
                 ctx.tick,
                 state.value
+            );
+            ensure!(
+                replica.client_table() == state.client_table(),
+                "tick {}: replica {id} holds client table {:?}, its state machine {:?}",
+                ctx.tick,
+                replica.client_table(),
+                state.client_table()
+            );
+            ensure!(
+                applied < ctx.model.fed || state.clients == ctx.model.table,
+                "tick {}: replica {id} holds client table {:?}, the log makes {:?}",
+                ctx.tick,
+                state.clients,
+                ctx.model.table
             );
         }
         Ok(())
@@ -523,33 +676,32 @@ impl Property for NoDuplicateOps {
 
     fn check(&mut self, ctx: &SimContext) -> Result<()> {
         for (i, entry) in ctx.committed.iter().enumerate().skip(self.verified) {
-            ensure!(
-                self.seen.insert(entry.op.id),
-                "tick {}: op {:?} committed again as op {}",
-                ctx.tick,
-                entry.op,
-                i + 1
-            );
+            if let LogEntry::Request { op, .. } = entry {
+                ensure!(
+                    self.seen.insert(op.id),
+                    "tick {}: op {op:?} committed again as op {}",
+                    ctx.tick,
+                    i + 1
+                );
+            }
         }
         self.verified = ctx.committed.len();
         Ok(())
     }
 }
 
-/// Every reply is for a request that has committed, and carries the
-/// accumulator value right after that request's op. Replies may be
+/// Every reply answers what committed: a registration with a session the
+/// log gave the client, a request with the accumulator value right after
+/// it executed, an eviction for a session the log evicted. Replies may be
 /// duplicated, since the primary answers a re-sent request from its client
-/// table, but every committed request gets at least one reply by the end.
+/// table, and by the end every request that executed has a reply, unless
+/// its session was evicted.
 #[derive(Default)]
 pub struct RepliesMatchCommits {
-    /// Expected result per committed request.
-    expected: BTreeMap<(ClientID, RequestNumber), i64>,
     /// Requests that have received a reply.
-    replied: BTreeSet<(ClientID, RequestNumber)>,
-    /// Committed entries and replies already processed.
-    committed: usize,
+    replied: BTreeSet<(ClientID, OpNumber, RequestNumber)>,
+    /// Replies already checked.
     verified: usize,
-    value: i64,
 }
 
 impl Property for RepliesMatchCommits {
@@ -558,40 +710,96 @@ impl Property for RepliesMatchCommits {
     }
 
     fn check(&mut self, ctx: &SimContext) -> Result<()> {
-        for entry in &ctx.committed[self.committed..] {
-            self.value = entry.op.kind.apply(self.value);
-            self.expected
-                .insert((entry.client_id, entry.request_number), self.value);
-        }
-        self.committed = ctx.committed.len();
+        let model = ctx.model;
         for reply in &ctx.replies[self.verified..] {
-            let key = (reply.client_id, reply.request_number);
-            let Some(expected) = self.expected.get(&key) else {
-                anyhow::bail!(
-                    "tick {}: reply {reply:?} for a request that has not committed",
+            match reply {
+                Reply::Registered {
+                    client_id, session, ..
+                } => ensure!(
+                    model.sessions.contains(&(*client_id, *session)),
+                    "tick {}: reply {reply:?} for a session the log did not give the client",
                     ctx.tick
-                );
-            };
-            ensure!(
-                reply.result == *expected,
-                "tick {}: reply {reply:?} but expected result {expected}",
-                ctx.tick
-            );
-            self.replied.insert(key);
+                ),
+                Reply::Executed {
+                    client_id,
+                    session,
+                    request_number,
+                    result,
+                    ..
+                } => {
+                    let key = (*client_id, *session, *request_number);
+                    let Some(expected) = model.results.get(&key) else {
+                        bail!(
+                            "tick {}: reply {reply:?} for a request that has not executed",
+                            ctx.tick
+                        );
+                    };
+                    ensure!(
+                        result == expected,
+                        "tick {}: reply {reply:?} but expected result {expected}",
+                        ctx.tick
+                    );
+                    self.replied.insert(key);
+                }
+                Reply::Evicted {
+                    client_id, session, ..
+                } => ensure!(
+                    model.evicted.contains(&(*client_id, *session)),
+                    "tick {}: reply {reply:?} for a session the log did not evict",
+                    ctx.tick
+                ),
+                Reply::Queried { .. } => {}
+            }
         }
         self.verified = ctx.replies.len();
         Ok(())
     }
 
-    fn finalize(&mut self, _ctx: &SimContext) -> Result<()> {
-        for key in self.expected.keys() {
+    fn finalize(&mut self, ctx: &SimContext) -> Result<()> {
+        for (client_id, session, request_number) in ctx.model.results.keys() {
             ensure!(
-                self.replied.contains(key),
-                "client {} got no reply for request {}",
-                key.0,
-                key.1
+                self.replied
+                    .contains(&(*client_id, *session, *request_number))
+                    || ctx.model.evicted.contains(&(*client_id, *session)),
+                "client {client_id} got no reply for request {request_number} of session {session}"
             );
         }
+        Ok(())
+    }
+}
+
+/// Every query read a state in the committed history no earlier than what
+/// was completed before the query was submitted, every request and the
+/// state every query read, nor than every earlier request of its own
+/// client, and no later than what has executed.
+#[derive(Default)]
+pub struct LinearizableQueries {
+    /// Answers already checked.
+    verified: usize,
+}
+
+impl Property for LinearizableQueries {
+    fn name(&self) -> &'static str {
+        "linearizable-queries"
+    }
+
+    fn check(&mut self, ctx: &SimContext) -> Result<()> {
+        let executed = ctx.model.executed.len() as i64;
+        for answer in &ctx.answers[self.verified..] {
+            ensure!(
+                answer.result >= answer.floor
+                    && answer.result >= answer.own
+                    && answer.result <= executed,
+                "tick {}: query {} of client {} read the state after {} requests; requests completed before it reach {}, its client's {}, and {executed} have executed",
+                answer.tick,
+                answer.query_number,
+                answer.client_id,
+                answer.result,
+                answer.floor,
+                answer.own
+            );
+        }
+        self.verified = ctx.answers.len();
         Ok(())
     }
 }

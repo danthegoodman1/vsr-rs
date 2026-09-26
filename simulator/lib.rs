@@ -29,12 +29,12 @@ use log::{debug, info, trace};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::fmt;
-use vsr_rs::{Client, Config, LogEntry, Replica, Reply, RequestNumber};
+use vsr_rs::{Client, ClientID, Completion, Config, LogEntry, QueryNumber, Replica, Reply};
 
 use disk::{Disk, PowerLossOdds, Step, WriteOdds};
 use network::Network;
 pub use network::{message_kind, Envelope, MessageSummary, NetworkOptions, Origin};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use vsr_rs::{Status, ViewNumber};
 
@@ -174,7 +174,8 @@ pub struct ReplicaSnapshot {
 pub struct ClientSnapshot {
     pub id: usize,
     pub view_number: ViewNumber,
-    pub inflight: Option<RequestNumber>,
+    /// Requests submitted and not yet completed.
+    pub in_flight: usize,
 }
 
 /// The whole simulation as seen from outside, for display.
@@ -196,9 +197,10 @@ pub struct Snapshot {
     pub lost_steps: usize,
     pub lost_writes: usize,
     pub flushes: usize,
+    pub restores: usize,
     pub network: MessageSummary,
 }
-use properties::{Property, SimContext};
+use properties::{Answer, Model, Property, SimContext};
 use state_machine::{Accumulator, Op};
 use workload::Workload;
 
@@ -206,12 +208,20 @@ use workload::Workload;
 #[derive(Clone, Debug)]
 pub struct Options {
     pub replica_count: usize,
-    /// Number of clients. Each client has at most one request in flight.
+    /// Number of clients.
     pub client_count: usize,
+    /// Sessions the client table holds; fewer than the clients makes them
+    /// evict each other.
+    pub clients_max: usize,
+    /// Requests a client keeps in flight. It queues up to as many more.
+    pub in_flight_max: usize,
+    /// Probability that an operation a client issues is a query.
+    pub query_probability: f64,
     pub network: NetworkOptions,
     /// Total number of requests to send.
     pub requests_max: usize,
-    /// Probability per tick that a client with no request in flight sends one.
+    /// Probability per tick that a client with room in its queue sends a
+    /// request.
     pub request_probability: f64,
     /// Probability per tick that clients go idle.
     pub request_idle_on_probability: f64,
@@ -294,9 +304,12 @@ impl Options {
         let primary_timeout = prng
             .gen_range(2..=10)
             .max((5 * one_way_delay_mean).div_ceil(heartbeat_interval) as usize);
-        Options {
+        let mut options = Options {
             replica_count: prng.gen_range(3..=7),
             client_count: prng.gen_range(1..=8),
+            clients_max: 1,
+            in_flight_max: 1,
+            query_probability: 0.0,
             network: NetworkOptions {
                 packet_loss_probability: f64::from(prng.gen_range(0..=30)) / 100.0,
                 packet_replay_probability: f64::from(prng.gen_range(0..=50)) / 100.0,
@@ -329,7 +342,17 @@ impl Options {
                 f64::from(prng.gen_range(1..=90)) / 100.0
             },
             write_land_probability: f64::from(prng.gen_range(5..=50)) / 100.0,
-        }
+        };
+        // Drawn last, so that the options drawn before keep their values
+        // for every seed.
+        options.clients_max = if prng.gen_bool(0.5) {
+            prng.gen_range(1..=options.client_count)
+        } else {
+            options.client_count
+        };
+        options.in_flight_max = prng.gen_range(1..=4);
+        options.query_probability = f64::from(prng.gen_range(0..=50)) / 100.0;
+        options
     }
 
     /// A small cluster, for quick runs.
@@ -343,6 +366,8 @@ impl Options {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.replica_count >= 3, "replica_count must be at least 3");
         ensure!(self.client_count >= 1, "client_count must be at least 1");
+        ensure!(self.clients_max >= 1, "clients_max must be at least 1");
+        ensure!(self.in_flight_max >= 1, "in_flight_max must be at least 1");
         ensure!(self.requests_max >= 1, "requests_max must be at least 1");
         ensure!(
             self.heartbeat_interval >= 1,
@@ -391,6 +416,7 @@ impl Options {
             ),
             ("write_out_probability", self.write_out_probability),
             ("write_land_probability", self.write_land_probability),
+            ("query_probability", self.query_probability),
         ] {
             ensure!(
                 (0.0..=1.0).contains(&p),
@@ -422,6 +448,9 @@ impl fmt::Display for Options {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "          replicas={}", self.replica_count)?;
         writeln!(f, "          clients={}", self.client_count)?;
+        writeln!(f, "          clients_max={}", self.clients_max)?;
+        writeln!(f, "          in_flight_max={}", self.in_flight_max)?;
+        writeln!(f, "          query_probability={}", self.query_probability)?;
         writeln!(f, "          requests_max={}", self.requests_max)?;
         writeln!(
             f,
@@ -568,7 +597,10 @@ pub struct Simulator {
     /// Ticks elapsed.
     pub ticks: u64,
     pub requests_sent: usize,
+    /// Requests completed: executed, or failed with their session.
     pub requests_replied: usize,
+    /// Requests that failed because their session was evicted.
+    pub requests_evicted: usize,
     requests_idle: bool,
     liveness_mode: bool,
     phase: Phase,
@@ -593,6 +625,8 @@ pub struct Simulator {
     /// commit number on disk, so that the restart compacted the log.
     pub process_crashes_ahead: usize,
     pub flushes: usize,
+    /// Number of checkpoints replicas fetched and restored.
+    pub restores: usize,
     /// Number of steps a power loss cut off before they were persisted,
     /// and of those that left the disk behind the replica's memory in more
     /// than the commit number.
@@ -615,8 +649,10 @@ pub struct Simulator {
     stepped: Vec<bool>,
     /// Replicas that lose power in their next step, by script.
     lose_step: BTreeSet<usize>,
-    /// Every op committed so far, see `SimContext::committed`.
+    /// Every op committed so far, see `SimContext::committed`, and what
+    /// they do.
     committed: Vec<LogEntry<Op>>,
+    model: Model,
     /// Whether each replica is up.
     replica_up: Vec<bool>,
     /// The tick before which each replica's health must not change again.
@@ -625,9 +661,19 @@ pub struct Simulator {
     /// phase, and a majority that is kept up during the liveness phase.
     core: Vec<usize>,
     replicas: Vec<Replica<Accumulator>>,
-    clients: Vec<Client<Op>>,
-    /// The request number each client is waiting for a reply to, if any.
-    client_inflight: Vec<Option<RequestNumber>>,
+    clients: Vec<Client<Op, ()>>,
+    /// Each client's requests and queries submitted and not yet completed.
+    client_requests: Vec<usize>,
+    /// The most requests executed, as a result places an operation in the
+    /// history, among the operations completed so far, and among each
+    /// client's requests.
+    completed_position: i64,
+    client_positions: Vec<i64>,
+    /// The queries submitted and not yet completed, by client and query
+    /// number, with `completed_position` when each was submitted.
+    queries: BTreeMap<(ClientID, QueryNumber), i64>,
+    /// The queries completed, in order.
+    answers: Vec<Answer>,
     /// Replies received, in order.
     replies: Vec<Reply<i64>>,
     network: Network,
@@ -646,6 +692,8 @@ impl Simulator {
             config.add_replica();
         }
         config.set_primary_timeout(options.primary_timeout);
+        config.set_clients_max(options.clients_max);
+        config.set_in_flight_max(options.in_flight_max);
         let replicas = (0..options.replica_count)
             .map(|id| Replica::new(id, config.clone(), Accumulator::default()))
             .collect();
@@ -657,7 +705,11 @@ impl Simulator {
         Ok(Simulator {
             seed,
             network: Network::new(options.network.clone()),
-            client_inflight: vec![None; options.client_count],
+            client_requests: vec![0; options.client_count],
+            completed_position: 0,
+            client_positions: vec![0; options.client_count],
+            queries: BTreeMap::new(),
+            answers: Vec::new(),
             core: (0..replica_count).collect(),
             replica_up: vec![true; replica_count],
             replica_stable_until: vec![0; replica_count],
@@ -666,6 +718,7 @@ impl Simulator {
             ticks: 0,
             requests_sent: 0,
             requests_replied: 0,
+            requests_evicted: 0,
             requests_idle: false,
             liveness_mode: false,
             phase: Phase::Safety,
@@ -680,6 +733,7 @@ impl Simulator {
             process_crashes: 0,
             process_crashes_ahead: 0,
             flushes: 0,
+            restores: 0,
             lost_steps: 0,
             lost_writes: 0,
             writes_out_at_crash: 0,
@@ -690,6 +744,7 @@ impl Simulator {
             stepped: vec![false; replica_count],
             lose_step: BTreeSet::new(),
             committed: Vec::new(),
+            model: Model::default(),
             replicas,
             clients,
             replies: Vec::new(),
@@ -863,7 +918,7 @@ impl Simulator {
                 .map(|(id, client)| ClientSnapshot {
                     id,
                     view_number: client.view_number(),
-                    inflight: self.client_inflight[id],
+                    in_flight: self.client_requests[id],
                 })
                 .collect(),
             messages: self.network.in_flight().cloned().collect(),
@@ -878,6 +933,7 @@ impl Simulator {
             lost_steps: self.lost_steps,
             lost_writes: self.lost_writes,
             flushes: self.flushes,
+            restores: self.restores,
             network: self.network.summary.clone(),
         }
     }
@@ -1073,7 +1129,7 @@ impl Simulator {
                     .push(replica.log()[op_number - log_start - 1].clone());
             }
         }
-        Ok(())
+        self.model.feed(&self.config, self.ticks, &self.committed)
     }
 
     /// Advances the simulation by one tick.
@@ -1170,20 +1226,33 @@ impl Simulator {
                 return Ok(Some("pending write"));
             }
         }
-        let ctx = Self::context(
-            self.ticks,
-            &self.replicas,
-            &self.disks,
-            &self.committed,
-            &self.replies,
-            &self.core,
-        );
-        for property in &mut self.properties {
-            property
-                .finalize(&ctx)
-                .with_context(|| format!("property '{}' failed", property.name()))?;
-        }
+        self.check_each(|property, ctx| property.finalize(ctx))?;
         Ok(None)
+    }
+
+    /// Runs `check` on every property, with the simulation as of now.
+    fn check_each(
+        &mut self,
+        check: impl Fn(&mut dyn Property, &SimContext) -> Result<()>,
+    ) -> Result<()> {
+        let mut properties = std::mem::take(&mut self.properties);
+        let ctx = SimContext {
+            tick: self.ticks,
+            config: &self.config,
+            model: &self.model,
+            replicas: &self.replicas,
+            disks: &self.disks,
+            committed: &self.committed,
+            replies: &self.replies,
+            answers: &self.answers,
+            core: &self.core,
+        };
+        let checked = properties.iter_mut().try_for_each(|property| {
+            check(property.as_mut(), &ctx)
+                .with_context(|| format!("property '{}' failed", property.name()))
+        });
+        self.properties = properties;
+        checked
     }
 
     fn tick_requests(&mut self) {
@@ -1208,21 +1277,32 @@ impl Simulator {
         }
         let client_count = self.options.client_count;
         let base = self.prng.gen_range(0..client_count);
+        let queue_max = 2 * self.options.in_flight_max;
         let Some(client_index) = (0..client_count)
             .map(|offset| (base + offset) % client_count)
-            .find(|index| self.client_inflight[*index].is_none())
+            .find(|index| self.client_requests[*index] < queue_max)
         else {
-            return; // Every client is waiting for a reply.
+            return; // Every client's queue is full.
         };
+        self.client_requests[client_index] += 1;
+        self.requests_sent += 1;
+        if self.prng.gen_bool(self.options.query_probability) {
+            let query_number = self.clients[client_index].on_query(());
+            debug!(
+                "tick {}: client {client_index} sends query {query_number}",
+                self.ticks
+            );
+            let floor = self.completed_position;
+            self.queries.insert((client_index, query_number), floor);
+            return;
+        }
         let op = Op {
             id: self.next_op_id,
             kind: self.workload.build_request(&mut self.prng),
         };
         self.next_op_id += 1;
         debug!("tick {}: client {client_index} sends {op:?}", self.ticks);
-        let request_number = self.clients[client_index].on_request(op);
-        self.client_inflight[client_index] = Some(request_number);
-        self.requests_sent += 1;
+        self.clients[client_index].on_request(op);
     }
 
     /// Crashes and restarts replicas. In the liveness phase the core is
@@ -1306,10 +1386,14 @@ impl Simulator {
         }
     }
 
-    /// Hands everything the replicas and clients want sent to the network,
-    /// delivers what is due this tick, and hands over what those deliveries
-    /// produced, which the network delivers from the next tick on.
+    /// Delivers the replies due this tick to the clients, hands everything
+    /// the replicas and clients want sent to the network, delivers what is
+    /// due this tick, and hands over what those deliveries produced, which
+    /// the network delivers from the next tick on.
     fn tick_network(&mut self) -> Result<()> {
+        for reply in self.network.take_due_replies(self.ticks) {
+            self.deliver_reply(reply);
+        }
         self.flush()?;
         for envelope in self.network.take_due(self.ticks) {
             let Envelope {
@@ -1333,25 +1417,12 @@ impl Simulator {
     }
 
     /// Ends the step of every running replica the way its owner does, see
-    /// [`Disk::step`]: moves its outgoing messages into the network and
-    /// delivers its replies to the clients. A replica that stepped may
-    /// lose power before its write. Then moves the clients' messages into
-    /// the network.
+    /// [`Disk::step`]: moves its outgoing messages and its replies into the
+    /// network. A replica that stepped may lose power before its write.
+    /// Then moves the clients' messages into the network.
     fn flush(&mut self) -> Result<()> {
         self.record_committed()?;
-        let ctx = Self::context(
-            self.ticks,
-            &self.replicas,
-            &self.disks,
-            &self.committed,
-            &self.replies,
-            &self.core,
-        );
-        for property in &mut self.properties {
-            property
-                .before_steps(&ctx)
-                .with_context(|| format!("property '{}' failed", property.name()))?;
-        }
+        self.check_each(|property, ctx| property.before_steps(ctx))?;
         let mut sent = Vec::new();
         let mut replies = Vec::new();
         for id in 0..self.replicas.len() {
@@ -1369,6 +1440,9 @@ impl Simulator {
             } else {
                 PowerLossOdds::default()
             };
+            if self.replicas[id].log_start() > self.disks[id].applied {
+                self.restores += 1;
+            }
             let properties = &mut self.properties;
             let send = |disk: &_, replica: &_, to, message| {
                 for property in properties.iter_mut() {
@@ -1397,17 +1471,9 @@ impl Simulator {
                     .send(self.ticks, Origin::Replica(id), to, message, &mut self.prng);
             }
             for reply in replies.drain(..) {
-                debug!("tick {}: reply {reply:?}", self.ticks);
-                // A reply completes the request its client is waiting for.
-                // Any other reply is a duplicate, which the properties still
-                // check.
-                self.clients[reply.client_id].on_reply(reply.request_number, reply.view_number);
-                let inflight = &mut self.client_inflight[reply.client_id];
-                if *inflight == Some(reply.request_number) {
-                    *inflight = None;
-                    self.requests_replied += 1;
+                if let Some(reply) = self.network.send_reply(self.ticks, reply, &mut self.prng) {
+                    self.deliver_reply(reply);
                 }
-                self.replies.push(reply);
             }
             match step {
                 Step::PowerLost => {
@@ -1432,39 +1498,50 @@ impl Simulator {
         Ok(())
     }
 
-    fn check_properties(&mut self) -> Result<()> {
-        let ctx = Self::context(
-            self.ticks,
-            &self.replicas,
-            &self.disks,
-            &self.committed,
-            &self.replies,
-            &self.core,
-        );
-        for property in &mut self.properties {
-            property
-                .check(&ctx)
-                .with_context(|| format!("property '{}' failed", property.name()))?;
-        }
-        Ok(())
+    /// Hands a reply to its client. A duplicate reply completes nothing,
+    /// and the properties still check it. An eviction fails every request
+    /// the client has not completed.
+    fn deliver_reply(&mut self, reply: Reply<i64>) {
+        debug!("tick {}: reply {reply:?}", self.ticks);
+        let client_id = reply.client_id();
+        let completed = match self.clients[client_id].on_reply(reply.clone()) {
+            Some(Completion::Executed(_, position)) => {
+                self.completed_position = self.completed_position.max(position);
+                let own = &mut self.client_positions[client_id];
+                *own = (*own).max(position);
+                1
+            }
+            Some(Completion::Queried(query_number, result)) => {
+                let floor = self
+                    .queries
+                    .remove(&(client_id, query_number))
+                    .expect("a query in flight");
+                self.completed_position = self.completed_position.max(result);
+                self.answers.push(Answer {
+                    tick: self.ticks,
+                    client_id,
+                    query_number,
+                    floor,
+                    own: self.client_positions[client_id],
+                    result,
+                });
+                1
+            }
+            Some(Completion::Evicted) => {
+                self.queries.retain(|(client, _), _| *client != client_id);
+                let failed = self.client_requests[client_id];
+                self.requests_evicted += failed;
+                failed
+            }
+            None => 0,
+        };
+        self.client_requests[client_id] -= completed;
+        self.requests_replied += completed;
+        self.replies.push(reply);
     }
 
-    fn context<'a>(
-        tick: u64,
-        replicas: &'a [Replica<Accumulator>],
-        disks: &'a [Disk],
-        committed: &'a [LogEntry<Op>],
-        replies: &'a [Reply<i64>],
-        core: &'a [usize],
-    ) -> SimContext<'a> {
-        SimContext {
-            tick,
-            replicas,
-            disks,
-            committed,
-            replies,
-            core,
-        }
+    fn check_properties(&mut self) -> Result<()> {
+        self.check_each(|property, ctx| property.check(ctx))
     }
 }
 

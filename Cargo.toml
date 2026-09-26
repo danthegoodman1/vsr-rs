@@ -10,6 +10,7 @@ path = "lib.rs"
 members = ["bench", "simulator"]
 
 [dependencies]
+foldhash = "0.2"
 log = "0.4.17"
 
 [dev-dependencies]

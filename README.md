@@ -61,9 +61,12 @@ A `Replica` and a `Client` are state machines that their owner steps:
 You provide the rest:
 
 - **State machine.** Implement `StateMachine`: `apply`, which the library
-  calls in order for every committed operation with its op number, and
-  `snapshot` and `restore`, which move the whole state to a replica that
-  fell behind a compacted log.
+  calls in order for every committed operation with its op number; `query`,
+  which reads the state;
+  `record_client` and `client_table`, which keep the client table with the
+  state; and `checkpoint`, `checkpoint_chunk`, `release_checkpoint`,
+  `stage_chunk`, and `restore`, which move the state a chunk at a time to
+  a replica that fell behind a compacted log.
 - **Transport.** Serialize `Message` values and move them between
   replicas and clients. The library does not care how, or whether they
   arrive, are duplicated, or are reordered.
@@ -89,7 +92,28 @@ You provide the rest:
   and a write that changed only the commit number needs no sync.
 - **Compaction.** Once the state machine has made its state durable, call
   `compact` with the op number it reached. A replica that needs entries
-  another one has compacted gets a checkpoint of its state instead.
+  another one has compacted fetches a checkpoint of its state instead, a
+  chunk at a time, and the sender compacts no entry after the checkpoint
+  while replicas ask for its chunks.
+
+A client registers for a session through the log, then keeps up to
+`Config::in_flight_max` requests in flight. The primary appends only a
+session's next request, so a session's requests execute in order. The
+client table holds at most `Config::clients_max` sessions: registering one
+more evicts the session whose latest entry executed earliest, the same one
+on every replica. An evicted session's requests never execute, and its
+client learns so from the reply, fails what it had in flight, and
+registers again.
+
+A query reads the state machine without a log entry. The primary answers
+it once a quorum has confirmed its view in a round started after the query
+arrived, from a state that holds every op that may have completed by then:
+the ops committed in earlier views, and those up to its commit number. So
+the query sees every write completed before it. No clocks are involved. At
+most 32 rounds are out at a time, whatever the number of queries. A client
+keeps its operations in the order it issued them: a query goes out only
+once every earlier request has its reply, and a request only once every
+earlier query has its reply.
 
 A replica whose disk is gone comes back through `Replica::recover`, which
 fetches the state from the others. It needs the view number it had, or it
@@ -105,11 +129,12 @@ here.
 | Feature | Paper section | Status |
 |---|---|---|
 | Normal operation | 4.1 | done |
-| Client table and request retransmission | 4.1 | done |
+| Client table and request retransmission | 4.1 | done, with sessions registered through the log, requests in flight, and a bounded table |
+| Reads | 6.3 | done, as queries the primary answers once a quorum confirms its view, rather than with leases |
 | View changes | 4.2 | done, with exponential backoff |
 | Recovery | 4.3 | done, with a persisted view number[^michael17] |
 | State transfer | 5.2 | done, without the truncation defect[^vanlightly22] |
-| Checkpoints and log compaction | 5.1 | done, checkpoints come from the state machine |
+| Checkpoints and log compaction | 5.1 | done, checkpoints come from the state machine a chunk at a time |
 | Durable log | | done, the owner persists a write after every step |
 | Reconfiguration | 7 | out of scope, membership is fixed |
 
@@ -120,26 +145,78 @@ process. A test or a simulator delivers the messages like this; a real
 program persists each write and puts the messages on the wire.
 
 ```rust
-use vsr_rs::{Checkpoint, Client, Config, LogEntry, OpNumber, Replica, StateMachine};
+use vsr_rs::{
+    Client, ClientID, ClientRecord, Completion, Config, OpNumber, Replica, StateMachine,
+};
+use std::collections::BTreeMap;
 
-struct Counter(i64);
+/// The value and the client table: the whole state, in one chunk.
+type State = (i64, Vec<ClientRecord<i64>>);
+
+#[derive(Clone, Debug, Default)]
+struct Counter {
+    value: i64,
+    clients: BTreeMap<ClientID, ClientRecord<i64>>,
+    op_number: OpNumber,
+    kept: Option<State>,
+    staged: Option<State>,
+}
 
 impl StateMachine for Counter {
     type Input = i64;
+    type Query = ();
     type Output = i64;
-    type Snapshot = i64;
+    type Chunk = State;
 
-    fn apply(&mut self, _op_number: OpNumber, entry: &LogEntry<i64>) -> i64 {
-        self.0 += entry.op;
-        self.0
+    fn apply(&mut self, op_number: OpNumber, op: &i64) -> i64 {
+        self.value += op;
+        self.op_number = op_number;
+        self.value
     }
 
-    fn snapshot(&self) -> i64 {
-        self.0
+    fn query(&self, _query: &()) -> i64 {
+        self.value
     }
 
-    fn restore(&mut self, checkpoint: Checkpoint<i64, i64>) {
-        self.0 = checkpoint.state;
+    fn record_client(
+        &mut self,
+        op_number: OpNumber,
+        client_id: ClientID,
+        record: Option<&ClientRecord<i64>>,
+    ) {
+        match record {
+            Some(record) => self.clients.insert(client_id, record.clone()),
+            None => self.clients.remove(&client_id),
+        };
+        self.op_number = op_number;
+    }
+
+    fn client_table(&self) -> Vec<ClientRecord<i64>> {
+        self.clients.values().cloned().collect()
+    }
+
+    fn checkpoint(&mut self) -> OpNumber {
+        self.kept = Some((self.value, self.client_table()));
+        self.op_number
+    }
+
+    fn checkpoint_chunk(&self, _index: usize) -> (State, bool) {
+        (self.kept.clone().expect("a checkpoint kept"), true)
+    }
+
+    fn release_checkpoint(&mut self) {
+        self.kept = None;
+    }
+
+    fn stage_chunk(&mut self, _op_number: OpNumber, _index: usize, chunk: State) {
+        self.staged = Some(chunk);
+    }
+
+    fn restore(&mut self, op_number: OpNumber) {
+        let (value, table) = self.staged.take().expect("a staged checkpoint");
+        self.value = value;
+        self.clients = table.into_iter().map(|record| (record.client_id, record)).collect();
+        self.op_number = op_number;
     }
 }
 
@@ -148,9 +225,9 @@ for _ in 0..3 {
     config.add_replica();
 }
 let mut replicas: Vec<_> = (0..3)
-    .map(|id| Replica::new(id, config.clone(), Counter(0)))
+    .map(|id| Replica::new(id, config.clone(), Counter::default()))
     .collect();
-let mut client = Client::new(0, config);
+let mut client: Client<i64, ()> = Client::new(0, config);
 
 client.on_request(5);
 loop {
@@ -161,9 +238,12 @@ loop {
         replica.persisted(write);
         queue.extend(replica.drain_messages());
         for reply in replica.drain_replies() {
-            println!("request {} -> {}", reply.request_number, reply.result);
+            if let Some(Completion::Executed(request, result)) = client.on_reply(reply) {
+                println!("request {request} -> {result}");
+            }
         }
     }
+    queue.extend(client.drain());
     if queue.is_empty() {
         break;
     }
@@ -178,8 +258,10 @@ replicated key-value store over TCP that speaks a Redis-like protocol. It
 persists the replica's log with the `writeahead` crate, one fsync per
 journal write, which holds every batch of events stepped while the last
 write was out, and keeps the store in a `fjall` database that is persisted
-once a second, after which the log is compacted. Start three nodes of a new
-cluster, each in its own terminal:
+once a second, after which the log is compacted. Each client connection is
+a session, and its commands pipeline: they are read as they come and
+answered in order. Start three nodes of a new cluster, each in its own
+terminal:
 
 ```console
 cargo build --example kvstore
@@ -229,7 +311,11 @@ tick:
 - committed prefixes agree on every replica,
 - committed operations survive on enough disks,
 - every operation a replica executed is on its disk,
-- every reply matches a committed request,
+- every reply matches what committed: a request's result, a session the
+  log opened, an eviction the log made,
+- a session's requests execute in order, and only in their session,
+- every query reads a state that holds every request completed before the
+  query was issued, and every earlier request of its own client,
 - no request runs twice.
 
 It also checks every message as it leaves: a replica acknowledges an op,
@@ -291,7 +377,7 @@ the durable log (commit `0b64760`) and now, through the same loop:
 | ops in flight | 1 | 16 | 64 | 256 | 1,024 | 4,096 | 16,384 |
 |---|---|---|---|---|---|---|---|
 | before, ns/op | 314 | 166 | 189 | 273 | 627 | 2,152 | 9,493 |
-| now, ns/op | 463 | 155 | 143 | 147 | 169 | 186 | 214 |
+| now, ns/op | 462 | 147 | 136 | 139 | 144 | 168 | 225 |
 
 With one operation in flight the library now spends more on each, on the
 write it builds and on holding back what waits for it; with more, it
@@ -313,18 +399,29 @@ journal fsync, and `NET_US` delays every frame between nodes by that many
 microseconds each way. On the development machine, with a 150 µs round
 trip between nodes (`NET_US=75`) and the fsync of an NVMe drive with
 power-loss protection, 15 to 100 µs as load grows, the median ops/s of
-three rounds:
+three rounds of SETs from clients with one command in flight each:
 
 | fsync | 1 client | 16 | 64 | 256 | 1,024 |
 |---|---|---|---|---|---|
-| 15 µs | 4.9k | 78.6k | 293.9k | 689.1k | 718.6k |
-| 30 µs | 4.6k | 70.3k | 259.0k | 686.1k | 726.4k |
-| 60 µs | 4.0k | 57.9k | 210.4k | 634.8k | 719.0k |
-| 100 µs | 3.4k | 47.5k | 169.4k | 516.7k | 716.6k |
+| 15 µs | 4.9k | 78.7k | 290.6k | 756.6k | 751.7k |
+| 30 µs | 4.7k | 70.3k | 259.4k | 750.1k | 764.0k |
+| 60 µs | 4.1k | 57.9k | 211.5k | 644.2k | 748.9k |
+| 100 µs | 3.3k | 47.5k | 173.9k | 507.1k | 734.9k |
 
 With enough requests in flight the primary's event loop sets the limit,
 whatever the fsync. With few, each request waits out a round trip and a
 backup's fsync; the primary's own fsync overlaps them.
+
+A GET is a query, which costs no log entry and no fsync. At 30 µs, with
+`READS` percent of the commands GETs:
+
+| reads | 1 client | 16 | 64 | 256 | 1,024 |
+|---|---|---|---|---|---|
+| 50% | 4.9k | 79.4k | 302.3k | 873.0k | 804.3k |
+| 90% | 5.2k | 89.5k | 306.8k | 706.7k | 710.3k |
+
+A connection with 16 SETs in flight (`PIPELINE=16`) goes further: 649.1k
+ops/s from 16 connections, 964.4k from 64.
 
 ```console
 cargo run --release -p vsr-bench --bin vsr-micro

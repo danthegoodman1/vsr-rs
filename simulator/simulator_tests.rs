@@ -76,6 +76,7 @@ fn fault_script() {
     let mut options = Options::lite(&mut prng);
     options.network = NetworkOptions::perfect();
     options.replica_crash_probability = 0.0;
+    options.replica_restart_probability = 0.0;
     options.blackout_probability = 0.0;
     options.checkpoint_power_loss_probability = 0.0;
     options.step_power_loss_probability = 0.0;
@@ -119,7 +120,8 @@ fn fault_script() {
 
 /// A quiet cluster: perfect network, no random crashes, restarts,
 /// blackouts, or flushes, every write landing in its step, every replica in
-/// the liveness core, so that a script alone decides what happens.
+/// the liveness core, and requests only, so that a script alone decides
+/// what happens.
 fn quiet(seed: u64, requests_max: usize) -> Simulator {
     let _ = env_logger::try_init();
     let mut prng = ChaCha8Rng::seed_from_u64(seed);
@@ -136,6 +138,7 @@ fn quiet(seed: u64, requests_max: usize) -> Simulator {
     options.full_core = true;
     options.requests_max = requests_max;
     options.write_out_probability = 0.0;
+    options.query_probability = 0.0;
     Simulator::init(seed, options).expect("options are valid")
 }
 
@@ -224,6 +227,7 @@ fn compaction_script() {
     );
     let snapshot = simulator.snapshot();
     assert_eq!(7, snapshot.flushes);
+    assert!(snapshot.restores > 0, "no replica restored a checkpoint");
     assert!(
         simulator
             .replicas()
@@ -549,7 +553,7 @@ fn acknowledgement_released_after_a_later_view_started() {
 #[test]
 fn process_crashes() {
     let mut ahead = 0;
-    for seed in [22, 23, 24] {
+    for seed in [28, 30, 31] {
         let simulator = run(seed, |options| {
             options.replica_crash_probability = 0.0005;
             options.replica_restart_probability = 0.01;
@@ -580,4 +584,49 @@ fn process_crash_script() {
     );
     assert_eq!(2, simulator.process_crashes);
     assert_eq!(0, simulator.power_losses);
+}
+
+/// More clients than the client table holds: they evict each other's
+/// sessions, whose requests in flight fail, and register again.
+#[test]
+fn clients_evict_each_other() {
+    let mut evicted = 0;
+    for seed in [31, 32, 33] {
+        let simulator = run(seed, |options| {
+            options.client_count = 4;
+            options.clients_max = 2;
+            options.in_flight_max = 3;
+        });
+        evicted += simulator.requests_evicted;
+    }
+    assert!(evicted > 0);
+}
+
+/// Clients keep several requests in flight on a network that loses,
+/// replays, and delays them.
+#[test]
+fn pipelined_clients() {
+    for seed in [41, 42, 43] {
+        let simulator = run(seed, |options| {
+            options.clients_max = options.client_count;
+            options.in_flight_max = 4;
+            options.request_probability = 1.0;
+        });
+        assert_eq!(0, simulator.requests_evicted);
+        assert_eq!(simulator.requests_replied, simulator.options.requests_max);
+    }
+}
+
+/// Clients mix queries with their requests on a network that loses,
+/// replays, and delays both, and every query reads a state at or past
+/// every write completed before it.
+#[test]
+fn queries_among_requests() {
+    for seed in [51, 52, 53] {
+        let simulator = run(seed, |options| {
+            options.query_probability = 0.5;
+            options.network.fault_client_messages = true;
+        });
+        assert_eq!(simulator.requests_replied, simulator.options.requests_max);
+    }
 }

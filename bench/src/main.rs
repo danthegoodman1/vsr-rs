@@ -5,8 +5,9 @@
 //! node sends goes through a router thread of its own to the node it is
 //! for, as the kvstore's sender threads would put it on the wire, so the
 //! numbers leave the network out. Closed-loop clients send their commands
-//! to node 0 the way the kvstore's client connections do, each waiting for
-//! its reply before it sends the next. Two configurations:
+//! to node 0 the way the kvstore's client connections do, each with
+//! `PIPELINE` commands in flight, one unless set, and `READS` percent of
+//! them GETs, none unless set, over 100,000 keys. Two configurations:
 //!
 //! - `journal`: the kvstore as it runs: a journal write and fsync of what
 //!   the replica changed more than the commit number, one write at a time
@@ -173,12 +174,15 @@ impl Cluster {
         Ok(cluster)
     }
 
-    /// Starts `count` closed-loop clients of node 0. Each returns the
-    /// latencies of the requests it had answered from `measure_from` to
-    /// `end`.
+    /// Starts `count` closed-loop clients of node 0, each with `pipeline`
+    /// commands in flight, a GET with probability `reads` and a SET
+    /// otherwise. Each returns the latencies of the commands it had
+    /// answered from `measure_from` to `end`.
     fn clients(
         &mut self,
         count: usize,
+        pipeline: usize,
+        reads: f64,
         measure_from: Instant,
         end: Instant,
     ) -> Vec<JoinHandle<Vec<Duration>>> {
@@ -192,19 +196,31 @@ impl Cluster {
                     let mut prng = ChaCha8Rng::seed_from_u64(i as u64);
                     let (respond_tx, respond_rx) = channel();
                     let mut latencies = Vec::new();
+                    // The node answers a connection's commands in the order
+                    // they came.
+                    let mut in_flight = VecDeque::new();
                     while !stop.load(Ordering::Relaxed) {
-                        let key = prng.gen_range(0..KEY_SPACE);
-                        let command =
-                            Command::Set(format!("k{key}"), prng.gen::<u64>().to_string());
-                        let sent = Instant::now();
-                        let event = Event::Command {
-                            connection,
-                            command,
-                            respond: respond_tx.clone(),
-                        };
-                        if events.send(event).is_err() || !wait(&respond_rx, &stop) {
+                        while in_flight.len() < pipeline {
+                            let key = format!("k{}", prng.gen_range(0..KEY_SPACE));
+                            let command = if prng.gen_bool(reads) {
+                                Command::Get(key)
+                            } else {
+                                Command::Set(key, prng.gen::<u64>().to_string())
+                            };
+                            let event = Event::Command {
+                                connection,
+                                command,
+                                respond: respond_tx.clone(),
+                            };
+                            in_flight.push_back(Instant::now());
+                            if events.send(event).is_err() {
+                                return latencies;
+                            }
+                        }
+                        if !wait(&respond_rx, &stop) {
                             break;
                         }
+                        let sent = in_flight.pop_front().expect("a request in flight");
                         let now = Instant::now();
                         answered.fetch_add(1, Ordering::Relaxed);
                         if (measure_from..=end).contains(&now) {
@@ -328,11 +344,15 @@ fn wait(replies: &Receiver<String>, stop: &AtomicBool) -> bool {
     }
 }
 
-/// Runs `clients` closed-loop clients against three new nodes in `dir`.
+/// Runs `clients` closed-loop clients, each with `pipeline` commands in
+/// flight and a share `reads` of them GETs, against three new nodes in
+/// `dir`.
 fn run(
     dir: &Path,
     journaled: bool,
     clients: usize,
+    pipeline: usize,
+    reads: f64,
     emulation: Emulation,
 ) -> Result<Measurement, String> {
     let _ = std::fs::remove_dir_all(dir);
@@ -340,7 +360,7 @@ fn run(
     let started = Instant::now();
     let measure_from = started + WARMUP;
     let end = measure_from + MEASURE;
-    let client_threads = cluster.clients(clients, measure_from, end);
+    let client_threads = cluster.clients(clients, pipeline, reads, measure_from, end);
     let (mut last_answered, mut last_progress) = (0, Instant::now());
     let mut fsyncs_from = None;
     while Instant::now() < end {
@@ -447,6 +467,8 @@ fn main() {
     );
     let client_counts = env_list("CLIENTS", &[1, 16, 64]);
     let repeat = env_list("REPEAT", &[3])[0].max(1);
+    let pipeline = env_list("PIPELINE", &[1])[0].max(1);
+    let reads = env_list("READS", &[0])[0].min(100) as f64 / 100.0;
     let configurations: Vec<(&str, bool)> = match std::env::var("CONFIG") {
         Ok(only) => match CONFIGURATIONS.iter().find(|(name, _)| *name == only) {
             Some(configuration) => vec![*configuration],
@@ -469,6 +491,12 @@ fn main() {
         data.display(),
         MEASURE.as_secs()
     );
+    if pipeline > 1 {
+        println!("each client keeps {pipeline} commands in flight");
+    }
+    if reads > 0.0 {
+        println!("{:.0}% of commands are GETs", reads * 100.0);
+    }
     if emulation.network > Duration::ZERO || emulation.fsync > Duration::ZERO {
         println!(
             "emulating {} µs between nodes each way and {} µs more per journal fsync",
@@ -495,7 +523,7 @@ fn main() {
         for i in 0..repeat {
             for (runs, (name, journaled)) in runs.iter_mut().zip(&configurations) {
                 let dir = data.join(format!("{name}-{clients}-{i}"));
-                match run(&dir, *journaled, clients, emulation) {
+                match run(&dir, *journaled, clients, pipeline, reads, emulation) {
                     Ok(measurement) => runs.push(measurement),
                     Err(err) => {
                         eprintln!("{name} with {clients} clients, run {i}: {err}");

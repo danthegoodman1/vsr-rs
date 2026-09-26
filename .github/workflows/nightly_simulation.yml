@@ -1,0 +1,46 @@
+name: Nightly simulation
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # The bugs the simulator has found showed up about once in 10,000
+      # runs, which the ten minutes on each pull request usually miss.
+      - name: Simulate
+        shell: bash
+        run: scripts/simulate --budget 2h --timeout 20m 2> >(tee sweep.log >&2)
+      - name: Keep the logs of the failed runs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulator-logs
+          path: target/simulate/logs/
+      - name: File an issue
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "The nightly simulation of ${GITHUB_SHA} failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo '```'
+            grep -E '^(FAILED|TIMEOUT)' sweep.log || echo "no failing seed printed; see the run's log"
+            echo '```'
+          } > issue.md
+          gh issue create --title "Nightly simulation failed on ${GITHUB_SHA::7}" --body-file issue.md

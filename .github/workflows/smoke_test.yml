@@ -10,17 +10,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  lint:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v3
-    - name: Check
-      run: cargo check --workspace --all-targets --all-features
-    - name: Clippy
-      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-    - name: Run tests
-      run: cargo test --workspace --verbose
-    - name: Run simulator
-      run: cargo run --release -p vsr-simulator -- ${{ github.sha }}
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # A debug build checks every arithmetic operation for overflow. The
+      # doctests run the README's example.
+      - name: Test
+        run: cargo test --workspace
+
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # Fresh seeds on every run; a failure prints the seed that reproduces
+      # it, which may expose a bug older than the change under test.
+      - name: Simulate
+        run: scripts/simulate --budget 10m --timeout 15m
+      - name: Keep the logs of the failed runs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulator-logs
+          path: target/simulate/logs/

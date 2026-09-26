@@ -45,6 +45,7 @@ use vsr_rs::{LogBase, LogSegment, Message, RecoveryState, ReplicaID, Reply};
 mod journal;
 mod node;
 
+use journal::push_number;
 use node::*;
 
 #[global_allocator]
@@ -83,10 +84,16 @@ fn encode(frame: &Frame) -> String {
                 request_number,
                 answered,
                 op,
-            } => format!(
-                "REQUEST {client_id} {session} {request_number} {answered} {}",
-                encode_op(op)
-            ),
+            } => {
+                let mut out = "REQUEST".to_string();
+                for number in [client_id, session, request_number, answered] {
+                    out.push(' ');
+                    push_number(&mut out, *number);
+                }
+                out.push(' ');
+                write_op(&mut out, op);
+                out
+            }
             Message::Query {
                 client_id,
                 query_number,
@@ -105,10 +112,16 @@ fn encode(frame: &Frame) -> String {
                 op_number,
                 entry,
                 commit_number,
-            } => format!(
-                "PREPARE {view_number} {op_number} {commit_number} {}",
-                encode_entry(entry)
-            ),
+            } => {
+                let mut out = "PREPARE".to_string();
+                for number in [view_number, op_number, commit_number] {
+                    out.push(' ');
+                    push_number(&mut out, *number);
+                }
+                out.push(' ');
+                write_entry(&mut out, entry);
+                out
+            }
             Message::PrepareOk {
                 view_number,
                 op_number,
@@ -1930,6 +1943,13 @@ mod tests {
                 request_number: 5,
                 answered: 3,
                 op: Op::Put("a".into(), "1".into()),
+            },
+            LogEntry::Request {
+                client_id: usize::MAX,
+                session: 10,
+                request_number: 1,
+                answered: 0,
+                op: Op::Put("b".into(), "2".into()),
             },
         ];
         let messages: Vec<KvMessage> = vec![

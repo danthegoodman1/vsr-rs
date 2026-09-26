@@ -2,7 +2,7 @@
 //! proxies, stepped by one event loop. `main.rs` puts it on the network;
 //! the benchmark runs three of them in one process.
 
-use crate::journal::{EntryCodec, Journal, Landing};
+use crate::journal::{push_number, EntryCodec, Journal, Landing};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable, Snapshot};
 use futures::future::{maybe_done, MaybeDone};
 use std::cell::RefCell;
@@ -59,25 +59,40 @@ pub(crate) enum Op {
     Put(String, String),
 }
 
-pub(crate) fn encode_op(op: &Op) -> String {
+pub(crate) fn write_op(out: &mut String, op: &Op) {
     match op {
-        Op::Put(key, value) => format!("PUT {key} {value}"),
+        Op::Put(key, value) => {
+            out.push_str("PUT ");
+            out.push_str(key);
+            out.push(' ');
+            out.push_str(value);
+        }
     }
 }
 
-pub(crate) fn encode_entry(entry: &LogEntry<Op>) -> String {
+/// Appends `entry` to `out`. The journal writes every entry this way on
+/// the event loop, so it skips `format!`.
+pub(crate) fn write_entry(out: &mut String, entry: &LogEntry<Op>) {
     match entry {
-        LogEntry::Register { client_id } => format!("REG {client_id}"),
+        LogEntry::Register { client_id } => {
+            out.push_str("REG ");
+            push_number(out, *client_id);
+        }
         LogEntry::Request {
             client_id,
             session,
             request_number,
             answered,
             op,
-        } => format!(
-            "REQ {client_id} {session} {request_number} {answered} {}",
-            encode_op(op)
-        ),
+        } => {
+            out.push_str("REQ");
+            for number in [client_id, session, request_number, answered] {
+                out.push(' ');
+                push_number(out, *number);
+            }
+            out.push(' ');
+            write_op(out, op);
+        }
     }
 }
 
@@ -89,7 +104,7 @@ pub(crate) fn decode_entry(text: &str) -> Result<LogEntry<Op>, String> {
 }
 
 pub(crate) const ENTRY_CODEC: EntryCodec<Op> = EntryCodec {
-    encode: encode_entry,
+    write: write_entry,
     decode: decode_entry,
 };
 
@@ -97,7 +112,7 @@ pub(crate) fn encode_entries(log: &[LogEntry<Op>]) -> String {
     let mut out = log.len().to_string();
     for entry in log {
         out.push(' ');
-        out.push_str(&encode_entry(entry));
+        write_entry(&mut out, entry);
     }
     out
 }
@@ -1013,7 +1028,6 @@ pub(crate) struct Connection {
 /// A command in flight on a connection.
 pub(crate) struct Pending {
     pub(crate) ticket: Ticket,
-    pub(crate) command: Command,
     pub(crate) respond: Sender<String>,
     /// Its answer, held until the commands before it have theirs, so that
     /// a connection gets its answers in the order its commands came.
@@ -1034,11 +1048,11 @@ pub(crate) const EVICTED: &str = "-ERR session evicted; the command may or may n
 /// A reply as a client connection takes it, and where to send it.
 pub(crate) type Answer = (Sender<String>, String);
 
-pub(crate) fn format_reply(command: &Command, result: Option<String>) -> String {
-    match (command, result) {
-        (Command::Set(..), _) => "+OK\r\n".to_string(),
-        (Command::Get(_), Some(value)) => format!("${}\r\n{value}\r\n", value.len()),
-        (Command::Get(_), None) => "$-1\r\n".to_string(),
+pub(crate) fn format_reply(ticket: Ticket, result: Option<String>) -> String {
+    match (ticket, result) {
+        (Ticket::Request(_), _) => "+OK\r\n".to_string(),
+        (Ticket::Query(_), Some(value)) => format!("${}\r\n{value}\r\n", value.len()),
+        (Ticket::Query(_), None) => "$-1\r\n".to_string(),
     }
 }
 
@@ -1454,7 +1468,7 @@ impl Node {
         if let Some((ticket, result)) = completed {
             let pending = &mut connection.pending;
             if let Some(pending) = pending.iter_mut().find(|pending| pending.ticket == ticket) {
-                pending.answer = Some(format_reply(&pending.command, result));
+                pending.answer = Some(format_reply(ticket, result));
             }
         }
         while connection
@@ -1487,16 +1501,14 @@ impl Node {
                     client: Client::new(id as ClientID, config.clone()),
                     pending: VecDeque::new(),
                 });
-                let ticket = match &command {
+                let ticket = match command {
                     Command::Set(key, value) => {
-                        let op = Op::Put(key.clone(), value.clone());
-                        Ticket::Request(connection.client.on_request(op))
+                        Ticket::Request(connection.client.on_request(Op::Put(key, value)))
                     }
-                    Command::Get(key) => Ticket::Query(connection.client.on_query(key.clone())),
+                    Command::Get(key) => Ticket::Query(connection.client.on_query(key)),
                 };
                 connection.pending.push_back(Pending {
                     ticket,
-                    command,
                     respond,
                     answer: None,
                 });

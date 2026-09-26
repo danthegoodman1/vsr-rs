@@ -12,7 +12,6 @@
 use futures::executor::block_on;
 use futures::StreamExt;
 use std::collections::BTreeMap;
-use std::fmt::Write;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -42,9 +41,24 @@ enum Record<Op> {
     Header(Header),
 }
 
-/// Encodes an entry as one line of text, and decodes it again.
+/// Appends `n` in decimal.
+pub fn push_number(out: &mut String, mut n: usize) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.extend(digits[start..].iter().map(|&digit| char::from(digit)));
+}
+
+/// Writes an entry as one line of text, and decodes it again.
 pub struct EntryCodec<Op> {
-    pub encode: fn(&LogEntry<Op>) -> String,
+    pub write: fn(&mut String, &LogEntry<Op>),
     pub decode: fn(&str) -> Result<LogEntry<Op>, String>,
 }
 
@@ -281,20 +295,26 @@ impl<Op: Clone> Journal<Op> {
     pub fn submit(&self, write: &LogWrite<Op>) -> Landing {
         let mut record = String::new();
         for (i, entry) in write.entries.iter().enumerate() {
-            let op_number = write.entries_from + i;
-            let _ = writeln!(record, "E {op_number} {}", (self.codec.encode)(entry));
+            record.push_str("E ");
+            push_number(&mut record, write.entries_from + i);
+            record.push(' ');
+            (self.codec.write)(&mut record, entry);
+            record.push('\n');
         }
-        let _ = write!(
-            record,
-            "H {} {} {} {} {} {} {}",
+        record.push('H');
+        let header = [
             write.view_number,
             write.last_normal_view,
             write.commit_number,
             write.log_start,
             write.entries_from,
             write.op_number(),
-            u8::from(write.recovering)
-        );
+            usize::from(write.recovering),
+        ];
+        for number in header {
+            record.push(' ');
+            push_number(&mut record, number);
+        }
         let writer = self.writer.clone();
         Box::pin(async move {
             writer

@@ -108,9 +108,10 @@
 //! client keeps its operations in the order it issued them, so a query sees
 //! every write its client issued before it.
 
+use foldhash::{HashMap, HashSet};
 use log::trace;
 use std::{
-    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{hash_map::Entry, BTreeMap, BTreeSet, VecDeque},
     fmt::Debug,
 };
 
@@ -219,7 +220,7 @@ pub trait StateMachine {
 /// Configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// IDs of all replicas (in sorted order).
+    /// IDs of all replicas, which are their indexes.
     replicas: Vec<ReplicaID>,
     /// Idle periods a backup waits without hearing from the primary before
     /// it starts a view change, and a view change may take before the next
@@ -248,7 +249,7 @@ impl Config {
     }
 
     pub fn primary_id(&self, view_number: ViewNumber) -> ReplicaID {
-        self.replicas[view_number % self.replicas.len()]
+        view_number % self.replicas.len()
     }
 
     pub fn add_replica(&mut self) -> ReplicaID {
@@ -868,28 +869,37 @@ impl<Op: Clone + Debug, Query: Clone + Debug> Client<Op, Query> {
         self.session
     }
 
-    /// Queues `op` and returns the request number it was given. It goes to
-    /// the primary once the client has a session, room in flight, and the
-    /// replies to the queries issued before it.
+    /// Sends `op` to the primary, or queues it until the client has a
+    /// session, room in flight, and the replies to the queries issued
+    /// before it. Returns the request number it was given.
     pub fn on_request(&mut self, op: Op) -> RequestNumber {
         trace!("Client {} <- {:?}", self.client_id, op);
         let request_number = self.next_request_number;
         self.next_request_number += 1;
-        self.queued.push_back(Queued::Request(request_number, op));
-        self.register();
-        self.send_queued();
+        match self.session {
+            Some(session) if self.queued.is_empty() && self.request_may_go(request_number) => {
+                self.send_request(session, request_number, op);
+            }
+            _ => {
+                self.queued.push_back(Queued::Request(request_number, op));
+                self.register();
+            }
+        }
         request_number
     }
 
-    /// Queues `query` and returns the query number it was given. It goes to
-    /// the primary once the client has room in flight and the replies to
-    /// the requests issued before it.
+    /// Sends `query` to the primary, or queues it until the client has room
+    /// in flight and the replies to the requests issued before it. Returns
+    /// the query number it was given.
     pub fn on_query(&mut self, query: Query) -> QueryNumber {
         trace!("Client {} <- {:?}", self.client_id, query);
         let query_number = self.next_query_number;
         self.next_query_number += 1;
-        self.queued.push_back(Queued::Query(query_number, query));
-        self.send_queued();
+        if self.queued.is_empty() && self.query_may_go(query_number) {
+            self.send_query(query_number, query);
+        } else {
+            self.queued.push_back(Queued::Query(query_number, query));
+        }
         query_number
     }
 
@@ -903,63 +913,89 @@ impl<Op: Clone + Debug, Query: Clone + Debug> Client<Op, Query> {
         }
     }
 
-    /// Sends the queued operations that may go, in order.
+    /// Sends the queued operations that may go, in order. The front of the
+    /// queue waits between calls, so only a reply or a session lets any go.
     fn send_queued(&mut self) {
-        let primary_id = self.config.primary_id(self.view_number);
-        let window = self.config.in_flight_max();
         loop {
-            let outgoing = match self.queued.front() {
+            match self.queued.front() {
                 Some(Queued::Request(request_number, _)) => {
-                    let oldest = self
-                        .requests
-                        .front()
-                        .map_or(*request_number, |sent| sent.number);
                     let Some(session) = self.session else {
                         return;
                     };
-                    if !self.queries.is_empty() || *request_number >= oldest + window {
+                    if !self.request_may_go(*request_number) {
                         return;
                     }
                     let Some(Queued::Request(request_number, op)) = self.queued.pop_front() else {
                         unreachable!("a request is queued");
                     };
-                    self.requests.push_back(InFlight {
-                        number: request_number,
-                        item: Some(op.clone()),
-                        sent: self.idle_periods,
-                    });
-                    Outgoing::Request {
-                        session,
-                        request_number,
-                        answered: oldest - 1,
-                        op,
-                    }
+                    self.send_request(session, request_number, op);
                 }
                 Some(Queued::Query(query_number, _)) => {
-                    let oldest = self
-                        .queries
-                        .front()
-                        .map_or(*query_number, |sent| sent.number);
-                    if !self.requests.is_empty() || *query_number >= oldest + window {
+                    if !self.query_may_go(*query_number) {
                         return;
                     }
                     let Some(Queued::Query(query_number, query)) = self.queued.pop_front() else {
                         unreachable!("a query is queued");
                     };
-                    self.queries.push_back(InFlight {
-                        number: query_number,
-                        item: Some(query.clone()),
-                        sent: self.idle_periods,
-                    });
-                    Outgoing::Query {
-                        query_number,
-                        query,
-                    }
+                    self.send_query(query_number, query);
                 }
                 None => return,
-            };
-            self.outbox.push((primary_id, outgoing));
+            }
         }
+    }
+
+    fn request_may_go(&self, request_number: RequestNumber) -> bool {
+        let oldest = self
+            .requests
+            .front()
+            .map_or(request_number, |sent| sent.number);
+        self.queries.is_empty() && request_number < oldest + self.config.in_flight_max()
+    }
+
+    fn query_may_go(&self, query_number: QueryNumber) -> bool {
+        let oldest = self
+            .queries
+            .front()
+            .map_or(query_number, |sent| sent.number);
+        self.requests.is_empty() && query_number < oldest + self.config.in_flight_max()
+    }
+
+    /// Sends a request to the primary, and keeps its op to re-send until
+    /// the reply comes.
+    fn send_request(&mut self, session: OpNumber, request_number: RequestNumber, op: Op) {
+        let oldest = self
+            .requests
+            .front()
+            .map_or(request_number, |sent| sent.number);
+        self.requests.push_back(InFlight {
+            number: request_number,
+            item: Some(op.clone()),
+            sent: self.idle_periods,
+        });
+        let outgoing = Outgoing::Request {
+            session,
+            request_number,
+            answered: oldest - 1,
+            op,
+        };
+        let primary_id = self.config.primary_id(self.view_number);
+        self.outbox.push((primary_id, outgoing));
+    }
+
+    /// Sends a query to the primary, and keeps it to re-send until the
+    /// reply comes.
+    fn send_query(&mut self, query_number: QueryNumber, query: Query) {
+        self.queries.push_back(InFlight {
+            number: query_number,
+            item: Some(query.clone()),
+            sent: self.idle_periods,
+        });
+        let outgoing = Outgoing::Query {
+            query_number,
+            query,
+        };
+        let primary_id = self.config.primary_id(self.view_number);
+        self.outbox.push((primary_id, outgoing));
     }
 
     /// Handles a reply to this client. Every reply tells the client the
@@ -1029,7 +1065,7 @@ impl<Op: Clone + Debug, Query: Clone + Debug> Client<Op, Query> {
         self.idle_periods += 1;
         let now = self.idle_periods;
         let due = |sent: u64| sent + 1 < now;
-        let replica_ids = self.config.replicas().to_vec();
+        let replica_count = self.config.replicas().len();
         let mut resend = Vec::new();
         if self.registering.is_some_and(due) {
             self.registering = Some(now);
@@ -1061,7 +1097,7 @@ impl<Op: Clone + Debug, Query: Clone + Debug> Client<Op, Query> {
             });
         }
         for outgoing in resend {
-            for &replica_id in &replica_ids {
+            for replica_id in 0..replica_count {
                 self.outbox.push((replica_id, outgoing.clone()));
             }
         }
@@ -1325,7 +1361,9 @@ pub struct Replica<SM: StateMachine> {
     /// table, and its latest entry in the log after `applied`. Every entry
     /// looks its client up here, on every replica, so it is a hash map: with
     /// many clients at work, the paths of a tree fall out of the cache. It
-    /// keeps the default hasher, since the keys come from clients.
+    /// and `waiting` take their keys from clients; foldhash seeds each
+    /// table, costs far less than SipHash, and resists chosen collisions
+    /// only minimally.
     clients: HashMap<ClientID, ClientState<SM::Output>>,
     /// The number of sessions in the client table.
     sessions: usize,
@@ -1413,13 +1451,13 @@ impl<SM: StateMachine> Replica<SM> {
             acked: vec![0; replica_count],
             view_start_op: 0,
             queries: VecDeque::new(),
-            waiting: HashSet::new(),
+            waiting: HashSet::default(),
             round: 0,
             round_confirmed: 0,
             confirmed: vec![0; replica_count],
             round_unsent: false,
             resend_up_to: 0,
-            clients: HashMap::new(),
+            clients: HashMap::default(),
             sessions: 0,
             eviction_candidates: VecDeque::new(),
             heard_from_primary: true,
@@ -2135,9 +2173,12 @@ impl<SM: StateMachine> Replica<SM> {
         // Only the session's next request is appended, so that its requests
         // execute in order: a later one arrived out of order, and an earlier
         // one is in the log already. A client has at most `in_flight_max`
-        // requests past its last executed one.
+        // requests past its last executed one. An entry of a later session
+        // in the log means the client has left this one, whose requests
+        // may be in the log too.
         let latest = match state.and_then(|state| state.pending) {
             Some((pending_session, pending)) if pending_session == session => pending,
+            Some((pending_session, _)) if pending_session > session => return,
             _ => record.request_number,
         };
         if request_number != latest + 1
@@ -2960,7 +3001,7 @@ impl<SM: StateMachine> Replica<SM> {
         // before it could.
         self.commit_up_to(commit_number, true);
         self.enter_normal();
-        for replica_id in self.config.replicas().to_vec() {
+        for replica_id in 0..self.config.replicas().len() {
             if replica_id != self.self_id {
                 self.send_start_view(replica_id);
             }
@@ -3146,7 +3187,7 @@ impl<SM: StateMachine> Replica<SM> {
             view_number: self.view_number,
         };
         let ask_everyone = self.recovery_responses.len() >= self.config.quorum();
-        for replica_id in self.config.replicas().to_vec() {
+        for replica_id in 0..self.config.replicas().len() {
             if replica_id != self.self_id
                 && (ask_everyone || !self.recovery_responses.contains_key(&replica_id))
             {
@@ -3190,7 +3231,7 @@ impl<SM: StateMachine> Replica<SM> {
                 let due = std::mem::replace(&mut self.resend_up_to, last_op).min(last_op);
                 if due > commit_number {
                     let entry = self.entry(due).clone();
-                    for replica_id in self.config.replicas().to_vec() {
+                    for replica_id in 0..self.config.replicas().len() {
                         if replica_id != self.self_id && self.acked[replica_id] < due {
                             self.send(
                                 replica_id,
@@ -3206,7 +3247,7 @@ impl<SM: StateMachine> Replica<SM> {
                 }
                 let round = self.round;
                 if round > self.round_confirmed {
-                    for replica_id in self.config.replicas().to_vec() {
+                    for replica_id in 0..self.config.replicas().len() {
                         if self.confirmed[replica_id] < round {
                             self.send(replica_id, Message::ConfirmView { view_number, round });
                         }
@@ -3430,7 +3471,7 @@ impl<SM: StateMachine> Replica<SM> {
     }
 
     fn send_to_others(&mut self, message: MessageFor<SM>) {
-        for replica_id in self.config.replicas().to_vec() {
+        for replica_id in 0..self.config.replicas().len() {
             if replica_id != self.self_id {
                 self.send(replica_id, message.clone());
             }

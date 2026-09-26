@@ -377,7 +377,7 @@ the durable log (commit `0b64760`) and now, through the same loop:
 | ops in flight | 1 | 16 | 64 | 256 | 1,024 | 4,096 | 16,384 |
 |---|---|---|---|---|---|---|---|
 | before, ns/op | 314 | 166 | 189 | 273 | 627 | 2,152 | 9,493 |
-| now, ns/op | 484 | 181 | 170 | 172 | 177 | 200 | 267 |
+| now, ns/op | 462 | 147 | 136 | 139 | 144 | 168 | 225 |
 
 With one operation in flight the library now spends more on each, on the
 write it builds and on holding back what waits for it; with more, it
@@ -403,10 +403,10 @@ three rounds of SETs from clients with one command in flight each:
 
 | fsync | 1 client | 16 | 64 | 256 | 1,024 |
 |---|---|---|---|---|---|
-| 15 µs | 4.9k | 76.4k | 286.7k | 635.4k | 655.4k |
-| 30 µs | 4.6k | 69.9k | 252.8k | 639.5k | 659.4k |
-| 60 µs | 4.0k | 57.2k | 206.3k | 574.2k | 653.4k |
-| 100 µs | 3.4k | 47.1k | 163.7k | 500.8k | 647.9k |
+| 15 µs | 4.9k | 78.7k | 290.6k | 756.6k | 751.7k |
+| 30 µs | 4.7k | 70.3k | 259.4k | 750.1k | 764.0k |
+| 60 µs | 4.1k | 57.9k | 211.5k | 644.2k | 748.9k |
+| 100 µs | 3.3k | 47.5k | 173.9k | 507.1k | 734.9k |
 
 With enough requests in flight the primary's event loop sets the limit,
 whatever the fsync. With few, each request waits out a round trip and a
@@ -417,11 +417,11 @@ A GET is a query, which costs no log entry and no fsync. At 30 µs, with
 
 | reads | 1 client | 16 | 64 | 256 | 1,024 |
 |---|---|---|---|---|---|
-| 50% | 4.9k | 78.9k | 297.7k | 752.3k | 759.9k |
-| 90% | 5.3k | 88.4k | 310.1k | 679.8k | 668.3k |
+| 50% | 4.9k | 79.4k | 302.3k | 873.0k | 804.3k |
+| 90% | 5.2k | 89.5k | 306.8k | 706.7k | 710.3k |
 
-A connection with 16 SETs in flight (`PIPELINE=16`) goes further: 638.9k
-ops/s from 16 connections, 827.6k from 64.
+A connection with 16 SETs in flight (`PIPELINE=16`) goes further: 649.1k
+ops/s from 16 connections, 964.4k from 64.
 
 ```console
 cargo run --release -p vsr-bench --bin vsr-micro

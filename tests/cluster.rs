@@ -2472,6 +2472,63 @@ fn test_request_of_a_session_evicted_in_between_does_not_execute() {
 /// A client asks for a session twice. The second request is dropped while
 /// the first is in the log, and answered with the same session once it
 /// executed.
+/// A new primary holds a client's request and its registration after an
+/// eviction it has yet to execute. A replayed copy of the request, from the
+/// session the client has left, is not appended again. Found by the
+/// simulator, `--lite 4242660838422493032`.
+#[test]
+fn test_request_of_a_left_session_is_appended_once() {
+    let mut config = Config::new();
+    config.set_clients_max(1);
+    let mut cluster = Cluster::with_config(3, config);
+    // Client 1's registration evicts client 0's session, and client 0's
+    // request, appended behind it, is skipped. Client 0 registers again
+    // with its next request. Replica 1 misses all of it.
+    let one = cluster.add_client();
+    cluster.other(one).register();
+    let registration: Vec<_> = cluster.other(one).drain::<Chunk>().collect();
+    for (replica_id, message) in registration {
+        cluster.replicas[replica_id].on_message(message);
+    }
+    cluster.request(Op::Add(1));
+    cluster.deliver_client();
+    cluster.tick_without(1);
+    cluster.idle_without(1);
+    cluster.tick_without(1);
+    cluster.request(Op::Add(2));
+    cluster.tick_without(1);
+    cluster.idle_without(1);
+    cluster.tick_without(1);
+    assert_eq!(5, cluster.replicas[2].op_number());
+    assert_eq!(1, cluster.replicas[1].op_number());
+
+    // Replica 0 goes down, and replica 1 starts view 1 from replica 2's
+    // log. Before its write lands, a replayed copy of the request arrives.
+    let dvcs = RefCell::new(Vec::new());
+    while dvcs.borrow().is_empty() {
+        cluster.idle_without(0);
+        cluster.tick_with(&|replica_id, message| {
+            if replica_id == 1 && matches!(message, Message::DoViewChange { .. }) {
+                dvcs.borrow_mut().push(message.clone());
+                return false;
+            }
+            replica_id != 0
+        });
+    }
+    for message in dvcs.take() {
+        cluster.replicas[1].on_message(message);
+    }
+    assert!(cluster.replicas[1].is_primary());
+    cluster.replicas[1].on_message(Message::Request {
+        client_id: 0,
+        session: 1,
+        request_number: 1,
+        answered: 0,
+        op: Op::Add(1),
+    });
+    assert_eq!(5, cluster.replicas[1].op_number());
+}
+
 #[test]
 fn test_duplicate_registration_answers_the_session() {
     let mut cluster = Cluster::new(3);
@@ -2865,6 +2922,27 @@ fn test_client_keeps_program_order() {
         .collect();
     assert_eq!(vec![10], queried);
     assert_eq!(30, cluster.value(0));
+}
+
+/// A request waits for the reply to a query in flight, though nothing is
+/// queued ahead of it, and goes once that reply comes.
+#[test]
+fn test_request_waits_for_a_query_in_flight() {
+    let mut cluster = Cluster::new(3);
+    cluster.client.on_query(());
+    cluster.request(Op::Add(10));
+    let sent: Vec<_> = cluster.client.drain::<Chunk>().collect();
+    assert!(matches!(sent[..], [(_, Message::Query { .. })]), "{sent:?}");
+    cluster.queue.extend(sent);
+    cluster.tick();
+    let queried: Vec<i32> = cluster
+        .take_replies()
+        .iter()
+        .filter(|reply| matches!(reply, Reply::Queried { .. }))
+        .map(queried)
+        .collect();
+    assert_eq!(vec![0], queried);
+    assert_eq!(10, cluster.value(0));
 }
 
 /// An eviction fails a query in flight, and the client numbers queries on:

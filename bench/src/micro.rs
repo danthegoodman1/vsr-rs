@@ -17,28 +17,60 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use vsr_rs::{
-    Checkpoint, Client, Config, LogEntry, Message, MessageFor, OpNumber, Replica, StateMachine,
+    Client, ClientID, ClientRecord, Completion, Config, Message, MessageFor, OpNumber, Replica,
+    StateMachine,
 };
 
-/// Adds up the ops.
+/// Adds up the ops. It keeps no client table: the benchmark never restarts
+/// a replica or transfers state, and a copy of each record would count
+/// against the library.
 struct Sum(u64);
 
 impl StateMachine for Sum {
     type Input = u64;
+    type Query = ();
     type Output = u64;
-    type Snapshot = u64;
+    type Chunk = ();
 
-    fn apply(&mut self, _op_number: OpNumber, entry: &LogEntry<u64>) -> u64 {
-        self.0 = self.0.wrapping_add(entry.op);
+    fn apply(&mut self, _op_number: OpNumber, op: &u64) -> u64 {
+        self.0 = self.0.wrapping_add(*op);
         self.0
     }
 
-    fn snapshot(&self) -> u64 {
+    fn query(&self, _query: &()) -> u64 {
         self.0
     }
 
-    fn restore(&mut self, checkpoint: Checkpoint<u64, u64>) {
-        self.0 = checkpoint.state;
+    fn record_client(
+        &mut self,
+        _op_number: OpNumber,
+        _client_id: ClientID,
+        _record: Option<&ClientRecord<u64>>,
+    ) {
+    }
+
+    fn client_table(&self) -> Vec<ClientRecord<u64>> {
+        Vec::new()
+    }
+
+    fn checkpoint(&mut self) -> OpNumber {
+        unreachable!("the benchmark transfers no state")
+    }
+
+    fn checkpoint_chunk(&self, _index: usize) -> ((), bool) {
+        unreachable!("the benchmark transfers no state")
+    }
+
+    fn release_checkpoint(&mut self) {
+        unreachable!("the benchmark transfers no state")
+    }
+
+    fn stage_chunk(&mut self, _op_number: OpNumber, _index: usize, _chunk: ()) {
+        unreachable!("the benchmark transfers no state")
+    }
+
+    fn restore(&mut self, _op_number: OpNumber) {
+        unreachable!("the benchmark transfers no state")
     }
 }
 
@@ -68,10 +100,11 @@ fn run(in_flight: usize, total: usize, idle: bool) -> Cost {
     for _ in 0..REPLICAS {
         config.add_replica();
     }
+    config.set_clients_max(in_flight);
     let mut replicas: Vec<Replica<Sum>> = (0..REPLICAS)
         .map(|id| Replica::new(id, config.clone(), Sum(0)))
         .collect();
-    let mut clients: Vec<Client<u64>> = (0..in_flight)
+    let mut clients: Vec<Client<u64, ()>> = (0..in_flight)
         .map(|id| Client::new(id, config.clone()))
         .collect();
     let mut queues: Vec<VecDeque<MessageFor<Sum>>> =
@@ -123,13 +156,13 @@ fn run(in_flight: usize, total: usize, idle: bool) -> Cost {
                 queues[to].push_back(message);
             }
             for reply in replies {
-                let client = &mut clients[reply.client_id];
-                if client.on_reply(reply.request_number, reply.view_number) {
+                let client = &mut clients[reply.client_id()];
+                if let Some(Completion::Executed(..)) = client.on_reply(reply) {
                     done += 1;
                     client.on_request(1);
-                    for (to, message) in client.drain() {
-                        queues[to].push_back(message);
-                    }
+                }
+                for (to, message) in client.drain() {
+                    queues[to].push_back(message);
                 }
             }
         }

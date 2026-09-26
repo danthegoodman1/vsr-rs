@@ -12,8 +12,9 @@
 //! bar
 //! ```
 //!
-//! Reads and writes both go through the replicated log, so a GET is
-//! linearizable.
+//! A SET goes through the replicated log. A GET is a query: the primary
+//! answers it from its state once a quorum has confirmed its view, so it
+//! is linearizable without a log entry or an fsync.
 //!
 //! Each node keeps two things on disk. The replica's log and counters go to
 //! a write-ahead log through the `writeahead` crate, whose writer thread
@@ -39,9 +40,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
-use vsr_rs::{
-    Checkpoint, ClientRecord, LogBase, LogSegment, Message, RecoveryState, ReplicaID, Reply,
-};
+use vsr_rs::{LogBase, LogSegment, Message, RecoveryState, ReplicaID, Reply};
 
 mod journal;
 mod node;
@@ -54,18 +53,13 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // ---------------------------------------------------------------------------
 // Wire encoding between nodes: one message per line, whitespace separated.
 
-fn encode_checkpoint(checkpoint: &KvCheckpoint) -> String {
-    let mut out = format!("{} {}", checkpoint.op_number, checkpoint.client_table.len());
-    for record in &checkpoint.client_table {
-        out.push_str(&format!(
-            " {} {} {}",
-            record.client_id,
-            record.request_number,
-            encode_result(&record.reply)
-        ));
+fn encode_chunk(chunk: &StoreChunk) -> String {
+    let mut out = chunk.clients.len().to_string();
+    for record in &chunk.clients {
+        out.push_str(&format!(" {} {}", record.client_id, encode_client(record)));
     }
-    out.push_str(&format!(" {}", checkpoint.state.pairs.len()));
-    for (key, value) in &checkpoint.state.pairs {
+    out.push_str(&format!(" {}", chunk.pairs.len()));
+    for (key, value) in &chunk.pairs {
         out.push_str(&format!(" {key} {value}"));
     }
     out
@@ -74,7 +68,7 @@ fn encode_checkpoint(checkpoint: &KvCheckpoint) -> String {
 fn encode_segment(segment: &KvSegment) -> String {
     let base = match &segment.base {
         LogBase::Op(op_number) => format!("- {op_number}"),
-        LogBase::Checkpoint(checkpoint) => format!("+ {}", encode_checkpoint(checkpoint)),
+        LogBase::Checkpoint(op_number) => format!("+ {op_number}"),
     };
     format!("{base} {}", encode_entries(&segment.entries))
 }
@@ -82,21 +76,38 @@ fn encode_segment(segment: &KvSegment) -> String {
 fn encode(frame: &Frame) -> String {
     match frame {
         Frame::Message(message) => match message {
+            Message::Register { client_id } => format!("REGISTER {client_id}"),
             Message::Request {
                 client_id,
+                session,
                 request_number,
+                answered,
                 op,
-            } => format!("REQUEST {client_id} {request_number} {}", encode_op(op)),
+            } => format!(
+                "REQUEST {client_id} {session} {request_number} {answered} {}",
+                encode_op(op)
+            ),
+            Message::Query {
+                client_id,
+                query_number,
+                query,
+            } => format!("QUERY {client_id} {query_number} {query}"),
+            Message::ConfirmView { view_number, round } => {
+                format!("CONFIRMVIEW {view_number} {round}")
+            }
+            Message::ConfirmViewOk {
+                view_number,
+                round,
+                replica_id,
+            } => format!("CONFIRMVIEWOK {view_number} {round} {replica_id}"),
             Message::Prepare {
                 view_number,
                 op_number,
-                client_id,
-                request_number,
-                op,
+                entry,
                 commit_number,
             } => format!(
-                "PREPARE {view_number} {op_number} {commit_number} {client_id} {request_number} {}",
-                encode_op(op)
+                "PREPARE {view_number} {op_number} {commit_number} {}",
+                encode_entry(entry)
             ),
             Message::PrepareOk {
                 view_number,
@@ -113,12 +124,29 @@ fn encode(frame: &Frame) -> String {
                 op_number,
             } => format!("GETSTATE {replica_id} {view_number} {op_number}"),
             Message::NewState {
+                replica_id,
                 view_number,
                 segment,
                 commit_number,
             } => format!(
-                "NEWSTATE {view_number} {commit_number} {}",
+                "NEWSTATE {replica_id} {view_number} {commit_number} {}",
                 encode_segment(segment)
+            ),
+            Message::GetChunk {
+                replica_id,
+                op_number,
+                index,
+            } => format!("GETCHUNK {replica_id} {op_number} {index}"),
+            Message::NewChunk {
+                replica_id,
+                op_number,
+                index,
+                chunk,
+                last,
+            } => format!(
+                "NEWCHUNK {replica_id} {op_number} {index} {} {}",
+                u8::from(*last),
+                encode_chunk(chunk)
             ),
             Message::StartViewChange {
                 view_number,
@@ -161,44 +189,68 @@ fn encode(frame: &Frame) -> String {
                 None => format!("RECOVERYRESPONSE {view_number} {nonce} {replica_id} -"),
             },
         },
-        Frame::Reply(reply) => format!(
-            "REPLY {} {} {} {}",
-            reply.view_number,
-            reply.client_id,
-            reply.request_number,
-            encode_result(&reply.result)
-        ),
+        Frame::Reply(reply) => match reply {
+            Reply::Registered {
+                view_number,
+                client_id,
+                session,
+            } => format!("REGISTERED {view_number} {client_id} {session}"),
+            Reply::Executed {
+                view_number,
+                client_id,
+                session,
+                request_number,
+                result,
+            } => format!(
+                "EXECUTED {view_number} {client_id} {session} {request_number} {}",
+                encode_result(result)
+            ),
+            Reply::Evicted {
+                view_number,
+                client_id,
+                session,
+            } => format!("EVICTED {view_number} {client_id} {session}"),
+            Reply::Queried {
+                view_number,
+                client_id,
+                query_number,
+                result,
+            } => format!(
+                "QUERIED {view_number} {client_id} {query_number} {}",
+                encode_result(result)
+            ),
+        },
     }
 }
 
 impl<'a> Tokens<'a> {
-    fn checkpoint(&mut self) -> Result<KvCheckpoint, String> {
-        let op_number = self.num()?;
+    fn chunk(&mut self) -> Result<StoreChunk, String> {
         let count = self.num()?;
-        let mut client_table = Vec::with_capacity(count);
+        let mut clients = Vec::with_capacity(count.min(RESERVED_MAX));
         for _ in 0..count {
-            client_table.push(ClientRecord {
-                client_id: self.num()?,
-                request_number: self.num()?,
-                reply: self.result()?,
-            });
+            let client_id = self.num()?;
+            clients.push(self.client(client_id)?);
         }
         let count = self.num()?;
-        let mut pairs = Vec::with_capacity(count);
+        let mut pairs = Vec::with_capacity(count.min(RESERVED_MAX));
         for _ in 0..count {
             pairs.push((self.word()?.to_string(), self.word()?.to_string()));
         }
-        Ok(Checkpoint {
-            op_number,
-            state: StoreSnapshot { pairs },
-            client_table,
-        })
+        Ok(StoreChunk { pairs, clients })
+    }
+
+    fn flag(&mut self) -> Result<bool, String> {
+        match self.word()? {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            word => Err(format!("bad flag {word:?}")),
+        }
     }
 
     fn segment(&mut self) -> Result<KvSegment, String> {
         let base = match self.word()? {
             "-" => LogBase::Op(self.num()?),
-            "+" => LogBase::Checkpoint(self.checkpoint()?),
+            "+" => LogBase::Checkpoint(self.num()?),
             word => return Err(format!("bad segment base {word:?}")),
         };
         let entries = self.entries()?;
@@ -209,18 +261,35 @@ impl<'a> Tokens<'a> {
 fn decode(line: &str) -> Result<Frame, String> {
     let mut t = Tokens::new(line);
     let message = match t.word()? {
+        "REGISTER" => Message::Register {
+            client_id: t.num()?,
+        },
         "REQUEST" => Message::Request {
             client_id: t.num()?,
+            session: t.num()?,
             request_number: t.num()?,
+            answered: t.num()?,
             op: t.op()?,
+        },
+        "QUERY" => Message::Query {
+            client_id: t.num()?,
+            query_number: t.num()?,
+            query: t.word()?.to_string(),
+        },
+        "CONFIRMVIEW" => Message::ConfirmView {
+            view_number: t.num()?,
+            round: t.word()?.parse().map_err(|_| "bad round".to_string())?,
+        },
+        "CONFIRMVIEWOK" => Message::ConfirmViewOk {
+            view_number: t.num()?,
+            round: t.word()?.parse().map_err(|_| "bad round".to_string())?,
+            replica_id: t.num()?,
         },
         "PREPARE" => Message::Prepare {
             view_number: t.num()?,
             op_number: t.num()?,
             commit_number: t.num()?,
-            client_id: t.num()?,
-            request_number: t.num()?,
-            op: t.op()?,
+            entry: t.entry()?,
         },
         "PREPAREOK" => Message::PrepareOk {
             view_number: t.num()?,
@@ -237,9 +306,22 @@ fn decode(line: &str) -> Result<Frame, String> {
             op_number: t.num()?,
         },
         "NEWSTATE" => Message::NewState {
+            replica_id: t.num()?,
             view_number: t.num()?,
             commit_number: t.num()?,
             segment: t.segment()?,
+        },
+        "GETCHUNK" => Message::GetChunk {
+            replica_id: t.num()?,
+            op_number: t.num()?,
+            index: t.num()?,
+        },
+        "NEWCHUNK" => Message::NewChunk {
+            replica_id: t.num()?,
+            op_number: t.num()?,
+            index: t.num()?,
+            last: t.flag()?,
+            chunk: t.chunk()?,
         },
         "STARTVIEWCHANGE" => Message::StartViewChange {
             view_number: t.num()?,
@@ -280,17 +362,36 @@ fn decode(line: &str) -> Result<Frame, String> {
                 state,
             }
         }
-        "REPLY" => {
-            let view_number = t.num()?;
-            let client_id = t.num()?;
-            let request_number = t.num()?;
-            let result = t.result()?;
-            return Ok(Frame::Reply(Reply {
-                view_number,
-                client_id,
-                request_number,
-                result,
-            }));
+        "REGISTERED" => {
+            return Ok(Frame::Reply(Reply::Registered {
+                view_number: t.num()?,
+                client_id: t.num()?,
+                session: t.num()?,
+            }))
+        }
+        "EXECUTED" => {
+            return Ok(Frame::Reply(Reply::Executed {
+                view_number: t.num()?,
+                client_id: t.num()?,
+                session: t.num()?,
+                request_number: t.num()?,
+                result: t.result()?,
+            }))
+        }
+        "EVICTED" => {
+            return Ok(Frame::Reply(Reply::Evicted {
+                view_number: t.num()?,
+                client_id: t.num()?,
+                session: t.num()?,
+            }))
+        }
+        "QUERIED" => {
+            return Ok(Frame::Reply(Reply::Queried {
+                view_number: t.num()?,
+                client_id: t.num()?,
+                query_number: t.num()?,
+                result: t.result()?,
+            }))
         }
         kind => return Err(format!("unknown message {kind:?}")),
     };
@@ -483,74 +584,88 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
     }
 }
 
-/// Serves one client connection: one command at a time, each answered once
-/// the replicated store has executed it. However the connection ends, the
-/// event loop is told it is gone.
+/// Commands a connection has read and not yet answered before it stops
+/// reading more.
+const CONNECTION_PIPELINE: usize = 1024;
+
+/// Serves one client connection. Commands are read as they arrive and
+/// answered in order, each once the replicated store has executed it; the
+/// event loop answers a connection's commands in the order they came. When
+/// the client stops sending, what it sent is answered first. However the
+/// connection ends, the event loop is told it is gone.
 fn run_client_connection(
     stream: TcpStream,
     connection: u64,
     events: Sender<Event>,
 ) -> std::io::Result<()> {
-    let (respond_tx, respond_rx) = channel::<String>();
     no_delay(&stream);
-    let mut writer = stream.try_clone()?;
+    let writer = stream.try_clone()?;
+    let (respond, answers) = channel::<String>();
+    // For each line, in order: the event loop's next answer, or one
+    // answered here.
+    let (script, steps) = sync_channel::<Option<String>>(CONNECTION_PIPELINE);
+    let writing = thread::spawn(move || write_responses(writer, steps, answers));
     let reader = BufReader::new(stream);
-    // A read or write error breaks out of the loop rather than returning, or
-    // it would carry us past the Event::Disconnect below and the event loop
+    // A read error breaks out of the loop rather than returning, or it
+    // would carry us past the Event::Disconnect below and the event loop
     // would keep this connection's client for the life of the process.
     let mut outcome = Ok(());
     for line in read_lines(reader) {
-        let step = line.and_then(|line| {
-            run_client_command(
-                &line,
-                &mut writer,
-                connection,
-                &events,
-                &respond_tx,
-                &respond_rx,
-            )
-        });
-        match step {
-            Ok(true) => continue,
-            Ok(false) => break,
+        let line = match line {
+            Ok(line) => line,
             Err(err) => {
                 outcome = Err(err);
                 break;
             }
+        };
+        let step = match parse_command(&line) {
+            Ok(None) => continue,
+            Ok(Some(command)) => {
+                let command = Event::Command {
+                    connection,
+                    command,
+                    respond: respond.clone(),
+                };
+                if script.send(None).is_err() {
+                    break;
+                }
+                let _ = events.send(command);
+                continue;
+            }
+            Err(canned) => Some(format!("{canned}\r\n")),
+        };
+        if script.send(step).is_err() {
+            break;
         }
+    }
+    drop((script, respond));
+    if outcome.is_ok() {
+        let _ = writing.join();
     }
     let _ = events.send(Event::Disconnect(connection));
     outcome
 }
 
-/// Runs one command from a client connection. Returns false once the
-/// connection should be closed.
-fn run_client_command(
-    line: &str,
-    writer: &mut TcpStream,
-    connection: u64,
-    events: &Sender<Event>,
-    respond_tx: &Sender<String>,
-    respond_rx: &Receiver<String>,
-) -> std::io::Result<bool> {
-    let command = match parse_command(line) {
-        Ok(None) => return Ok(true),
-        Ok(Some(command)) => command,
-        Err(response) => {
-            writer.write_all(format!("{response}\r\n").as_bytes())?;
-            return Ok(true);
+/// Writes the responses in the order of `steps`. Ends when the connection
+/// stops reading or writing, or the event loop drops a command it never
+/// answers.
+fn write_responses(
+    mut writer: TcpStream,
+    steps: Receiver<Option<String>>,
+    answers: Receiver<String>,
+) {
+    for step in steps {
+        let response = match step {
+            Some(response) => response,
+            None => match answers.recv() {
+                Ok(answer) => answer,
+                Err(_) => return,
+            },
+        };
+        if writer.write_all(response.as_bytes()).is_err() {
+            return;
         }
-    };
-    let _ = events.send(Event::Command {
-        connection,
-        command,
-        respond: respond_tx.clone(),
-    });
-    let Ok(response) = respond_rx.recv() else {
-        return Ok(false);
-    };
-    writer.write_all(response.as_bytes())?;
-    Ok(true)
+    }
 }
 
 fn run_client_acceptor(
@@ -684,9 +799,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::net::Shutdown;
     use std::sync::mpsc::RecvTimeoutError;
-    use vsr_rs::{Client, Config, LogEntry, OpNumber, Status};
+    use vsr_rs::{
+        Client, ClientRecord, Config, LogEntry, OpNumber, QueryNumber, StateMachine, Status,
+    };
 
     /// A fresh directory for one node of one test.
     fn temp_dir(test: &str, id: ReplicaID) -> PathBuf {
@@ -713,9 +831,10 @@ mod tests {
             .collect()
     }
 
-    /// A command from a client of the primary's own node goes into the log
-    /// in the batch that took it: the step appends it, writes it, and sends
-    /// its `Prepare`s, and sends the node itself nothing.
+    /// A client of the primary's own node sends to the replica in the batch
+    /// that took its command: the step appends the client's registration,
+    /// writes it, and sends its `Prepare`s, and sends the node itself
+    /// nothing.
     #[test]
     fn own_client_request_joins_the_batch() {
         let dir = temp_dir("own-client", 0);
@@ -781,23 +900,128 @@ mod tests {
             respond,
         };
         assert!(node.batch([command], &frames, &wake));
-        let request_number = node.connections[&connection].pending.as_ref().unwrap().0;
-        let reply = Event::Reply(Reply {
+        let client_id = connection as vsr_rs::ClientID;
+        let registered = Event::Reply(Reply::Registered {
             view_number: 0,
-            client_id: connection as vsr_rs::ClientID,
-            request_number,
+            client_id,
+            session: 1,
+        });
+        assert!(node.batch([registered], &frames, &wake));
+        let executed = Event::Reply(Reply::Executed {
+            view_number: 0,
+            client_id,
+            session: 1,
+            request_number: 1,
             result: None,
         });
-        node.batch([reply, Event::Stop], &frames, &wake);
+        node.batch([executed, Event::Stop], &frames, &wake);
         assert_eq!("+OK\r\n", responses.try_recv().unwrap());
         drop(node);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A connection's answers leave in the order its commands came, even
+    /// when a later command's reply arrives first.
+    #[test]
+    fn answers_leave_in_the_order_commands_came() {
+        let dir = temp_dir("answer-order", 1);
+        let mut node = Node::open(1, config(3), &dir, Start::Init).unwrap();
+        let (wake, _woken) = channel();
+        let (frames, _frames_rx) = channel();
+        let (respond, responses) = channel();
+        let connection = client_id(1, node.incarnation, 0);
+        let command = |command| Event::Command {
+            connection,
+            command,
+            respond: respond.clone(),
+        };
+        let commands = [
+            command(Command::Get("a".into())),
+            command(Command::Get("b".into())),
+        ];
+        assert!(node.batch(commands, &frames, &wake));
+        let client_id = connection as vsr_rs::ClientID;
+        let queried = |query_number, result: &str| {
+            Event::Reply(Reply::Queried {
+                view_number: 0,
+                client_id,
+                query_number,
+                result: Some(result.into()),
+            })
+        };
+        assert!(node.batch([queried(2, "y")], &frames, &wake));
+        assert!(responses.try_recv().is_err());
+        assert!(node.batch([queried(1, "x")], &frames, &wake));
+        let answers: Vec<String> = responses.try_iter().collect();
+        assert_eq!(vec!["$1\r\nx\r\n", "$1\r\ny\r\n"], answers);
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An eviction fails the commands of a connection that have no answer
+    /// yet, and keeps the answers held for later ones.
+    #[test]
+    fn eviction_keeps_answers_already_held() {
+        let dir = temp_dir("evicted-held", 1);
+        let mut node = Node::open(1, config(3), &dir, Start::Init).unwrap();
+        let (wake, _woken) = channel();
+        let (frames, _frames_rx) = channel();
+        let (respond, responses) = channel();
+        let connection = client_id(1, node.incarnation, 0);
+        let client_id = connection as vsr_rs::ClientID;
+        let command = |command| Event::Command {
+            connection,
+            command,
+            respond: respond.clone(),
+        };
+        let reply = |reply| Event::Reply(reply);
+        let set = command(Command::Set("a".into(), "x".into()));
+        assert!(node.batch([set], &frames, &wake));
+        let registered = Reply::Registered {
+            view_number: 0,
+            client_id,
+            session: 1,
+        };
+        let executed = Reply::Executed {
+            view_number: 0,
+            client_id,
+            session: 1,
+            request_number: 1,
+            result: None,
+        };
+        assert!(node.batch([reply(registered), reply(executed)], &frames, &wake));
+        assert_eq!(Ok("+OK\r\n".to_string()), responses.try_recv());
+        let gets = [
+            command(Command::Get("a".into())),
+            command(Command::Get("b".into())),
+        ];
+        assert!(node.batch(gets, &frames, &wake));
+        let queried = Reply::Queried {
+            view_number: 0,
+            client_id,
+            query_number: 2,
+            result: Some("y".into()),
+        };
+        let evicted = Reply::Evicted {
+            view_number: 0,
+            client_id,
+            session: 1,
+        };
+        assert!(node.batch([reply(queried), reply(evicted)], &frames, &wake));
+        let answers: Vec<String> = responses.try_iter().collect();
+        assert_eq!(
+            vec![EVICTED.to_string(), "$1\r\ny\r\n".to_string()],
+            answers
+        );
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The event loop's step sends a write that needs a sync to the journal
-    /// and steps on while it is out: the next request's `Prepare` leaves at
+    /// and steps on while it is out: the next entry's `Prepare` leaves at
     /// once, and the replies and the next write wait until the event loop
-    /// hears that the write landed.
+    /// hears that the write landed. A client's registration answered in a
+    /// step sends its request in that step.
     #[test]
     fn deliver_steps_on_while_a_write_is_out() {
         let dir = temp_dir("pipelined", 0);
@@ -814,33 +1038,48 @@ mod tests {
             assert!(node.batch([command], &frames, &wake));
             responses
         };
+        let prepared = |frames_rx: &Receiver<Addressed>| -> Vec<OpNumber> {
+            frames_rx
+                .try_iter()
+                .filter_map(|(_, frame)| match frame {
+                    Frame::Message(Message::Prepare { op_number, .. }) => Some(op_number),
+                    _ => None,
+                })
+                .collect()
+        };
+        let ack = |op_number| {
+            Event::Message(Message::PrepareOk {
+                view_number: 0,
+                op_number,
+                replica_id: 1,
+            })
+        };
+        // The two clients' registrations are ops 1 and 2.
         let first_responses = request(&mut node, 0, "a");
         assert_eq!(Some((1, 1)), out(&node));
         let second_responses = request(&mut node, 1, "b");
         assert_eq!(Some((1, 1)), out(&node));
-        let prepared: Vec<OpNumber> = frames_rx
-            .try_iter()
-            .filter_map(|(_, frame)| match frame {
-                Frame::Message(Message::Prepare { op_number, .. }) => Some(op_number),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(vec![1, 1, 2, 2], prepared);
+        assert_eq!(vec![1, 1, 2, 2], prepared(&frames_rx));
         // A backup's acknowledgement of both ops is no quorum while the
         // primary's own write is out.
-        let ack = Event::Message(Message::PrepareOk {
-            view_number: 0,
-            op_number: 2,
-            replica_id: 1,
-        });
-        assert!(node.batch([ack], &frames, &wake));
+        assert!(node.batch([ack(2)], &frames, &wake));
         assert_eq!(0, node.replica.commit_number());
-        assert!(first_responses.try_recv().is_err());
+        // The first registration commits, and its client's request goes
+        // out as op 3 in the same step, behind the write of op 2 it takes.
         assert!(land(&mut node, &woken, &frames, &wake));
         assert_eq!(1, node.replica.commit_number());
+        assert_eq!(vec![3, 3], prepared(&frames_rx));
+        assert_eq!(Some((2, 2)), out(&node));
+        assert!(node.batch([ack(3)], &frames, &wake));
+        assert!(land(&mut node, &woken, &frames, &wake));
+        assert_eq!(2, node.replica.commit_number());
+        assert_eq!(Some((3, 3)), out(&node));
+        assert!(first_responses.try_recv().is_err());
+        assert!(land(&mut node, &woken, &frames, &wake));
+        assert_eq!(3, node.replica.commit_number());
         assert_eq!(Ok("+OK\r\n".to_string()), first_responses.try_recv());
         assert!(second_responses.try_recv().is_err());
-        assert_eq!(Some((2, 2)), out(&node));
+        assert_eq!(Some((4, 4)), out(&node));
         drop(node);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -918,8 +1157,16 @@ mod tests {
 
     impl Pipelined {
         fn new(test: &str) -> Pipelined {
+            Pipelined::with_config(test, config(3))
+        }
+
+        fn with_config(test: &str, config: Config) -> Pipelined {
             let dirs: Vec<PathBuf> = (0..3).map(|id| temp_dir(test, id)).collect();
-            let mut nodes = open_nodes(&dirs);
+            let mut nodes: Vec<Node> = dirs
+                .iter()
+                .enumerate()
+                .map(|(id, dir)| Node::open(id, config.clone(), dir, Start::Init).unwrap())
+                .collect();
             for node in &mut nodes {
                 node.announce_views = false;
             }
@@ -940,9 +1187,15 @@ mod tests {
         /// A new client of node 0 sets `key`. Returns where its response
         /// comes.
         fn set(&mut self, key: &str) -> Receiver<String> {
-            let (respond, responses) = channel();
-            let connection = client_id(0, self.nodes[0].incarnation, self.connections);
+            let connection = self.connections;
             self.connections += 1;
+            self.set_on(connection, key)
+        }
+
+        /// The client of node 0's connection `connection` sets `key`.
+        fn set_on(&mut self, connection: u64, key: &str) -> Receiver<String> {
+            let (respond, responses) = channel();
+            let connection = client_id(0, self.nodes[0].incarnation, connection);
             let command = Command::Set(key.into(), "1".into());
             self.batch(
                 0,
@@ -1012,11 +1265,12 @@ mod tests {
         let b = cluster.set("b");
         cluster.settle(&[0, 1]);
         assert_eq!(Ok("+OK\r\n".to_string()), b.try_recv());
-        assert_eq!(Some((2, 2)), out(&cluster.nodes[2]));
+        // Its registration, op 3, is the write node 2 has out.
+        assert_eq!(Some((3, 3)), out(&cluster.nodes[2]));
         let landed = cluster.wakes[2].1.recv_timeout(Duration::from_secs(10));
         assert!(matches!(landed, Ok(Event::Written)));
         cluster.lose_power(2);
-        assert_eq!(2, cluster.nodes[2].replica.op_number());
+        assert_eq!(3, cluster.nodes[2].replica.op_number());
         let c = cluster.set("c");
         for _ in 0..3 {
             cluster.tick();
@@ -1024,8 +1278,35 @@ mod tests {
         }
         assert_eq!(Ok("+OK\r\n".to_string()), c.try_recv());
         let node = &cluster.nodes[2];
-        assert_eq!(3, node.replica.commit_number());
+        assert_eq!(6, node.replica.commit_number());
         assert_eq!(Some("1".to_string()), node.replica.state_machine().get("b"));
+        remove_dirs(cluster.nodes, &cluster.dirs);
+    }
+
+    /// With room for one session, a second connection's registration
+    /// evicts the first. The first connection's next command fails, as it
+    /// may or may not have run, and the one after it runs in a new session.
+    #[test]
+    fn evicted_connection_fails_its_command_and_registers_again() {
+        let mut config = config(3);
+        config.set_clients_max(1);
+        let mut cluster = Pipelined::with_config("evicted", config);
+        let all = [0, 1, 2];
+        let a = cluster.set_on(0, "a");
+        cluster.settle(&all);
+        assert_eq!(Ok("+OK\r\n".to_string()), a.try_recv());
+        let b = cluster.set_on(1, "b");
+        cluster.settle(&all);
+        assert_eq!(Ok("+OK\r\n".to_string()), b.try_recv());
+        let c = cluster.set_on(0, "c");
+        cluster.settle(&all);
+        assert_eq!(Ok(EVICTED.to_string()), c.try_recv());
+        let d = cluster.set_on(0, "d");
+        cluster.settle(&all);
+        assert_eq!(Ok("+OK\r\n".to_string()), d.try_recv());
+        let store = cluster.nodes[0].replica.state_machine();
+        assert_eq!(None, store.get("c"));
+        assert_eq!(Some("1".to_string()), store.get("d"));
         remove_dirs(cluster.nodes, &cluster.dirs);
     }
 
@@ -1076,14 +1357,18 @@ mod tests {
             .collect();
         drop(nodes);
         let node = Node::open(0, config(3), &dirs[0], Start::Restart).unwrap();
-        assert_eq!(1, node.replica.op_number());
+        assert_eq!(2, node.replica.op_number());
         remove_dirs(vec![node], &dirs);
     }
 
     /// Persists every node, then moves what the nodes and the client want
     /// sent through the wire encoding to their destination, until nothing
     /// is left. Messages to `down` nodes are dropped. Returns the replies.
-    fn deliver(nodes: &mut [Node], client: &mut Client<Op>, down: &[ReplicaID]) -> Vec<KvReply> {
+    fn deliver(
+        nodes: &mut [Node],
+        client: &mut Client<Op, String>,
+        down: &[ReplicaID],
+    ) -> Vec<KvReply> {
         let mut replies = Vec::new();
         loop {
             let mut frames: Vec<(ReplicaID, String)> = Vec::new();
@@ -1092,7 +1377,7 @@ mod tests {
                 let send = |dst, message| frames.push((dst, encode(&Frame::Message(message))));
                 node.step(send, &mut node_replies).unwrap();
                 for reply in node_replies {
-                    client.on_reply(reply.request_number, reply.view_number);
+                    client.on_reply(reply.clone());
                     replies.push(reply);
                 }
             }
@@ -1133,17 +1418,47 @@ mod tests {
     /// Runs `op` through the cluster and returns its result.
     fn run(
         nodes: &mut [Node],
-        client: &mut Client<Op>,
+        client: &mut Client<Op, String>,
         op: Op,
         down: &[ReplicaID],
     ) -> Option<String> {
         let request_number = client.on_request(op);
         let replies = deliver(nodes, client, down);
-        let reply = replies
-            .iter()
-            .find(|reply| reply.request_number == request_number)
-            .expect("a reply");
-        reply.result.clone()
+        replies
+            .into_iter()
+            .find_map(|reply| match reply {
+                Reply::Executed {
+                    request_number: n,
+                    result,
+                    ..
+                } if n == request_number => Some(result),
+                _ => None,
+            })
+            .expect("a reply")
+    }
+
+    /// Reads `key` through the cluster and returns its value.
+    fn read(
+        nodes: &mut [Node],
+        client: &mut Client<Op, String>,
+        key: &str,
+        down: &[ReplicaID],
+    ) -> Option<String> {
+        let query_number = client.on_query(key.to_string());
+        let replies = deliver(nodes, client, down);
+        queried(replies, query_number).expect("a reply")
+    }
+
+    /// The result of the query numbered `query_number` among `replies`.
+    fn queried(replies: Vec<KvReply>, query_number: QueryNumber) -> Option<Option<String>> {
+        replies.into_iter().find_map(|reply| match reply {
+            Reply::Queried {
+                query_number: n,
+                result,
+                ..
+            } if n == query_number => Some(result),
+            _ => None,
+        })
     }
 
     /// Three nodes execute a few commands. One of them shuts down and comes
@@ -1172,17 +1487,13 @@ mod tests {
                 &[]
             )
         );
-        assert_eq!(
-            Some("1".into()),
-            run(&mut nodes, &mut client, Op::Get("a".into()), &[])
-        );
+        assert_eq!(Some("1".into()), read(&mut nodes, &mut client, "a", &[]));
         idle(&mut nodes, &[]);
         deliver(&mut nodes, &mut client, &[]);
         for node in &nodes {
             assert_eq!(3, node.replica.commit_number());
         }
-        // Node 1 persists its store after the first two ops, then executes
-        // the third, so on restart the store is one op behind the journal.
+        // Node 1 persists its store, which has executed every op.
         nodes[1].flush_store().unwrap();
         assert_eq!(3, nodes[1].replica.state_machine().applied);
         let before = nodes[1].replica.persistent_state();
@@ -1254,11 +1565,11 @@ mod tests {
             );
         }
         nodes[0].flush_store().unwrap();
-        assert_eq!(5, nodes[0].replica.log_start());
+        assert_eq!(6, nodes[0].replica.log_start());
         assert_eq!(0, nodes[2].replica.op_number());
 
-        // With node 1 cut off, node 2 hears about op 6, finds the gap, and
-        // gets a checkpoint: the primary's state as executed, and op 6
+        // With node 1 cut off, node 2 hears about op 7, finds the gap, and
+        // gets a checkpoint: the primary's state as executed, and op 7
         // after it, which node 2's acknowledgement then commits.
         run(
             &mut nodes,
@@ -1268,9 +1579,9 @@ mod tests {
         );
         idle(&mut nodes, &[]);
         deliver(&mut nodes, &mut client, &[]);
-        assert_eq!(5, nodes[2].replica.log_start());
-        assert_eq!(6, nodes[2].replica.commit_number());
-        assert_eq!(6, nodes[2].replica.state_machine().applied);
+        assert_eq!(6, nodes[2].replica.log_start());
+        assert_eq!(7, nodes[2].replica.commit_number());
+        assert_eq!(7, nodes[2].replica.state_machine().applied);
         for i in 0..6 {
             assert_eq!(
                 Some(format!("v{i}")),
@@ -1279,14 +1590,14 @@ mod tests {
         }
         assert_eq!(
             nodes[0].replica.client_table(),
-            nodes[2].replica.state_machine().client_table().unwrap()
+            nodes[2].replica.state_machine().client_table()
         );
 
         // Node 2 loses power. Its store goes back to the checkpoint, which
-        // it made durable as it restored it, and its journal holds op 6,
-        // which it executes again once it hears that op 6 committed.
+        // it made durable as it restored it, and its journal holds op 7,
+        // which it executes again once it hears that op 7 committed.
         reopen(&mut nodes, &dirs, 2, true);
-        assert_eq!(5, nodes[2].replica.state_machine().applied);
+        assert_eq!(6, nodes[2].replica.state_machine().applied);
         assert_eq!(
             Some("v3".to_string()),
             nodes[2].replica.state_machine().get("k3")
@@ -1299,8 +1610,8 @@ mod tests {
         );
         idle(&mut nodes, &[]);
         deliver(&mut nodes, &mut client, &[]);
-        assert_eq!(7, nodes[2].replica.commit_number());
-        assert_eq!(7, nodes[2].replica.state_machine().applied);
+        assert_eq!(8, nodes[2].replica.commit_number());
+        assert_eq!(8, nodes[2].replica.state_machine().applied);
         assert_eq!(
             Some("v5".to_string()),
             nodes[2].replica.state_machine().get("k5")
@@ -1308,28 +1619,88 @@ mod tests {
         remove_dirs(nodes, &dirs);
     }
 
-    /// Runs `op` through the cluster, with the client re-sending to every
-    /// node until a reply comes, and returns the result: after a view
-    /// change the client's first try goes to the old primary.
-    fn run_resending(
+    /// A node far behind rejoins from a checkpoint of ten chunks, which it
+    /// fetches over the wire a chunk at a time; then another node loses its
+    /// disk and recovers from the same checkpoint.
+    #[test]
+    fn rejoin_from_a_checkpoint_of_several_chunks() {
+        let dirs: Vec<PathBuf> = (0..3).map(|id| temp_dir("chunked", id)).collect();
+        let mut nodes = open_nodes(&dirs);
+        for node in &mut nodes {
+            node.log_retention = 0;
+        }
+        let mut client = Client::new(1, config(3));
+        let value = "v".repeat(CHUNK_BYTES / 4);
+        let keys = 40;
+        for i in 0..keys {
+            run(
+                &mut nodes,
+                &mut client,
+                Op::Put(format!("k{i}"), value.clone()),
+                &[2],
+            );
+        }
+        nodes[0].flush_store().unwrap();
+        assert_eq!(keys + 1, nodes[0].replica.log_start());
+
+        run(
+            &mut nodes,
+            &mut client,
+            Op::Put("last".into(), "1".into()),
+            &[1],
+        );
+        idle(&mut nodes, &[]);
+        deliver(&mut nodes, &mut client, &[]);
+        assert_eq!(keys + 1, nodes[2].replica.log_start());
+        assert_eq!(keys + 2, nodes[2].replica.commit_number());
+        holds_every_key(&nodes[2], keys, &value);
+        assert_eq!(
+            nodes[0].replica.client_table(),
+            nodes[2].replica.state_machine().client_table()
+        );
+
+        drop(nodes.remove(1));
+        std::fs::remove_dir_all(&dirs[1]).unwrap();
+        let node = Node::open(1, config(3), &dirs[1], Start::Recover { view: 0 }).unwrap();
+        nodes.insert(1, node);
+        for _ in 0..3 {
+            idle(&mut nodes, &[]);
+            deliver(&mut nodes, &mut client, &[]);
+        }
+        assert!(!nodes[1].replica.is_recovering());
+        assert_eq!(keys + 1, nodes[1].replica.log_start());
+        holds_every_key(&nodes[1], keys, &value);
+        remove_dirs(nodes, &dirs);
+    }
+
+    /// Whether `node`'s store holds `value` under each of the first `keys`
+    /// keys.
+    fn holds_every_key(node: &Node, keys: usize, value: &String) {
+        for i in 0..keys {
+            let held = node.replica.state_machine().get(&format!("k{i}"));
+            assert_eq!(Some(value), held.as_ref(), "k{i}");
+        }
+    }
+
+    /// Reads `key` through the cluster, with the client re-sending to every
+    /// node until a reply comes, and returns the value: after a view change
+    /// the client's first try goes to the old primary.
+    fn read_resending(
         nodes: &mut [Node],
-        client: &mut Client<Op>,
-        op: Op,
+        client: &mut Client<Op, String>,
+        key: &str,
         down: &[ReplicaID],
     ) -> Option<String> {
-        let request_number = client.on_request(op);
+        let query_number = client.on_query(key.to_string());
         for _ in 0..20 {
             let replies = deliver(nodes, client, down);
-            if let Some(reply) = replies
-                .iter()
-                .find(|reply| reply.request_number == request_number)
-            {
-                return reply.result.clone();
+            if let Some(result) = queried(replies, query_number) {
+                return result;
             }
             idle(nodes, down);
             client.on_idle();
         }
-        panic!("no reply to request {request_number}");
+        panic!("no reply to query {query_number}");
     }
 
     /// Takes node `id` down and brings it back from its data directory,
@@ -1362,31 +1733,22 @@ mod tests {
             );
         }
         nodes[0].flush_store().unwrap();
-        assert_eq!(5, nodes[0].replica.log_start());
+        assert_eq!(6, nodes[0].replica.log_start());
 
-        // Node 2 learns it is behind and asks the primary, which answers
-        // with its checkpoint.
+        // Node 2 learns it is behind and fetches the primary's checkpoint,
+        // with none of its steps journaled.
         nodes[2].replica.on_message(Message::Commit {
             view_number: 0,
-            commit_number: 5,
+            commit_number: 6,
         });
-        let get_state: Vec<_> = nodes[2].replica.drain_messages_before_persist().collect();
-        for (dst, message) in get_state {
-            assert_eq!(0, dst);
-            nodes[0].replica.on_message(message);
-        }
-        let new_state: Vec<_> = nodes[0].replica.drain_messages_before_persist().collect();
-        for (dst, message) in new_state {
-            assert_eq!(2, dst);
-            nodes[2].replica.on_message(message);
-        }
-        assert_eq!(5, nodes[2].replica.state_machine().applied);
+        exchange_early_messages(&mut nodes, 2, 0);
+        assert_eq!(6, nodes[2].replica.state_machine().applied);
         reopen(&mut nodes, &dirs, 2, true);
-        assert_eq!(5, nodes[2].replica.log_start());
-        assert_eq!(5, nodes[2].replica.commit_number());
-        assert_eq!(5, nodes[2].replica.op_number());
+        assert_eq!(6, nodes[2].replica.log_start());
+        assert_eq!(6, nodes[2].replica.commit_number());
+        assert_eq!(6, nodes[2].replica.op_number());
         reopen(&mut nodes, &dirs, 2, true);
-        assert_eq!(5, nodes[2].replica.log_start());
+        assert_eq!(6, nodes[2].replica.log_start());
         for i in 0..5 {
             assert_eq!(
                 Some(format!("v{i}")),
@@ -1401,9 +1763,31 @@ mod tests {
         );
         idle(&mut nodes, &[1]);
         deliver(&mut nodes, &mut client, &[1]);
-        assert_eq!(6, nodes[2].replica.commit_number());
-        assert_eq!(6, nodes[2].replica.state_machine().applied);
+        assert_eq!(7, nodes[2].replica.commit_number());
+        assert_eq!(7, nodes[2].replica.state_machine().applied);
         remove_dirs(nodes, &dirs);
+    }
+
+    /// Delivers what nodes `a` and `b` send each other before their steps
+    /// are journaled, until neither sends more.
+    fn exchange_early_messages(nodes: &mut [Node], a: ReplicaID, b: ReplicaID) {
+        loop {
+            let mut quiet = true;
+            for (from, to) in [(a, b), (b, a)] {
+                let early: Vec<_> = nodes[from]
+                    .replica
+                    .drain_messages_before_persist()
+                    .collect();
+                for (dst, message) in early {
+                    assert_eq!(to, dst);
+                    nodes[to].replica.on_message(message);
+                    quiet = false;
+                }
+            }
+            if quiet {
+                return;
+            }
+        }
     }
 
     /// Restarts from the journal in each status it records: the primary
@@ -1428,7 +1812,7 @@ mod tests {
         assert_eq!(1, nodes[0].replica.view_number());
         assert_eq!(
             Some("1".to_string()),
-            run_resending(&mut nodes, &mut client, Op::Get("a".into()), &[])
+            read_resending(&mut nodes, &mut client, "a", &[])
         );
         assert_eq!(1, nodes[1].replica.view_number());
         assert!(nodes[1].replica.is_primary());
@@ -1446,7 +1830,7 @@ mod tests {
         assert_eq!(2, nodes[2].replica.view_number());
         assert_eq!(
             Some("1".to_string()),
-            run_resending(&mut nodes, &mut client, Op::Get("a".into()), &[])
+            read_resending(&mut nodes, &mut client, "a", &[])
         );
         assert!(nodes[2].replica.is_primary());
 
@@ -1461,7 +1845,7 @@ mod tests {
         assert_eq!(2, nodes[0].replica.view_number());
         assert_eq!(
             Some("1".to_string()),
-            run_resending(&mut nodes, &mut client, Op::Get("a".into()), &[])
+            read_resending(&mut nodes, &mut client, "a", &[])
         );
         idle(&mut nodes, &[]);
         deliver(&mut nodes, &mut client, &[]);
@@ -1509,48 +1893,104 @@ mod tests {
         for i in 0..15 {
             assert_eq!(
                 Some(format!("v{i}")),
-                run_resending(&mut nodes, &mut client, Op::Get(format!("k{i}")), &[])
+                read_resending(&mut nodes, &mut client, &format!("k{i}"), &[])
             );
         }
         remove_dirs(nodes, &dirs);
     }
 
-    /// The wire encoding round-trips the messages that carry checkpoints.
+    /// The wire encoding round-trips the messages that carry entries or
+    /// checkpoints, and the replies.
     #[test]
     fn codec_round_trip() {
-        let checkpoint = Checkpoint {
-            op_number: 7,
-            state: StoreSnapshot {
-                pairs: vec![("a".into(), "1".into()), ("b".into(), "2".into())],
-            },
-            client_table: vec![
+        let chunk = StoreChunk {
+            pairs: vec![("a".into(), "1".into()), ("b".into(), "2".into())],
+            clients: vec![
                 ClientRecord {
                     client_id: 3,
+                    session: 1,
                     request_number: 4,
-                    reply: Some("1".into()),
+                    replies: VecDeque::from([None, Some("1".into())]),
+                    op_number: 6,
                 },
                 ClientRecord {
                     client_id: 5,
+                    session: 2,
                     request_number: 0,
-                    reply: None,
+                    replies: VecDeque::new(),
+                    op_number: 2,
                 },
             ],
         };
-        let entries = vec![LogEntry {
-            client_id: 3,
-            request_number: 5,
-            op: Op::Get("a".into()),
-        }];
+        let entries = vec![
+            LogEntry::Register { client_id: 3 },
+            LogEntry::Request {
+                client_id: 3,
+                session: 1,
+                request_number: 5,
+                answered: 3,
+                op: Op::Put("a".into(), "1".into()),
+            },
+        ];
         let messages: Vec<KvMessage> = vec![
+            Message::Register { client_id: 3 },
+            Message::Request {
+                client_id: 3,
+                session: 1,
+                request_number: 5,
+                answered: 4,
+                op: Op::Put("a".into(), "2".into()),
+            },
+            Message::Prepare {
+                view_number: 2,
+                op_number: 8,
+                entry: entries[1].clone(),
+                commit_number: 7,
+            },
+            Message::Query {
+                client_id: 3,
+                query_number: 2,
+                query: "a".into(),
+            },
+            Message::ConfirmView {
+                view_number: 2,
+                round: 9,
+            },
+            Message::ConfirmViewOk {
+                view_number: 2,
+                round: 9,
+                replica_id: 1,
+            },
             Message::NewState {
+                replica_id: 0,
                 view_number: 2,
                 segment: LogSegment {
-                    base: LogBase::Checkpoint(checkpoint.clone()),
+                    base: LogBase::Checkpoint(7),
                     entries: entries.clone(),
                 },
                 commit_number: 7,
             },
+            Message::GetChunk {
+                replica_id: 2,
+                op_number: 7,
+                index: 1,
+            },
+            Message::NewChunk {
+                replica_id: 0,
+                op_number: 7,
+                index: 1,
+                chunk,
+                last: true,
+            },
+            Message::NewChunk {
+                replica_id: 0,
+                op_number: 7,
+                index: 0,
+                chunk: StoreChunk::default(),
+                last: false,
+            },
             Message::NewState {
+                replica_id: 0,
                 view_number: 2,
                 segment: LogSegment {
                     base: LogBase::Op(3),
@@ -1564,7 +2004,7 @@ mod tests {
                 replica_id: 1,
                 state: Some(RecoveryState {
                     segment: LogSegment {
-                        base: LogBase::Checkpoint(checkpoint),
+                        base: LogBase::Checkpoint(7),
                         entries: entries.clone(),
                     },
                     commit_number: 7,
@@ -1594,6 +2034,38 @@ mod tests {
             match decode(&line).unwrap() {
                 Frame::Message(decoded) => assert_eq!(message, decoded, "{line}"),
                 Frame::Reply(_) => panic!("{line}"),
+            }
+        }
+        let replies: Vec<KvReply> = vec![
+            Reply::Registered {
+                view_number: 2,
+                client_id: 3,
+                session: 1,
+            },
+            Reply::Executed {
+                view_number: 2,
+                client_id: 3,
+                session: 1,
+                request_number: 5,
+                result: Some("1".into()),
+            },
+            Reply::Evicted {
+                view_number: 2,
+                client_id: 3,
+                session: 1,
+            },
+            Reply::Queried {
+                view_number: 2,
+                client_id: 3,
+                query_number: 2,
+                result: None,
+            },
+        ];
+        for reply in replies {
+            let line = encode(&Frame::Reply(reply.clone()));
+            match decode(&line).unwrap() {
+                Frame::Reply(decoded) => assert_eq!(reply, decoded, "{line}"),
+                Frame::Message(_) => panic!("{line}"),
             }
         }
     }
@@ -1651,8 +2123,8 @@ mod tests {
         peer.shutdown(Shutdown::Write).unwrap();
 
         match received.recv_timeout(Duration::from_secs(1)) {
-            Ok(Event::Message(Message::Prepare { op, .. })) => {
-                panic!("incomplete frame was dispatched as {op:?}")
+            Ok(Event::Message(Message::Prepare { entry, .. })) => {
+                panic!("incomplete frame was dispatched as {entry:?}")
             }
             Ok(_) => panic!("incomplete frame dispatched an unexpected event"),
             Err(RecvTimeoutError::Timeout) => {}
@@ -1663,11 +2135,15 @@ mod tests {
     fn prepare_put(value: &str) -> Frame {
         Frame::Message(Message::Prepare {
             view_number: 0,
-            op_number: 1,
+            op_number: 2,
             commit_number: 0,
-            client_id: 7,
-            request_number: 0,
-            op: Op::Put("key".into(), value.into()),
+            entry: LogEntry::Request {
+                client_id: 7,
+                session: 1,
+                request_number: 1,
+                answered: 0,
+                op: Op::Put("key".into(), value.into()),
+            },
         })
     }
 
@@ -1692,7 +2168,10 @@ mod tests {
         peer.shutdown(Shutdown::Write).unwrap();
 
         match received.recv_timeout(Duration::from_secs(1)) {
-            Ok(Event::Message(Message::Prepare { op, .. })) => {
+            Ok(Event::Message(Message::Prepare { entry, .. })) => {
+                let LogEntry::Request { op, .. } = entry else {
+                    panic!("not a request: {entry:?}");
+                };
                 assert_eq!(op, Op::Put("key".into(), "ABCDEFGHIJ".into()))
             }
             Ok(_) => panic!("expected the complete PREPARE, got another event"),
@@ -1700,8 +2179,8 @@ mod tests {
         }
         match received.recv_timeout(Duration::from_millis(500)) {
             Err(RecvTimeoutError::Timeout) => {}
-            Ok(Event::Message(Message::Prepare { op, .. })) => {
-                panic!("incomplete frame was dispatched as {op:?}")
+            Ok(Event::Message(Message::Prepare { entry, .. })) => {
+                panic!("incomplete frame was dispatched as {entry:?}")
             }
             Ok(_) => panic!("unexpected second event"),
             Err(err) => panic!("event channel failed: {err}"),
@@ -1730,6 +2209,41 @@ mod tests {
             Ok(_) => panic!("unexpected event"),
             Err(err) => panic!("expected a disconnect, got {err}"),
         }
+    }
+
+    /// A connection reads commands as they come, answers them in the order
+    /// they came, those it answers itself among the event loop's, and
+    /// answers what it read before the client stopped sending.
+    #[test]
+    fn connection_answers_pipelined_commands_in_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (events, received) = channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = run_client_connection(stream, 1, events);
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(b"SET a 1\r\nPING\r\nGET a\r\n").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut commands = Vec::new();
+        for _ in 0..2 {
+            match received.recv_timeout(Duration::from_secs(1)) {
+                Ok(Event::Command { respond, .. }) => commands.push(respond),
+                Ok(_) => panic!("unexpected event"),
+                Err(err) => panic!("expected a command, got {err}"),
+            }
+        }
+        commands[0].send("+OK\r\n".into()).unwrap();
+        commands[1].send("$1\r\n1\r\n".into()).unwrap();
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut client, &mut response).unwrap();
+        assert_eq!("+OK\r\n+PONG\r\n$1\r\n1\r\n", response);
+        assert!(matches!(
+            received.recv_timeout(Duration::from_secs(1)),
+            Ok(Event::Disconnect(1))
+        ));
     }
 
     /// Regression test case for https://github.com/penberg/vsr-rs/issues/15
@@ -1777,10 +2291,11 @@ mod disk_tests {
     use super::*;
     use fjall::PersistMode;
     use std::collections::HashSet;
+    use std::collections::VecDeque;
     use std::path::Path;
     use std::process::Command;
     use std::sync::atomic::Ordering;
-    use vsr_rs::{Config, LogEntry, OpNumber, StateMachine};
+    use vsr_rs::{ClientRecord, Config, LogEntry, OpNumber, StateMachine};
 
     fn temp_dir(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("vsr-kvstore-{}-{test}", std::process::id()));
@@ -1821,12 +2336,25 @@ mod disk_tests {
         node.replica.on_message(Message::Prepare {
             view_number: 0,
             op_number,
-            client_id: 7,
-            request_number: op_number - 1,
-            op: Op::Put(format!("k{op_number}"), format!("v{op_number}")),
+            entry: entry(op_number),
             commit_number,
         });
         step(node);
+    }
+
+    /// The primary's entry at `op_number`: client 7's registration, then
+    /// its requests, each of which puts `k{op_number}`.
+    fn entry(op_number: OpNumber) -> LogEntry<Op> {
+        match op_number {
+            1 => LogEntry::Register { client_id: 7 },
+            _ => LogEntry::Request {
+                client_id: 7,
+                session: 1,
+                request_number: op_number - 1,
+                answered: op_number - 2,
+                op: Op::Put(format!("k{op_number}"), format!("v{op_number}")),
+            },
+        }
     }
 
     /// Tells a backup node that the primary committed up to `commit_number`.
@@ -1994,9 +2522,11 @@ mod disk_tests {
         let mut node = Node::open(1, config(), &dir, Start::Init).unwrap();
         let value = "v".repeat(100);
         let entries: Vec<_> = (1..=50_000)
-            .map(|i| LogEntry {
+            .map(|i| LogEntry::Request {
                 client_id: 7,
+                session: 1,
                 request_number: i,
+                answered: i - 1,
                 op: Op::Put(format!("k{i}"), value.clone()),
             })
             .collect();
@@ -2101,7 +2631,9 @@ mod disk_tests {
 
             let mut batch = String::new();
             for op_number in replaced.clone() {
-                batch.push_str(&format!("E {op_number} 8 {op_number} PUT other value\n"));
+                batch.push_str(&format!(
+                    "E {op_number} REQ 8 1 {op_number} 0 PUT other value\n"
+                ));
             }
             batch.push_str(&format!("H 0 0 3 0 4 {} 0", replaced.end()));
             write_torn_batch(&dir, &batch);
@@ -2115,7 +2647,10 @@ mod disk_tests {
             assert_eq!(before, node.replica.persistent_state(), "{replaced:?}");
             assert_eq!(6, node.replica.op_number());
             assert!(
-                node.replica.log().iter().all(|entry| entry.client_id == 7),
+                node.replica
+                    .log()
+                    .iter()
+                    .all(|entry| entry.client_id() == 7),
                 "{replaced:?}: {:?}",
                 node.replica.log()
             );
@@ -2189,46 +2724,188 @@ mod disk_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A store with data and no format of its own, or with the one
+    /// keyspace of the formats before 3, was written by another version of
+    /// the kvstore, and the node refuses it.
+    #[test]
+    fn store_of_another_format_is_refused() {
+        let dir = temp_dir("format");
+        let mut store = new_store(&dir);
+        store.apply(1, &Op::Put("a".into(), "1".into()));
+        store.persist().unwrap();
+        store.meta.remove(FORMAT_KEY).unwrap();
+        drop(store);
+        let err = Store::open(&dir).err().expect("the store refused");
+        assert!(err.contains("another version"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.with_extension("durable"));
+
+        let db = fjall::Database::builder(&dir).open().unwrap();
+        db.keyspace("kv", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        drop(db);
+        let err = Store::open(&dir).err().expect("the store refused");
+        assert!(err.contains("another version"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store of a node that has not started yet, which records its
+    /// format as `Node::open` has it do.
+    fn new_store(dir: &Path) -> Store {
+        let store = Store::open(dir).unwrap();
+        store.stamp_format().unwrap();
+        store
+    }
+
     /// A checkpoint replaces keys the store already holds, keeps none the
     /// checkpoint lacks, and leaves the node's own records alone.
     #[test]
     fn restore_over_existing_keys() {
         let dir = temp_dir("restore");
-        let mut store = Store::open(&dir).unwrap();
+        let mut store = new_store(&dir);
         let incarnation = store.next_incarnation().unwrap();
         for (op_number, (key, value)) in [("a", "1"), ("b", "2")].into_iter().enumerate() {
-            store.apply(
-                op_number + 1,
-                &LogEntry {
-                    client_id: 3,
-                    request_number: op_number,
-                    op: Op::Put(key.into(), value.into()),
-                },
-            );
+            store.apply(op_number + 1, &Op::Put(key.into(), value.into()));
         }
-        let client_table = vec![ClientRecord {
-            client_id: 4,
-            request_number: 9,
-            reply: Some("x".into()),
-        }];
-        store.restore(Checkpoint {
-            op_number: 7,
-            state: StoreSnapshot {
-                pairs: vec![("a".into(), "x".into()), ("c".into(), "y".into())],
+        let record = |client_id, request_number| ClientRecord {
+            client_id,
+            session: 1,
+            request_number,
+            replies: VecDeque::from([Some("x".to_string())]),
+            op_number: 5,
+        };
+        store.record_client(2, 3, Some(&record(3, 1)));
+        let client_table = vec![record(4, 9)];
+        let chunks = [
+            StoreChunk {
+                pairs: Vec::new(),
+                clients: client_table.clone(),
             },
-            client_table: client_table.clone(),
-        });
+            StoreChunk {
+                pairs: vec![("a".into(), "x".into()), ("c".into(), "y".into())],
+                clients: Vec::new(),
+            },
+        ];
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            store.stage_chunk(7, index, chunk);
+        }
+        store.restore(7);
         drop(store);
         let mut store = Store::open(&dir).unwrap();
         assert_eq!(7, store.applied);
         assert_eq!(Some("x".to_string()), store.get("a"));
         assert_eq!(None, store.get("b"));
         assert_eq!(Some("y".to_string()), store.get("c"));
-        assert_eq!(client_table, store.client_table().unwrap());
+        assert_eq!(client_table, store.client_table());
         assert!(store.next_incarnation().unwrap() > incarnation);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(dir.with_extension("durable"));
+    }
+
+    /// A checkpoint of more than `CHUNK_BYTES` comes in several chunks,
+    /// all as of the flush it was kept at while the store moves on. Asked
+    /// for out of order, as by replicas fetching at once, and again, the
+    /// chunks split the state the same way, with nothing past the last one.
+    /// Another store restores them whole and durable.
+    #[test]
+    fn checkpoint_comes_in_chunks() {
+        let dir = temp_dir("chunks");
+        let mut store = new_store(&dir);
+        let value = "v".repeat(1000);
+        let count = 3 * CHUNK_BYTES / 1000;
+        for op_number in 1..=count {
+            store.apply(
+                op_number,
+                &Op::Put(format!("k{op_number:05}"), value.clone()),
+            );
+        }
+        let record = ClientRecord {
+            client_id: 3,
+            session: 1,
+            request_number: 2,
+            replies: VecDeque::from([None]),
+            op_number: count,
+        };
+        store.record_client(count, 3, Some(&record));
+        store.persist().unwrap();
+        let pairs = store.pairs();
+        assert_eq!(count, store.checkpoint());
+        store.apply(count + 1, &Op::Put("k00001".into(), "later".into()));
+        store.persist().unwrap();
+
+        let mut chunks = std::collections::BTreeMap::new();
+        for index in [2, 0, 1] {
+            let (chunk, last) = store.checkpoint_chunk(index);
+            assert!(!last);
+            chunks.insert(index, chunk);
+        }
+        for index in 3.. {
+            let (chunk, last) = store.checkpoint_chunk(index);
+            chunks.insert(index, chunk);
+            if last {
+                break;
+            }
+        }
+        let split: Vec<_> = chunks
+            .values()
+            .flat_map(|chunk| chunk.pairs.clone())
+            .collect();
+        assert_eq!(pairs, split);
+        assert_eq!(chunks[&1], store.checkpoint_chunk(1).0);
+        let past = store.checkpoint_chunk(chunks.len());
+        assert_eq!((StoreChunk::default(), true), past);
+        store.release_checkpoint();
+
+        let other_dir = temp_dir("chunks-restored");
+        let mut other = new_store(&other_dir);
+        other.apply(1, &Op::Put("gone".into(), "1".into()));
+        for (index, chunk) in chunks {
+            other.stage_chunk(count, index, chunk);
+        }
+        other.restore(count);
+        assert_eq!(pairs, other.pairs());
+        assert_eq!(vec![record.clone()], other.client_table());
+        drop(other);
+        let durable = Store::open(&other_dir.with_extension("durable")).unwrap();
+        assert_eq!(count, durable.applied);
+        assert_eq!(pairs, durable.pairs());
+        assert_eq!(vec![record], durable.client_table());
+        drop((store, durable));
+        for dir in [dir, other_dir] {
+            let _ = std::fs::remove_dir_all(dir.with_extension("durable"));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Chunks staged and synced with a later persist leave the state as it
+    /// was: after a power loss before the restore the store holds the old
+    /// state, and opening it clears them.
+    #[test]
+    fn staged_chunks_stay_out_of_the_state() {
+        let dir = temp_dir("staged");
+        let mut store = new_store(&dir.join("store"));
+        store.apply(1, &Op::Put("a".into(), "1".into()));
+        let chunk = |key: &str| StoreChunk {
+            pairs: vec![(key.into(), "x".into())],
+            clients: Vec::new(),
+        };
+        store.stage_chunk(9, 0, chunk("b"));
+        store.apply(2, &Op::Put("c".into(), "3".into()));
+        store.persist().unwrap();
+        store.stage_chunk(9, 1, chunk("e"));
+        drop(store);
+        power::lose_power(&dir);
+        let mut store = Store::open(&dir.join("store")).unwrap();
+        assert_eq!(2, store.applied);
+        let pairs = vec![("a".into(), "1".into()), ("c".into(), "3".into())];
+        assert_eq!(pairs, store.pairs());
+        assert!(store.staging_is_empty());
+        store.stage_chunk(10, 0, chunk("d"));
+        store.restore(10);
+        assert_eq!(vec![("d".into(), "x".into())], store.pairs());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The store reads its writes before a flush makes them durable and
@@ -2239,21 +2916,25 @@ mod disk_tests {
     fn store_writes_back() {
         let dir = temp_dir("writes-back");
         let durable_dir = dir.with_extension("durable");
-        let mut store = Store::open(&dir).unwrap();
-        let put = |op_number: usize, key: &str, value: &str| LogEntry {
-            client_id: 3,
-            request_number: op_number,
-            op: Op::Put(key.into(), value.into()),
-        };
-        store.apply(1, &put(1, "a", "1"));
+        let mut store = new_store(&dir);
+        let put = |key: &str, value: &str| Op::Put(key.into(), value.into());
+        store.apply(1, &put("a", "1"));
         assert_eq!(Some("1".into()), store.get("a"));
         let (landed, flushed) = channel();
         assert!(store.flush(move || landed.send(()).unwrap()));
-        store.apply(2, &put(2, "a", "2"));
-        store.apply(3, &put(3, "b", "3"));
+        store.apply(2, &put("a", "2"));
+        let record = ClientRecord {
+            client_id: 3,
+            session: 1,
+            request_number: 2,
+            replies: VecDeque::from([None, None]),
+            op_number: 3,
+        };
+        store.apply(3, &put("b", "3"));
+        store.record_client(3, 3, Some(&record));
         assert!(!store.flush(|| {}), "one flush is out at a time");
         let pairs = vec![("a".into(), "2".into()), ("b".into(), "3".into())];
-        assert_eq!(pairs, store.snapshot().pairs);
+        assert_eq!(pairs, store.pairs());
         flushed.recv().unwrap();
         assert_eq!(Some(1), store.landed_flush().unwrap());
         let durable = Store::open(&durable_dir).unwrap();
@@ -2261,45 +2942,36 @@ mod disk_tests {
         assert_eq!(Some("1".into()), durable.get("a"));
         assert_eq!(None, durable.get("b"));
         drop(durable);
-        assert_eq!(pairs, store.snapshot().pairs);
+        assert_eq!(pairs, store.pairs());
         store.persist().unwrap();
         let durable = Store::open(&durable_dir).unwrap();
         assert_eq!(3, durable.applied);
-        assert_eq!(pairs, durable.snapshot().pairs);
-        let client_table = vec![ClientRecord {
-            client_id: 3,
-            request_number: 3,
-            reply: None,
-        }];
-        assert_eq!(client_table, durable.client_table().unwrap());
+        assert_eq!(pairs, durable.pairs());
+        assert_eq!(vec![record], durable.client_table());
         drop(durable);
         // A flush this large is still out when the reads below run, so they
         // see its writes through it rather than through fjall.
         let many = 20_000;
         for op_number in 4..4 + many {
-            store.apply(op_number, &put(op_number, &format!("k{op_number}"), "v"));
+            store.apply(op_number, &put(&format!("k{op_number}"), "v"));
         }
         assert!(store.flush(|| {}));
         assert_eq!(Some("v".into()), store.get("k4"));
-        assert_eq!(2 + many, store.snapshot().pairs.len());
-        store.apply(4 + many, &put(4 + many, "z", "6"));
+        assert_eq!(2 + many, store.pairs().len());
+        store.apply(4 + many, &put("z", "6"));
         let checkpoint_pairs = vec![("c".into(), "5".into())];
-        store.restore(Checkpoint {
-            op_number: 9,
-            state: StoreSnapshot {
-                pairs: checkpoint_pairs.clone(),
-            },
-            client_table: Vec::new(),
-        });
-        assert_eq!(checkpoint_pairs, store.snapshot().pairs);
+        let chunk = StoreChunk {
+            pairs: checkpoint_pairs.clone(),
+            clients: Vec::new(),
+        };
+        store.stage_chunk(9, 0, chunk);
+        store.restore(9);
+        assert_eq!(checkpoint_pairs, store.pairs());
         drop(store);
         let durable = Store::open(&durable_dir).unwrap();
         assert_eq!(9, durable.applied);
-        assert_eq!(checkpoint_pairs, durable.snapshot().pairs);
-        assert_eq!(
-            Vec::<ClientRecord<Option<String>>>::new(),
-            durable.client_table().unwrap()
-        );
+        assert_eq!(checkpoint_pairs, durable.pairs());
+        assert_eq!(Vec::<KvClientRecord>::new(), durable.client_table());
         drop(durable);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&durable_dir);
@@ -2381,7 +3053,7 @@ mod disk_tests {
             (CHILD_PERSIST_AT - 1..CHILD_OPS).contains(&applied),
             "store applied {applied} ops"
         );
-        for op_number in 1..=applied {
+        for op_number in 2..=applied {
             assert_eq!(
                 Some(format!("v{op_number}")),
                 store.get(&format!("k{op_number}"))
@@ -2399,7 +3071,7 @@ mod disk_tests {
         assert_eq!(CHILD_PERSIST_AT - 1, node.replica.log_start());
         commit(&mut node, CHILD_OPS);
         assert_eq!(CHILD_OPS, node.replica.state_machine().applied);
-        for op_number in 1..=CHILD_OPS {
+        for op_number in 2..=CHILD_OPS {
             assert_eq!(
                 Some(format!("v{op_number}")),
                 node.replica.state_machine().get(&format!("k{op_number}"))
@@ -2408,8 +3080,10 @@ mod disk_tests {
         assert_eq!(
             vec![ClientRecord {
                 client_id: 7,
+                session: 1,
                 request_number: CHILD_OPS - 1,
-                reply: None,
+                replies: VecDeque::from([None]),
+                op_number: CHILD_OPS,
             }],
             node.replica.client_table()
         );
@@ -2476,7 +3150,7 @@ mod disk_tests {
 
         let node = Node::open(1, config(), &dir, Start::Restart).unwrap();
         assert_eq!(applied, node.replica.state_machine().applied);
-        for op_number in 1..=applied {
+        for op_number in 2..=applied {
             assert_eq!(
                 Some(format!("v{op_number}")),
                 node.replica.state_machine().get(&format!("k{op_number}"))

@@ -457,12 +457,18 @@ fn ring_position(id: usize, count: usize) -> (f64, f64) {
 /// The glyph and color a message in flight is drawn with.
 fn message_glyph(kind: &str) -> (&'static str, Color) {
     match kind {
+        "Register" => ("R", Color::Blue),
         "Request" => ("r", Color::Blue),
+        "Query" => ("q", Color::Blue),
+        "ConfirmView" => ("?", Color::Green),
+        "ConfirmViewOk" => ("y", Color::Green),
         "Prepare" => ("P", Color::White),
         "PrepareOk" => ("k", Color::Green),
         "Commit" => ("c", Color::DarkGray),
         "GetState" => ("g", Color::Cyan),
         "NewState" => ("N", Color::Cyan),
+        "GetChunk" => ("h", Color::Cyan),
+        "NewChunk" => ("H", Color::Cyan),
         "StartViewChange" => ("v", Color::Magenta),
         "DoViewChange" => ("V", Color::Magenta),
         "StartView" => ("S", Color::Magenta),
@@ -527,11 +533,7 @@ fn draw_cluster(frame: &mut Frame, area: Rect, app: &App, snapshot: &Snapshot) {
             }
             ctx.layer();
             // Clients in the middle.
-            let waiting = snapshot
-                .clients
-                .iter()
-                .filter(|c| c.inflight.is_some())
-                .count();
+            let waiting = snapshot.clients.iter().filter(|c| c.in_flight > 0).count();
             let label = format!("{} clients, {waiting} waiting", snapshot.clients.len());
             ctx.print(
                 -(label.len() as f64) * char_width / 2.0,
@@ -617,7 +619,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, snapshot: &Snapshot) {
     ]);
     let net = &snapshot.network;
     let line2 = Line::from(format!(
-        "requests {}/{} replied of {}   crashes {} power losses {} process crashes {} lost steps {} lost writes {} restarts {} reboots {} flushes {}   messages sent {} lost {} replayed {} delayed {}   loss {} replay {} latency {} ticks, mean {}",
+        "requests {}/{} replied of {}   crashes {} power losses {} process crashes {} lost steps {} lost writes {} restarts {} reboots {} flushes {} restores {}   messages sent {} lost {} replayed {} delayed {}   loss {} replay {} latency {} ticks, mean {}",
         snapshot.requests_replied,
         snapshot.requests_sent,
         snapshot.requests_max,
@@ -629,6 +631,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, snapshot: &Snapshot) {
         snapshot.restarts,
         snapshot.reboots,
         snapshot.flushes,
+        snapshot.restores,
         net.sent,
         net.lost,
         net.replayed,
@@ -733,9 +736,9 @@ fn draw_replicas(frame: &mut Frame, area: Rect, app: &App, snapshot: &Snapshot) 
     let clients: Vec<String> = snapshot
         .clients
         .iter()
-        .map(|c| match c.inflight {
-            Some(request) => format!("{}:#{request}", c.id),
-            None => format!("{}:idle", c.id),
+        .map(|c| match c.in_flight {
+            0 => format!("{}:idle", c.id),
+            requests => format!("{}:{requests}", c.id),
         })
         .collect();
     let text = format!(
@@ -769,7 +772,7 @@ fn draw_messages(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
         let color = match kind {
             "Prepare" | "PrepareOk" | "Commit" => Color::White,
             "Request" => Color::Blue,
-            "GetState" | "NewState" => Color::Cyan,
+            "GetState" | "NewState" | "GetChunk" | "NewChunk" => Color::Cyan,
             "Recovery" | "RecoveryResponse" => Color::Yellow,
             _ => Color::Magenta,
         };

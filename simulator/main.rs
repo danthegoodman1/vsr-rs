@@ -185,11 +185,11 @@ fn main() -> anyhow::Result<()> {
         summary.sent, summary.delivered, summary.lost, summary.replayed, summary.delayed
     );
     println!(
-        "          requests: sent={} replied={}",
-        simulator.requests_sent, simulator.requests_replied
+        "          requests: sent={} replied={} evicted={}",
+        simulator.requests_sent, simulator.requests_replied, simulator.requests_evicted
     );
     println!(
-        "          replicas: crashes={} power_losses={} process_crashes={} ahead={} lost_steps={} lost_writes={} writes_out_at_crash={} landed={} restarts={} reboots={} flushes={} core={:?} up={:?}",
+        "          replicas: crashes={} power_losses={} process_crashes={} ahead={} lost_steps={} lost_writes={} writes_out_at_crash={} landed={} restarts={} reboots={} flushes={} restores={} core={:?} up={:?}",
         simulator.crashes,
         simulator.power_losses,
         simulator.process_crashes,
@@ -201,6 +201,7 @@ fn main() -> anyhow::Result<()> {
         simulator.restarts,
         simulator.reboots,
         simulator.flushes,
+        simulator.restores,
         simulator.core(),
         (0..simulator.options.replica_count)
             .filter(|&id| simulator.is_up(id))

@@ -3,10 +3,10 @@
 //! the benchmark runs three of them in one process.
 
 use crate::journal::{EntryCodec, Journal, Landing};
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable, Snapshot};
 use futures::future::{maybe_done, MaybeDone};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -17,8 +17,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use vsr_rs::{
-    Checkpoint, Client, ClientID, ClientRecord, Config, LogEntry, LogSegment, LogWrite, MessageFor,
-    OpNumber, Replica, ReplicaID, Reply, RequestNumber, StateMachine, ViewNumber,
+    Client, ClientID, ClientRecord, Completion, Config, LogEntry, LogSegment, LogWrite, MessageFor,
+    OpNumber, QueryNumber, Replica, ReplicaID, Reply, RequestNumber, StateMachine, ViewNumber,
 };
 
 /// How often the replica and the clients run their idle logic.
@@ -27,6 +27,10 @@ pub(crate) const TICK: Duration = Duration::from_millis(100);
 pub(crate) const CLIENT_RESEND_TICKS: u64 = 5;
 /// Idle periods without hearing from the primary before a view change.
 pub(crate) const PRIMARY_TIMEOUT: usize = 5;
+/// Sessions the client table holds, one per client connection.
+pub(crate) const CLIENTS_MAX: usize = 16_384;
+/// Commands a connection has in flight.
+pub(crate) const IN_FLIGHT_MAX: usize = 16;
 /// Ticks between two persists of the store, each of which lets the
 /// replica compact its log.
 pub(crate) const FLUSH_TICKS: u64 = 10;
@@ -49,26 +53,32 @@ pub(crate) const WAL_FILE_SIZE: u64 = 4 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 // Operations
 
+/// A write. A read is a query, a key, which goes in no log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
     Put(String, String),
-    Get(String),
 }
 
 pub(crate) fn encode_op(op: &Op) -> String {
     match op {
         Op::Put(key, value) => format!("PUT {key} {value}"),
-        Op::Get(key) => format!("GET {key}"),
     }
 }
 
 pub(crate) fn encode_entry(entry: &LogEntry<Op>) -> String {
-    format!(
-        "{} {} {}",
-        entry.client_id,
-        entry.request_number,
-        encode_op(&entry.op)
-    )
+    match entry {
+        LogEntry::Register { client_id } => format!("REG {client_id}"),
+        LogEntry::Request {
+            client_id,
+            session,
+            request_number,
+            answered,
+            op,
+        } => format!(
+            "REQ {client_id} {session} {request_number} {answered} {}",
+            encode_op(op)
+        ),
+    }
 }
 
 pub(crate) fn decode_entry(text: &str) -> Result<LogEntry<Op>, String> {
@@ -125,22 +135,48 @@ impl<'a> Tokens<'a> {
     pub(crate) fn op(&mut self) -> Result<Op, String> {
         match self.word()? {
             "PUT" => Ok(Op::Put(self.word()?.to_string(), self.word()?.to_string())),
-            "GET" => Ok(Op::Get(self.word()?.to_string())),
             kind => Err(format!("bad op {kind:?}")),
         }
     }
 
     pub(crate) fn entry(&mut self) -> Result<LogEntry<Op>, String> {
-        Ok(LogEntry {
-            client_id: self.num()?,
-            request_number: self.num()?,
-            op: self.op()?,
+        match self.word()? {
+            "REG" => Ok(LogEntry::Register {
+                client_id: self.num()?,
+            }),
+            "REQ" => Ok(LogEntry::Request {
+                client_id: self.num()?,
+                session: self.num()?,
+                request_number: self.num()?,
+                answered: self.num()?,
+                op: self.op()?,
+            }),
+            kind => Err(format!("bad entry {kind:?}")),
+        }
+    }
+
+    /// A client record as `encode_client` wrote it.
+    pub(crate) fn client(&mut self, client_id: ClientID) -> Result<KvClientRecord, String> {
+        let session = self.num()?;
+        let request_number = self.num()?;
+        let op_number = self.num()?;
+        let count = self.num()?;
+        let mut replies = VecDeque::with_capacity(count.min(RESERVED_MAX));
+        for _ in 0..count {
+            replies.push_back(self.result()?);
+        }
+        Ok(ClientRecord {
+            client_id,
+            session,
+            request_number,
+            replies,
+            op_number,
         })
     }
 
     pub(crate) fn entries(&mut self) -> Result<Vec<LogEntry<Op>>, String> {
         let count = self.num()?;
-        let mut log = Vec::with_capacity(count);
+        let mut log = Vec::with_capacity(count.min(RESERVED_MAX));
         for _ in 0..count {
             log.push(self.entry()?);
         }
@@ -166,23 +202,44 @@ impl<'a> Tokens<'a> {
 // The store: a fjall database that never fsyncs on its own, behind the
 // writes applied since the last flush
 
-/// Key prefixes in the store's one keyspace.
+/// Key prefixes in a data keyspace.
 pub(crate) const KEY_PREFIX: &str = "k/";
 pub(crate) const CLIENT_PREFIX: &str = "c/";
 /// The number of operations applied to the store, written in the same
 /// batch as the operations' writes.
-pub(crate) const APPLIED_KEY: &str = "m/applied";
+pub(crate) const APPLIED_KEY: &str = "applied";
 /// The number of times the node has started, which keeps the client ids
 /// of one run apart from those of the others.
-pub(crate) const INCARNATION_KEY: &str = "m/incarnation";
+pub(crate) const INCARNATION_KEY: &str = "incarnation";
+/// The data keyspace that holds the state, 0 or 1.
+const CURRENT_KEY: &str = "current";
+/// The layout of the store's keyspaces and records, and of the journal's
+/// entries.
+pub(crate) const FORMAT_KEY: &str = "format";
+pub(crate) const FORMAT: u64 = 3;
+/// The one keyspace of formats before 3.
+const OLD_FORMAT_KEYSPACE: &str = "kv";
+/// The bytes of keys and values a checkpoint chunk holds, about.
+pub(crate) const CHUNK_BYTES: usize = 256 * 1024;
+/// The chunks a kept checkpoint reads ahead at most, one for each of a few
+/// replicas fetching it at once.
+const CHUNKS_AHEAD: usize = 4;
+/// The most items decoding reserves room for up front, whatever count a
+/// frame claims.
+pub(crate) const RESERVED_MAX: usize = 1024;
 
 /// The key-value store. The output of an op is the value read by a GET.
 /// An op's writes stay in memory until a flush writes them to fjall, with
-/// the op number they reach, in one batch, and fsyncs.
+/// the op number they reach, in one batch, and fsyncs. The keys and the
+/// client table live in one of two data keyspaces; the other stages a
+/// checkpoint being fetched, and restoring it switches the two.
 pub(crate) struct Store {
     pub(crate) path: PathBuf,
     pub(crate) db: Database,
-    pub(crate) keyspace: Keyspace,
+    /// The counters, and which data keyspace is current.
+    pub(crate) meta: Keyspace,
+    data: [Keyspace; 2],
+    current: usize,
     /// The number of operations applied.
     pub(crate) applied: OpNumber,
     /// The number of times the store was persisted, each with an fsync.
@@ -191,14 +248,18 @@ pub(crate) struct Store {
     dirty: RefCell<Writes>,
     /// The flush out, if any.
     flushing: RefCell<Option<Flushing>>,
+    /// The checkpoint kept for replicas that fell behind.
+    kept: Option<Kept>,
+    /// The op number of the checkpoint being staged, if any.
+    staged: Option<OpNumber>,
 }
 
 /// The writes of a run of operations, which a flush encodes for fjall.
 #[derive(Default)]
 struct Writes {
     values: HashMap<String, String>,
-    /// Each client's latest request number and its reply.
-    clients: HashMap<ClientID, (RequestNumber, Option<String>)>,
+    /// The client records handed over, `None` for an eviction.
+    clients: HashMap<ClientID, Option<KvClientRecord>>,
 }
 
 /// A flush on a thread of its own.
@@ -212,11 +273,32 @@ struct Flushing {
     thread: JoinHandle<()>,
 }
 
-/// Every key and value in the store, for a replica that fell behind a
-/// compacted log.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoreSnapshot {
+/// A checkpoint kept: a snapshot of the current data keyspace, the key
+/// each chunk found so far starts at, and the chunks after those served
+/// last, each read ahead on a thread of its own while the replica that
+/// asked stages the one before.
+struct Kept {
+    reader: ChunkReader,
+    starts: RefCell<Vec<Vec<u8>>>,
+    ahead: RefCell<VecDeque<(usize, JoinHandle<ReadChunk>)>>,
+}
+
+/// Reads chunks of a checkpoint.
+#[derive(Clone)]
+struct ChunkReader {
+    snapshot: Snapshot,
+    keyspace: Keyspace,
+}
+
+/// A chunk, and the key the next one starts at, if any.
+type ReadChunk = (StoreChunk, Option<Vec<u8>>);
+
+/// A run of a checkpoint's keys and values and client records, for a
+/// replica that fell behind a compacted log.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StoreChunk {
     pub(crate) pairs: Vec<(String, String)>,
+    pub(crate) clients: Vec<KvClientRecord>,
 }
 
 pub(crate) fn utf8(bytes: &[u8]) -> String {
@@ -229,30 +311,63 @@ impl Store {
             .manual_journal_persist(true)
             .open()
             .map_err(|err| format!("cannot open store at {}: {err}", path.display()))?;
-        let keyspace = db
-            .keyspace("kv", KeyspaceCreateOptions::default)
-            .map_err(|err| format!("cannot open keyspace: {err}"))?;
+        if db.keyspace_exists(OLD_FORMAT_KEYSPACE) {
+            return Err(another_version(&format!("the store at {}", path.display())));
+        }
+        let keyspace = |name: &str| {
+            db.keyspace(name, KeyspaceCreateOptions::default)
+                .map_err(|err| format!("cannot open keyspace {name}: {err}"))
+        };
+        let meta = keyspace("meta")?;
+        let data = [keyspace("data-a")?, keyspace("data-b")?];
         let mut store = Store {
             path: path.to_path_buf(),
             db,
-            keyspace,
+            meta,
+            data,
+            current: 0,
             applied: 0,
             persists: Arc::default(),
             dirty: RefCell::default(),
             flushing: RefCell::default(),
+            kept: None,
+            staged: None,
         };
         store.applied = store.read_counter(APPLIED_KEY)?;
+        match store.read_counter::<u64>(FORMAT_KEY)? {
+            FORMAT => {}
+            0 if store.applied == 0 => {}
+            _ => return Err(another_version(&format!("the store at {}", path.display()))),
+        }
+        store.current = match store.read_counter(CURRENT_KEY)? {
+            current @ (0 | 1) => current,
+            _ => return Err(format!("bad {CURRENT_KEY} in store")),
+        };
+        // The other data keyspace holds a checkpoint staged before a crash,
+        // or the state before a restore that crashed before clearing it.
+        store.data[1 - store.current]
+            .clear()
+            .map_err(|err| format!("cannot write store: {err}"))?;
         Ok(store)
+    }
+
+    /// Whether the store records its format: one that holds nothing yet
+    /// does not until [`Store::stamp_format`].
+    pub(crate) fn has_format(&self) -> Result<bool, String> {
+        Ok(self.read_counter::<u64>(FORMAT_KEY)? == FORMAT)
+    }
+
+    /// Records the store's format, durable with the next persist.
+    pub(crate) fn stamp_format(&self) -> Result<(), String> {
+        self.meta
+            .insert(FORMAT_KEY, FORMAT.to_string())
+            .map_err(|err| format!("cannot write store: {err}"))
     }
 
     /// The number the store keeps under `key`, or 0 if it keeps none.
     fn read_counter<T: std::str::FromStr + Default>(&self, key: &str) -> Result<T, String> {
-        match self.keyspace.get(key).map_err(|err| err.to_string())? {
-            Some(value) => utf8(&value)
-                .parse()
-                .map_err(|_| format!("bad {key} in store")),
-            None => Ok(T::default()),
-        }
+        let value = self.meta.get(key).map_err(|err| err.to_string())?;
+        parse_counter(key, value.as_deref())
     }
 
     /// Counts one more start of the node, and returns its incarnation: the
@@ -267,40 +382,18 @@ impl Store {
             .map(|since| since.as_secs())
             .unwrap_or(0);
         let incarnation = (self.read_counter::<u64>(INCARNATION_KEY)? + 1).max(now);
-        self.keyspace
+        self.meta
             .insert(INCARNATION_KEY, incarnation.to_string())
             .map_err(|err| format!("cannot write store: {err}"))?;
         Ok(incarnation)
-    }
-
-    /// The client table as the store recorded it, for `Replica::restart`.
-    pub(crate) fn client_table(&self) -> Result<Vec<ClientRecord<Option<String>>>, String> {
-        let mut table = Vec::new();
-        let mut records = self.committed(CLIENT_PREFIX);
-        self.overlay(|writes| {
-            for (client_id, (request_number, reply)) in &writes.clients {
-                records.insert(client_id.to_string(), encode_client(*request_number, reply));
-            }
-        });
-        for (key, value) in records {
-            let client_id = key
-                .parse()
-                .map_err(|_| "bad client id in store".to_string())?;
-            let mut t = Tokens::new(&value);
-            table.push(ClientRecord {
-                client_id,
-                request_number: t.num()?,
-                reply: t.result()?,
-            });
-        }
-        Ok(table)
     }
 
     /// Makes everything applied so far durable.
     pub(crate) fn persist(&self) -> Result<(), String> {
         self.finish_flush()?;
         let (writes, op_number) = (self.dirty.take(), self.applied);
-        make_durable(&self.db, &self.keyspace, &writes, op_number, &self.path)?;
+        let data = &self.data[self.current];
+        make_durable(&self.db, &self.meta, data, &writes, op_number, &self.path)?;
         self.persists.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -314,15 +407,16 @@ impl Store {
         }
         let writes = Arc::new(self.dirty.take());
         let op_number = self.applied;
-        let (db, keyspace, persists) = (
+        let (db, meta, data, persists) = (
             self.db.clone(),
-            self.keyspace.clone(),
+            self.meta.clone(),
+            self.data[self.current].clone(),
             self.persists.clone(),
         );
         let (flushed, path) = (writes.clone(), self.path.clone());
         let (result, done) = std::sync::mpsc::channel();
         let flush = move || {
-            let flushed = make_durable(&db, &keyspace, &flushed, op_number, &path);
+            let flushed = make_durable(&db, &meta, &data, &flushed, op_number, &path);
             if flushed.is_ok() {
                 persists.fetch_add(1, Ordering::Relaxed);
             }
@@ -347,7 +441,8 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn write_unsynced(&self) -> Result<(), String> {
         self.finish_flush()?;
-        write_batch(&self.db, &self.keyspace, &self.dirty.take(), self.applied)
+        let data = &self.data[self.current];
+        write_batch(&self.db, &self.meta, data, &self.dirty.take(), self.applied)
     }
 
     /// Waits for the flush out, if any, and returns the op number it made
@@ -392,17 +487,35 @@ impl Store {
                 return Some(value.clone());
             }
         }
-        self.keyspace
+        self.data[self.current]
             .get(format!("{KEY_PREFIX}{key}"))
             .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")))
             .map(|value| utf8(&value))
+    }
+
+    /// Every key and its value, less the prefix, in key order.
+    #[cfg(test)]
+    pub(crate) fn pairs(&self) -> Vec<(String, String)> {
+        let mut pairs = self.committed(KEY_PREFIX);
+        self.overlay(|writes| {
+            for (key, value) in &writes.values {
+                pairs.insert(key.clone(), value.clone());
+            }
+        });
+        pairs.into_iter().collect()
+    }
+
+    /// Whether the data keyspace that is not current holds nothing.
+    #[cfg(test)]
+    pub(crate) fn staging_is_empty(&self) -> bool {
+        self.data[1 - self.current].is_empty().unwrap()
     }
 
     /// The keys under `prefix` in fjall, less the prefix, and their values,
     /// in key order.
     fn committed(&self, prefix: &str) -> BTreeMap<String, String> {
         let mut pairs = BTreeMap::new();
-        for guard in self.db.snapshot().prefix(&self.keyspace, prefix) {
+        for guard in self.db.snapshot().prefix(&self.data[self.current], prefix) {
             let (key, value) = guard
                 .into_inner()
                 .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")));
@@ -421,50 +534,82 @@ impl Store {
     }
 }
 
-/// A client's latest request number and reply as the store keeps them.
-fn encode_client(request_number: RequestNumber, reply: &Option<String>) -> String {
-    format!("{request_number} {}", encode_result(reply))
+/// The number stored under `key`, or 0 if there is none.
+fn parse_counter<T: std::str::FromStr + Default>(
+    key: &str,
+    value: Option<&[u8]>,
+) -> Result<T, String> {
+    match value {
+        Some(value) => utf8(value)
+            .parse()
+            .map_err(|_| format!("bad {key} in store")),
+        None => Ok(T::default()),
+    }
+}
+
+/// A client record as the store and the wire keep it, less its client id.
+pub(crate) fn encode_client(record: &KvClientRecord) -> String {
+    let mut out = format!(
+        "{} {} {} {}",
+        record.session,
+        record.request_number,
+        record.op_number,
+        record.replies.len()
+    );
+    for reply in &record.replies {
+        out.push(' ');
+        out.push_str(&encode_result(reply));
+    }
+    out
 }
 
 /// Writes `writes` and the op number they reach to fjall in one batch, and
 /// fsyncs.
 fn make_durable(
     db: &Database,
-    keyspace: &Keyspace,
+    meta: &Keyspace,
+    data: &Keyspace,
     writes: &Writes,
     op_number: OpNumber,
     path: &Path,
 ) -> Result<(), String> {
-    write_batch(db, keyspace, writes, op_number)?;
-    db.persist(PersistMode::SyncData)
-        .map_err(|err| format!("cannot persist store at {}: {err}", path.display()))?;
-    #[cfg(test)]
-    power::record_durable(path);
-    Ok(())
+    write_batch(db, meta, data, writes, op_number)?;
+    sync(db, path)
 }
 
-/// Writes `writes` and the op number they reach to fjall in one batch.
+/// Writes `writes` to the data keyspace `data` and the op number they
+/// reach to `meta`, in one batch.
 fn write_batch(
     db: &Database,
-    keyspace: &Keyspace,
+    meta: &Keyspace,
+    data: &Keyspace,
     writes: &Writes,
     op_number: OpNumber,
 ) -> Result<(), String> {
     let mut batch = db.batch();
     for (key, value) in &writes.values {
-        batch.insert(keyspace, format!("{KEY_PREFIX}{key}"), value.as_str());
+        batch.insert(data, format!("{KEY_PREFIX}{key}"), value.as_str());
     }
-    for (client_id, (request_number, reply)) in &writes.clients {
-        batch.insert(
-            keyspace,
-            format!("{CLIENT_PREFIX}{client_id}"),
-            encode_client(*request_number, reply),
-        );
+    for (client_id, record) in &writes.clients {
+        let key = format!("{CLIENT_PREFIX}{client_id}");
+        match record {
+            Some(record) => batch.insert(data, key, encode_client(record)),
+            None => batch.remove(data, key),
+        }
     }
-    batch.insert(keyspace, APPLIED_KEY, op_number.to_string());
+    batch.insert(meta, APPLIED_KEY, op_number.to_string());
     batch
         .commit()
         .map_err(|err| format!("cannot write store: {err}"))
+}
+
+/// Makes every write so far durable.
+fn sync(db: &Database, path: &Path) -> Result<(), String> {
+    db.persist(PersistMode::SyncData)
+        .map_err(|err| format!("cannot persist store at {}: {err}", path.display()))?;
+    #[cfg(test)]
+    power::record_durable(path);
+    Ok(())
 }
 
 impl Drop for Store {
@@ -476,6 +621,11 @@ impl Drop for Store {
     }
 }
 
+/// The error for data that another version of the kvstore wrote.
+pub(crate) fn another_version(what: &str) -> String {
+    format!("{what} was written by another version of the kvstore; start the node over with --init or --recover")
+}
+
 pub(crate) fn fatal(message: &str) -> ! {
     eprintln!("{message}");
     std::process::exit(1);
@@ -483,92 +633,265 @@ pub(crate) fn fatal(message: &str) -> ! {
 
 impl StateMachine for Store {
     type Input = Op;
+    type Query = String;
     type Output = Option<String>;
-    type Snapshot = StoreSnapshot;
+    type Chunk = StoreChunk;
 
-    fn apply(&mut self, op_number: OpNumber, entry: &LogEntry<Op>) -> Option<String> {
-        let result = match &entry.op {
+    fn apply(&mut self, op_number: OpNumber, op: &Op) -> Option<String> {
+        match op {
             Op::Put(key, value) => {
                 let values = &mut self.dirty.get_mut().values;
                 values.insert(key.clone(), value.clone());
-                None
             }
-            Op::Get(key) => self.get(key),
-        };
-        let clients = &mut self.dirty.get_mut().clients;
-        clients.insert(entry.client_id, (entry.request_number, result.clone()));
+        }
         self.applied = op_number;
-        result
+        None
     }
 
-    fn snapshot(&self) -> StoreSnapshot {
-        let mut pairs = self.committed(KEY_PREFIX);
+    fn query(&self, key: &String) -> Option<String> {
+        self.get(key)
+    }
+
+    /// Keeps the record in the writes since the last flush, reusing the
+    /// copy kept there of the client's last one.
+    fn record_client(
+        &mut self,
+        op_number: OpNumber,
+        client_id: ClientID,
+        record: Option<&KvClientRecord>,
+    ) {
+        let clients = &mut self.dirty.get_mut().clients;
+        match (clients.get_mut(&client_id), record) {
+            (Some(Some(kept)), Some(record)) => {
+                kept.session = record.session;
+                kept.request_number = record.request_number;
+                kept.replies.clone_from(&record.replies);
+                kept.op_number = record.op_number;
+            }
+            _ => {
+                clients.insert(client_id, record.cloned());
+            }
+        }
+        self.applied = op_number;
+    }
+
+    fn client_table(&self) -> Vec<KvClientRecord> {
+        let mut table = BTreeMap::new();
+        for (key, value) in self.committed(CLIENT_PREFIX) {
+            let client_id = key
+                .parse()
+                .unwrap_or_else(|_| fatal(&format!("bad client id {key:?} in store")));
+            let record = Tokens::new(&value)
+                .client(client_id)
+                .unwrap_or_else(|err| fatal(&format!("bad client record in store: {err}")));
+            table.insert(client_id, record);
+        }
         self.overlay(|writes| {
-            for (key, value) in &writes.values {
-                pairs.insert(key.clone(), value.clone());
+            for (client_id, record) in &writes.clients {
+                match record {
+                    Some(record) => table.insert(*client_id, record.clone()),
+                    None => table.remove(client_id),
+                };
             }
         });
-        StoreSnapshot {
-            pairs: pairs.into_iter().collect(),
-        }
+        table.into_values().collect()
     }
 
-    /// Replaces the keys, values, and client table with the checkpoint's,
-    /// in one batch that removes only the keys the checkpoint lacks, and
-    /// makes it durable before returning, as the library requires.
-    fn restore(&mut self, checkpoint: Checkpoint<Option<String>, StoreSnapshot>) {
-        let mut pairs = checkpoint.state.pairs;
-        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let mut table = checkpoint.client_table;
-        table.sort_unstable_by_key(|record| record.client_id);
-        self.finish_flush().unwrap_or_else(|err| fatal(&err));
-        *self.dirty.get_mut() = Writes::default();
+    /// Keeps a snapshot of fjall, which holds the state as of the last
+    /// flush written: no earlier than the replica's log start, since the
+    /// node compacts only up to a flush that landed.
+    fn checkpoint(&mut self) -> OpNumber {
+        let snapshot = self.db.snapshot();
+        let applied = snapshot
+            .get(&self.meta, APPLIED_KEY)
+            .map_err(|err| err.to_string())
+            .and_then(|value| parse_counter(APPLIED_KEY, value.as_deref()))
+            .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")));
+        let reader = ChunkReader {
+            snapshot,
+            keyspace: self.data[self.current].clone(),
+        };
+        self.kept = Some(Kept {
+            reader,
+            starts: RefCell::new(vec![Vec::new()]),
+            ahead: RefCell::default(),
+        });
+        applied
+    }
+
+    /// Chunk `index` holds the keys from where chunk `index - 1` stopped,
+    /// up to about `CHUNK_BYTES` of them, so where each chunk starts
+    /// depends only on the state.
+    fn checkpoint_chunk(&self, index: usize) -> (StoreChunk, bool) {
+        let kept = self.kept.as_ref().expect("a checkpoint kept");
+        let (chunk, next) = kept.chunk(index);
+        (chunk, next.is_none())
+    }
+
+    fn release_checkpoint(&mut self) {
+        self.kept = None;
+    }
+
+    /// Writes the chunk to the data keyspace that is not current, which
+    /// chunk 0 clears first. `restore` syncs it with the rest.
+    fn stage_chunk(&mut self, op_number: OpNumber, index: usize, chunk: StoreChunk) {
+        let staging = &self.data[1 - self.current];
+        if index == 0 {
+            staging
+                .clear()
+                .unwrap_or_else(|err| fatal(&format!("cannot write store: {err}")));
+            self.staged = Some(op_number);
+        }
+        assert_eq!(Some(op_number), self.staged);
         let mut batch = self.db.batch();
-        for guard in self.keyspace.prefix(KEY_PREFIX) {
-            let key = guard
-                .key()
-                .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")));
-            let name = &key[KEY_PREFIX.len()..];
-            if pairs
-                .binary_search_by(|(kept, _)| kept.as_bytes().cmp(name))
-                .is_err()
-            {
-                batch.remove(&self.keyspace, key);
-            }
+        for (key, value) in chunk.pairs {
+            batch.insert(staging, format!("{KEY_PREFIX}{key}"), value);
         }
-        for guard in self.keyspace.prefix(CLIENT_PREFIX) {
-            let key = guard
-                .key()
-                .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")));
-            let kept = utf8(&key[CLIENT_PREFIX.len()..]).parse().is_ok_and(|id| {
-                table
-                    .binary_search_by_key(&id, |record| record.client_id)
-                    .is_ok()
-            });
-            if !kept {
-                batch.remove(&self.keyspace, key);
-            }
+        for record in chunk.clients {
+            let key = format!("{CLIENT_PREFIX}{}", record.client_id);
+            batch.insert(staging, key, encode_client(&record));
         }
-        for (key, value) in pairs {
-            batch.insert(&self.keyspace, format!("{KEY_PREFIX}{key}"), value);
-        }
-        for record in table {
-            batch.insert(
-                &self.keyspace,
-                format!("{CLIENT_PREFIX}{}", record.client_id),
-                encode_client(record.request_number, &record.reply),
-            );
-        }
-        batch.insert(
-            &self.keyspace,
-            APPLIED_KEY,
-            checkpoint.op_number.to_string(),
-        );
         batch
             .commit()
             .unwrap_or_else(|err| fatal(&format!("cannot write store: {err}")));
-        self.applied = checkpoint.op_number;
-        self.persist().unwrap_or_else(|err| fatal(&err));
+    }
+
+    /// Makes the staged checkpoint the state: one batch switches the data
+    /// keyspaces and sets the op number, and a sync makes it durable with
+    /// the chunks, as the library requires. The old state is cleared.
+    fn restore(&mut self, op_number: OpNumber) {
+        assert_eq!(Some(op_number), self.staged.take());
+        assert!(self.kept.is_none(), "a checkpoint kept of the old state");
+        self.finish_flush().unwrap_or_else(|err| fatal(&err));
+        *self.dirty.get_mut() = Writes::default();
+        let staging = 1 - self.current;
+        let mut batch = self.db.batch();
+        batch.insert(&self.meta, CURRENT_KEY, staging.to_string());
+        batch.insert(&self.meta, APPLIED_KEY, op_number.to_string());
+        batch
+            .commit()
+            .map_err(|err| format!("cannot write store: {err}"))
+            .and_then(|()| sync(&self.db, &self.path))
+            .unwrap_or_else(|err| fatal(&err));
+        self.persists.fetch_add(1, Ordering::Relaxed);
+        let old = std::mem::replace(&mut self.current, staging);
+        self.data[old]
+            .clear()
+            .unwrap_or_else(|err| fatal(&format!("cannot write store: {err}")));
+        self.applied = op_number;
+    }
+}
+
+impl Kept {
+    /// Chunk `index`: the one read ahead, or else read now; past the last
+    /// chunk, an empty one. The chunk after it is then read ahead.
+    fn chunk(&self, index: usize) -> ReadChunk {
+        let ahead = {
+            let mut ahead = self.ahead.borrow_mut();
+            let position = ahead.iter().position(|(read, _)| *read == index);
+            position.and_then(|position| ahead.remove(position))
+        };
+        let read = match ahead {
+            Some((_, thread)) => thread
+                .join()
+                .unwrap_or_else(|_| fatal("a checkpoint read panicked")),
+            None => match self.start(index) {
+                Some(start) => self.reader.read(&start),
+                None => (StoreChunk::default(), None),
+            },
+        };
+        if let Some(next) = &read.1 {
+            let mut starts = self.starts.borrow_mut();
+            if starts.len() == index + 1 {
+                starts.push(next.clone());
+            }
+            self.read_ahead(index + 1, next.clone());
+        }
+        read
+    }
+
+    /// Where chunk `index` starts, found from the last start known by the
+    /// sizes of the keys and values alone, or `None` past the last chunk.
+    fn start(&self, index: usize) -> Option<Vec<u8>> {
+        let mut starts = self.starts.borrow_mut();
+        while starts.len() <= index {
+            let last = starts.last().expect("chunk 0's start");
+            let next = self.reader.scan(last, |_, _| {})?;
+            starts.push(next);
+        }
+        Some(starts[index].clone())
+    }
+
+    /// Reads chunk `index`, which starts at `start`, on a thread of its
+    /// own, unless it is being read already; with `CHUNKS_AHEAD` being read,
+    /// the oldest read goes first.
+    fn read_ahead(&self, index: usize, start: Vec<u8>) {
+        let mut ahead = self.ahead.borrow_mut();
+        if ahead.iter().any(|(read, _)| *read == index) {
+            return;
+        }
+        if ahead.len() == CHUNKS_AHEAD {
+            if let Some((_, thread)) = ahead.pop_front() {
+                let _ = thread.join();
+            }
+        }
+        let reader = self.reader.clone();
+        let thread = std::thread::Builder::new()
+            .name("checkpoint read".to_string())
+            .spawn(move || reader.read(&start))
+            .unwrap_or_else(|err| fatal(&format!("cannot read a checkpoint: {err}")));
+        ahead.push_back((index, thread));
+    }
+}
+
+impl Drop for Kept {
+    /// Waits for the chunks read ahead, whose keyspace a restore clears
+    /// once the checkpoint is dropped.
+    fn drop(&mut self) {
+        for (_, thread) in self.ahead.get_mut().drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl ChunkReader {
+    /// The chunk that starts at key `start`, and the key the next one
+    /// starts at, if any.
+    fn read(&self, start: &[u8]) -> ReadChunk {
+        let mut chunk = StoreChunk::default();
+        let next = self.scan(start, |key, value| {
+            if let Some(name) = key.strip_prefix(KEY_PREFIX.as_bytes()) {
+                chunk.pairs.push((utf8(name), utf8(value)));
+            } else if let Some(client_id) = key.strip_prefix(CLIENT_PREFIX.as_bytes()) {
+                let client_id = utf8(client_id);
+                let record = client_id
+                    .parse()
+                    .map_err(|_| format!("bad client id {client_id:?}"))
+                    .and_then(|client_id| Tokens::new(&utf8(value)).client(client_id))
+                    .unwrap_or_else(|err| fatal(&format!("bad client record in store: {err}")));
+                chunk.clients.push(record);
+            } else {
+                fatal(&format!("unexpected key {:?} in store", utf8(key)));
+            }
+        });
+        (chunk, next)
+    }
+
+    /// Calls `take` with each key and value of the chunk that starts at
+    /// key `start`, and returns the key the next one starts at, if any.
+    fn scan(&self, start: &[u8], mut take: impl FnMut(&[u8], &[u8])) -> Option<Vec<u8>> {
+        let mut bytes = 0;
+        for guard in self.snapshot.range(&self.keyspace, start..) {
+            let (key, value) = guard
+                .into_inner()
+                .unwrap_or_else(|err| fatal(&format!("cannot read store: {err}")));
+            if bytes >= CHUNK_BYTES {
+                return Some(key.to_vec());
+            }
+            bytes += key.len() + value.len();
+            take(&key, &value);
+        }
+        None
     }
 }
 
@@ -577,8 +900,8 @@ impl StateMachine for Store {
 
 pub(crate) type KvReply = Reply<Option<String>>;
 pub(crate) type KvMessage = MessageFor<Store>;
-pub(crate) type KvCheckpoint = Checkpoint<Option<String>, StoreSnapshot>;
-pub(crate) type KvSegment = LogSegment<Op, Option<String>, StoreSnapshot>;
+pub(crate) type KvSegment = LogSegment<Op>;
+pub(crate) type KvClientRecord = ClientRecord<Option<String>>;
 
 /// What travels between nodes: protocol messages, and replies routed back
 /// to the node that owns the client connection.
@@ -615,6 +938,8 @@ pub(crate) fn config(replicas: usize) -> Config {
         config.add_replica();
     }
     config.set_primary_timeout(PRIMARY_TIMEOUT);
+    config.set_clients_max(CLIENTS_MAX);
+    config.set_in_flight_max(IN_FLIGHT_MAX);
     config
 }
 
@@ -639,9 +964,8 @@ pub(crate) enum Command {
 
 /// The client id of a node's `next` connection in its `incarnation`.
 ///
-/// Client ids must never repeat, or the primary's client table mistakes a
-/// new connection's first request for a re-send of an old one and answers
-/// it from the cache (section 4.5 of the paper). The node id in the top
+/// Client ids must never repeat, or the primary answers a new connection's
+/// registration with an old connection's session. The node id in the top
 /// byte tells the primary which node to route the reply to, the node's
 /// incarnation in the next 32 bits separates its runs, and the low 24 bits
 /// count its connections.
@@ -679,34 +1003,36 @@ pub(crate) enum Event {
     Stop,
 }
 
-/// A client connection's VSR client and the command it is waiting on.
+/// A client connection's VSR client and the commands it has in flight.
 pub(crate) struct Connection {
-    pub(crate) client: Client<Op>,
-    pub(crate) pending: Option<(RequestNumber, Command, Sender<String>)>,
+    pub(crate) client: Client<Op, String>,
+    /// The commands in flight, in the order they came.
+    pub(crate) pending: VecDeque<Pending>,
 }
+
+/// A command in flight on a connection.
+pub(crate) struct Pending {
+    pub(crate) ticket: Ticket,
+    pub(crate) command: Command,
+    pub(crate) respond: Sender<String>,
+    /// Its answer, held until the commands before it have theirs, so that
+    /// a connection gets its answers in the order its commands came.
+    pub(crate) answer: Option<String>,
+}
+
+/// What a command went out as: a request, or a query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ticket {
+    Request(RequestNumber),
+    Query(QueryNumber),
+}
+
+/// The answer to each command in flight when the connection's session was
+/// evicted.
+pub(crate) const EVICTED: &str = "-ERR session evicted; the command may or may not have run\r\n";
 
 /// A reply as a client connection takes it, and where to send it.
 pub(crate) type Answer = (Sender<String>, String);
-
-/// Queues a reply for the connection waiting for it, if it is still there
-/// and still waiting for that request.
-pub(crate) fn deliver_reply(
-    connections: &mut HashMap<u64, Connection>,
-    answers: &mut Vec<Answer>,
-    reply: KvReply,
-) {
-    let Some(connection) = connections.get_mut(&(reply.client_id as u64)) else {
-        return;
-    };
-    let answers_pending = connection
-        .client
-        .on_reply(reply.request_number, reply.view_number);
-    if answers_pending {
-        if let Some((_, command, respond)) = connection.pending.take() {
-            answers.push((respond, format_reply(&command, reply.result)));
-        }
-    }
-}
 
 pub(crate) fn format_reply(command: &Command, result: Option<String>) -> String {
     match (command, result) {
@@ -745,8 +1071,8 @@ pub(crate) struct Node {
     pub(crate) woken: bool,
     /// Whether the event loop is to end, once no write is out.
     pub(crate) stopping: bool,
-    /// The connections whose clients may have requests to send.
-    pub(crate) requesting: Vec<u64>,
+    /// What this node's clients send, taken from each as it has something.
+    pub(crate) requests: Vec<(ReplicaID, KvMessage)>,
     /// The number of times this node has started, which its client ids
     /// carry.
     pub(crate) incarnation: u64,
@@ -755,8 +1081,10 @@ pub(crate) struct Node {
     /// [`Node::hand_out`].
     pub(crate) answers: Vec<Answer>,
     /// The thread that hands replies to the connections while
-    /// [`Node::run`] runs.
+    /// [`Node::run`] runs, and the number of batches handed to it that it
+    /// has not handed out yet.
     pub(crate) answerer: Option<Sender<Vec<Answer>>>,
+    pub(crate) handed_off: Arc<AtomicU64>,
     pub(crate) ticks: u64,
     pub(crate) view: usize,
     /// Log entries kept behind what the store has persisted.
@@ -814,7 +1142,21 @@ impl Node {
             ));
         }
         let mut store = Store::open(&data_dir.join("store"))?;
-        let (journal, state) = Journal::open(&journal_dir, wal_file_size, ENTRY_CODEC)?;
+        // A store with no format of its own holds nothing yet, beside a
+        // journal that may be of an earlier version, which fails to decode.
+        let formatted = store.has_format()?;
+        let (journal, state) = Journal::open(&journal_dir, wal_file_size, ENTRY_CODEC).map_err(
+            |err| match formatted {
+                true => err,
+                false => format!(
+                    "{}: {err}",
+                    another_version(&format!("the journal in {dir}"))
+                ),
+            },
+        )?;
+        if !formatted {
+            store.stamp_format()?;
+        }
         let inconsistent = |what: &str| {
             format!(
                 "{what} in {dir}; restore the store and the journal from the same backup, or remove both and start with --recover"
@@ -856,7 +1198,6 @@ impl Node {
         let nonce = incarnation;
         let replica = match (state, start) {
             (Some(state), Start::Restart) => {
-                let client_table = store.client_table()?;
                 let applied = store.applied;
                 println!(
                     "restarting from view {} with {} ops, {} committed, {applied} applied by the store",
@@ -864,15 +1205,7 @@ impl Node {
                     state.log_start + state.log.len(),
                     state.commit_number
                 );
-                Replica::restart(
-                    id,
-                    config.clone(),
-                    store,
-                    applied,
-                    client_table,
-                    state,
-                    nonce,
-                )
+                Replica::restart(id, config.clone(), store, applied, state, nonce)
             }
             (None, Start::Recover { view }) => {
                 println!("recovering with an empty disk, in view {view} or later");
@@ -890,12 +1223,13 @@ impl Node {
             write_ticks: 0,
             woken: false,
             stopping: false,
-            requesting: Vec::new(),
+            requests: Vec::new(),
             incarnation,
             config,
             connections: HashMap::new(),
             answers: Vec::new(),
             answerer: None,
+            handed_off: Arc::default(),
             ticks: 0,
             log_retention: LOG_RETENTION,
             journaled: true,
@@ -943,20 +1277,13 @@ impl Node {
         send: &mut impl FnMut(ReplicaID, KvMessage),
         replies: &mut Vec<KvReply>,
     ) {
-        let mut requesting = std::mem::take(&mut self.requesting);
-        for id in requesting.drain(..) {
-            let Some(connection) = self.connections.get_mut(&id) else {
-                continue;
-            };
-            for (dst, message) in connection.client.drain() {
-                if dst == self.id {
-                    self.replica.on_message(message);
-                } else {
-                    send(dst, message);
-                }
+        for (dst, message) in std::mem::take(&mut self.requests) {
+            if dst == self.id {
+                self.replica.on_message(message);
+            } else {
+                send(dst, message);
             }
         }
-        self.requesting = requesting;
         for (dst, message) in self.replica.drain_messages_before_persist() {
             send(dst, message);
         }
@@ -999,35 +1326,45 @@ impl Node {
     /// is out already, it takes the replica's write: one that needs a sync
     /// goes out to the journal, which wakes the event loop through `wake`
     /// with an [`Event::Written`]; any other goes straight back to the
-    /// replica, and what that released goes out too.
+    /// replica, and what that released goes out too. The replies to this
+    /// node's clients can let them send more, which goes out in the same
+    /// batch.
     pub(crate) fn deliver(&mut self, outbox: &impl Outbox, wake: &Sender<Event>) {
         let mut send = |dst, message| {
             outbox.send_to(dst, Frame::Message(message));
         };
         let mut replies = Vec::new();
-        self.before_write(&mut send, &mut replies);
-        self.after_write(&mut send, &mut replies);
-        self.answer(&mut replies, outbox);
-        if self.writing.is_none() {
-            let write = self.replica.take_write();
-            if write.sync && self.journaled {
-                self.write_out(write, wake);
-            } else {
-                self.replica.persisted(write);
+        loop {
+            self.before_write(&mut send, &mut replies);
+            self.after_write(&mut send, &mut replies);
+            self.answer(&mut replies, outbox);
+            if self.writing.is_none() {
+                let write = self.replica.take_write();
+                if write.sync && self.journaled {
+                    self.write_out(write, wake);
+                } else {
+                    self.replica.persisted(write);
+                }
+            }
+            self.after_write(&mut send, &mut replies);
+            self.answer(&mut replies, outbox);
+            if self.requests.is_empty() {
+                break;
             }
         }
-        self.after_write(&mut send, &mut replies);
-        self.answer(&mut replies, outbox);
         self.hand_out();
     }
 
-    /// Sends the replies ready to their connections.
+    /// Sends the replies ready to their connections, in order: behind the
+    /// batches the answerer thread has yet to hand out.
     fn hand_out(&mut self) {
         if self.answers.is_empty() {
             return;
         }
+        let behind = self.handed_off.load(Ordering::Acquire) > 0;
         match &self.answerer {
-            Some(answerer) if self.answers.len() >= HANDED_OFF_ANSWERS => {
+            Some(answerer) if self.answers.len() >= HANDED_OFF_ANSWERS || behind => {
+                self.handed_off.fetch_add(1, Ordering::AcqRel);
                 if answerer.send(std::mem::take(&mut self.answers)).is_err() {
                     fatal("the answerer thread is gone");
                 }
@@ -1081,13 +1418,57 @@ impl Node {
     /// connection, which may be this one.
     fn answer(&mut self, replies: &mut Vec<KvReply>, outbox: &impl Outbox) {
         for reply in replies.drain(..) {
-            let owner = node_of(reply.client_id);
+            let owner = node_of(reply.client_id());
             if owner == self.id {
-                deliver_reply(&mut self.connections, &mut self.answers, reply);
+                self.deliver_reply(reply);
             } else {
                 outbox.send_to(owner, Frame::Reply(reply));
             }
         }
+    }
+
+    /// Queues the answers a reply completes for its connection, if it is
+    /// still there: a command's result, or, after an eviction, the failure
+    /// of every command in flight. The connection's client may then have
+    /// requests to send, with its session or with room in flight.
+    fn deliver_reply(&mut self, reply: KvReply) {
+        let id = reply.client_id() as u64;
+        let Some(connection) = self.connections.get_mut(&id) else {
+            return;
+        };
+        let completed = match connection.client.on_reply(reply) {
+            Some(Completion::Executed(request_number, result)) => {
+                Some((Ticket::Request(request_number), result))
+            }
+            Some(Completion::Queried(query_number, result)) => {
+                Some((Ticket::Query(query_number), result))
+            }
+            Some(Completion::Evicted) => {
+                for pending in &mut connection.pending {
+                    pending.answer.get_or_insert_with(|| EVICTED.to_string());
+                }
+                None
+            }
+            None => None,
+        };
+        if let Some((ticket, result)) = completed {
+            let pending = &mut connection.pending;
+            if let Some(pending) = pending.iter_mut().find(|pending| pending.ticket == ticket) {
+                pending.answer = Some(format_reply(&pending.command, result));
+            }
+        }
+        while connection
+            .pending
+            .front()
+            .is_some_and(|pending| pending.answer.is_some())
+        {
+            let Pending {
+                respond, answer, ..
+            } = connection.pending.pop_front().expect("a command in flight");
+            self.answers
+                .push((respond, answer.expect("the command's answer")));
+        }
+        self.requests.extend(connection.client.drain());
     }
 
     /// Steps the replica or a client with one event. Returns whether the
@@ -1095,7 +1476,7 @@ impl Node {
     pub(crate) fn handle(&mut self, event: Event) -> bool {
         match event {
             Event::Message(message) => self.replica.on_message(message),
-            Event::Reply(reply) => deliver_reply(&mut self.connections, &mut self.answers, reply),
+            Event::Reply(reply) => self.deliver_reply(reply),
             Event::Command {
                 connection: id,
                 command,
@@ -1104,15 +1485,22 @@ impl Node {
                 let config = &self.config;
                 let connection = self.connections.entry(id).or_insert_with(|| Connection {
                     client: Client::new(id as ClientID, config.clone()),
-                    pending: None,
+                    pending: VecDeque::new(),
                 });
-                let op = match &command {
-                    Command::Set(key, value) => Op::Put(key.clone(), value.clone()),
-                    Command::Get(key) => Op::Get(key.clone()),
+                let ticket = match &command {
+                    Command::Set(key, value) => {
+                        let op = Op::Put(key.clone(), value.clone());
+                        Ticket::Request(connection.client.on_request(op))
+                    }
+                    Command::Get(key) => Ticket::Query(connection.client.on_query(key.clone())),
                 };
-                let request_number = connection.client.on_request(op);
-                connection.pending = Some((request_number, command, respond));
-                self.requesting.push(id);
+                connection.pending.push_back(Pending {
+                    ticket,
+                    command,
+                    respond,
+                    answer: None,
+                });
+                self.requests.extend(connection.client.drain());
             }
             Event::Disconnect(id) => {
                 self.connections.remove(&id);
@@ -1124,9 +1512,9 @@ impl Node {
                 }
                 self.replica.on_idle();
                 if self.ticks.is_multiple_of(CLIENT_RESEND_TICKS) {
-                    for (id, connection) in &mut self.connections {
+                    for connection in self.connections.values_mut() {
                         connection.client.on_idle();
-                        self.requesting.push(*id);
+                        self.requests.extend(connection.client.drain());
                     }
                 }
                 return self.ticks.is_multiple_of(FLUSH_TICKS);
@@ -1184,11 +1572,15 @@ impl Node {
         outbox: impl Outbox,
     ) {
         let (answerer, batches) = std::sync::mpsc::channel::<Vec<Answer>>();
+        let handed_off = self.handed_off.clone();
         let answering = std::thread::Builder::new()
             .name(format!("node {} answers", self.id))
             .spawn(move || {
-                for (respond, answer) in batches.into_iter().flatten() {
-                    let _ = respond.send(answer);
+                for batch in batches {
+                    for (respond, answer) in batch {
+                        let _ = respond.send(answer);
+                    }
+                    handed_off.fetch_sub(1, Ordering::AcqRel);
                 }
             })
             .unwrap_or_else(|err| fatal(&format!("cannot start the answerer thread: {err}")));

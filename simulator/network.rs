@@ -9,7 +9,7 @@ use log::trace;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::BTreeMap;
-use vsr_rs::Message;
+use vsr_rs::{Message, Reply};
 
 pub type ReplicaId = usize;
 
@@ -33,12 +33,18 @@ pub struct Envelope {
 /// The name of a message's kind, for display.
 pub fn message_kind(message: &Msg) -> &'static str {
     match message {
+        Message::Register { .. } => "Register",
         Message::Request { .. } => "Request",
+        Message::Query { .. } => "Query",
+        Message::ConfirmView { .. } => "ConfirmView",
+        Message::ConfirmViewOk { .. } => "ConfirmViewOk",
         Message::Prepare { .. } => "Prepare",
         Message::PrepareOk { .. } => "PrepareOk",
         Message::Commit { .. } => "Commit",
         Message::GetState { .. } => "GetState",
         Message::NewState { .. } => "NewState",
+        Message::GetChunk { .. } => "GetChunk",
+        Message::NewChunk { .. } => "NewChunk",
         Message::StartViewChange { .. } => "StartViewChange",
         Message::DoViewChange { .. } => "DoViewChange",
         Message::StartView { .. } => "StartView",
@@ -110,6 +116,8 @@ pub struct Network {
     options: NetworkOptions,
     /// Messages in flight, keyed by (delivery tick, sequence number).
     queue: BTreeMap<(u64, u64), Envelope>,
+    /// Replies in flight to the clients, keyed the same way.
+    replies: BTreeMap<(u64, u64), Reply<i64>>,
     seq: u64,
     pub summary: MessageSummary,
 }
@@ -119,6 +127,7 @@ impl Network {
         Network {
             options,
             queue: BTreeMap::new(),
+            replies: BTreeMap::new(),
             seq: 0,
             summary: MessageSummary::default(),
         }
@@ -134,9 +143,9 @@ impl Network {
         self.options = options;
     }
 
-    /// Number of messages in flight.
+    /// Number of messages and replies in flight.
     pub fn pending(&self) -> usize {
-        self.queue.len()
+        self.queue.len() + self.replies.len()
     }
 
     /// Messages in flight, in delivery order.
@@ -147,7 +156,11 @@ impl Network {
     /// Accepts a message sent at tick `now`, applying faults.
     pub fn send(&mut self, now: u64, from: Origin, dst: ReplicaId, msg: Msg, rng: &mut ChaCha8Rng) {
         self.summary.sent += 1;
-        if matches!(msg, Message::Request { .. }) && !self.options.fault_client_messages {
+        let from_client = matches!(
+            msg,
+            Message::Register { .. } | Message::Request { .. } | Message::Query { .. }
+        );
+        if from_client && !self.options.fault_client_messages {
             self.enqueue_at(now, now, from, dst, msg);
             return;
         }
@@ -166,6 +179,55 @@ impl Network {
             self.enqueue(now, from, dst, msg.clone(), rng);
         }
         self.enqueue(now, from, dst, msg, rng);
+    }
+
+    /// Accepts a reply to a client at tick `now`. It is returned for
+    /// delivery at once unless faults apply to clients' messages, which
+    /// lose, replay, and delay replies as they do messages.
+    pub fn send_reply(
+        &mut self,
+        now: u64,
+        reply: Reply<i64>,
+        rng: &mut ChaCha8Rng,
+    ) -> Option<Reply<i64>> {
+        self.summary.sent += 1;
+        if !self.options.fault_client_messages {
+            self.summary.delivered += 1;
+            return Some(reply);
+        }
+        if self.options.packet_loss_probability > 0.0
+            && rng.gen_bool(self.options.packet_loss_probability)
+        {
+            trace!("tick {now}: lost {reply:?}");
+            self.summary.lost += 1;
+            return None;
+        }
+        let copies = if self.options.packet_replay_probability > 0.0
+            && rng.gen_bool(self.options.packet_replay_probability)
+        {
+            trace!("tick {now}: replaying {reply:?}");
+            self.summary.replayed += 1;
+            2
+        } else {
+            1
+        };
+        for _ in 0..copies {
+            let delay = self.sample_delay(rng);
+            if delay > self.options.one_way_delay_min {
+                self.summary.delayed += 1;
+            }
+            self.seq += 1;
+            self.replies.insert((now + delay, self.seq), reply.clone());
+        }
+        None
+    }
+
+    /// Returns every reply due at tick `now` in delivery order.
+    pub fn take_due_replies(&mut self, now: u64) -> Vec<Reply<i64>> {
+        let later = self.replies.split_off(&(now + 1, 0));
+        let due = std::mem::replace(&mut self.replies, later);
+        self.summary.delivered += due.len();
+        due.into_values().collect()
     }
 
     /// Returns every message due at tick `now` in delivery order.
